@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod font;
+mod terminal;
 
 extern "C" {
     fn tzset();
@@ -1274,10 +1275,13 @@ fn handle_tap(
         SCREEN_SETTINGS => {
             let editing = wifi_form().lock().map(|f| f.editing).unwrap_or(false);
             if editing {
-                keyboard_tap(sx, sy);
+                keyboard_tap(sx, sy, false);
             } else {
                 settings_tap(sx, sy);
             }
+        }
+        SCREEN_TERMINAL => {
+            keyboard_tap(sx, sy, true);
         }
         _ => {
             // Any tap on a secondary screen goes back to the menu.
@@ -1440,13 +1444,6 @@ fn render_about(fb: &mut Framebuffer, info: &SystemInfo) {
     draw_hint_footer(fb, "[HOME] Back");
 }
 
-fn render_placeholder(fb: &mut Framebuffer, title: &str, msg: &str) {
-    draw_topbar(fb, title, "[HOME] Back");
-    let x = (FB_WIDTH.saturating_sub(msg.len() * 8)) / 2;
-    fb.draw_text(x, 280, msg, theme().text_dim, 1);
-    draw_hint_footer(fb, "[HOME] Back");
-}
-
 // -------------------------------------------------------------
 // On-screen keyboard (QWERTY + modifiers/arrows) — reusable
 // -------------------------------------------------------------
@@ -1515,6 +1512,12 @@ const KB_U: usize = 56;      // key unit width
 const KB_GAP: usize = 6;
 const KB_H: usize = 44;
 const KB_TOP: usize = 300;
+
+// Terminal grid geometry (the area above the keyboard).
+const TERM_X: usize = MARGIN;
+const TERM_Y: usize = 56;
+const TERM_COLS: usize = (FB_WIDTH - 2 * MARGIN) / 8;
+const TERM_ROWS: usize = (KB_TOP - TERM_Y) / 16;
 const KB_ROW_GAP: usize = 8;
 
 /// Bounding box (x, y, w, h) of the key at (row, col).
@@ -1684,6 +1687,16 @@ fn render_settings(fb: &mut Framebuffer) {
     }
 }
 
+fn render_terminal(fb: &mut Framebuffer) {
+    draw_topbar(fb, "TERMINAL", "[BACK] Menu");
+    if terminal::is_ready() {
+        terminal::render(fb, TERM_X, TERM_Y);
+    } else {
+        fb.draw_text(TERM_X, TERM_Y + 8, "Terminal indisponivel (PTY falhou).", theme().text_dim, 1);
+    }
+    draw_keyboard(fb);
+}
+
 /// Connect wpa_supplicant to an SSID (PSK if provided). Returns a status line.
 fn wifi_connect(ssid: &str, psk: &str) -> String {
     let run = |args: &[&str]| -> Option<String> {
@@ -1748,12 +1761,14 @@ fn wifi_submit() {
     }
 }
 
-/// Apply a keyboard key press to the current text target / modifiers.
-fn kb_press(key: Key) {
+/// Apply a keyboard key press. `terminal_mode` routes characters/keys to the
+/// PTY; otherwise they edit the Wi-Fi form.
+fn kb_press(key: Key, terminal_mode: bool) {
     match key {
         Key::Shift => KB_SHIFT.store(!KB_SHIFT.load(Ordering::Relaxed), Ordering::Relaxed),
         Key::Ctrl => KB_CTRL.store(!KB_CTRL.load(Ordering::Relaxed), Ordering::Relaxed),
         Key::Alt => KB_ALT.store(!KB_ALT.load(Ordering::Relaxed), Ordering::Relaxed),
+        _ if terminal_mode => term_key(key),
         Key::Backspace => kb_backspace(),
         Key::Space => kb_type_char(' '),
         Key::Enter => wifi_submit(),
@@ -1766,13 +1781,47 @@ fn kb_press(key: Key) {
     }
 }
 
+/// Map a key to terminal bytes (respecting Ctrl/Alt/Shift).
+fn term_key(key: Key) {
+    let ctrl = KB_CTRL.load(Ordering::Relaxed);
+    let alt = KB_ALT.load(Ordering::Relaxed);
+    let shift = KB_SHIFT.load(Ordering::Relaxed);
+    match key {
+        Key::Ch(c) => {
+            let mut out: Vec<u8> = Vec::new();
+            if ctrl {
+                out.push((c as u8) & 0x1f);
+            } else {
+                let c = if shift { shift_char(c) } else { c };
+                if alt {
+                    out.push(0x1b);
+                }
+                let mut b = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            }
+            terminal::write(&out);
+            KB_SHIFT.store(false, Ordering::Relaxed);
+        }
+        Key::Enter => terminal::write(b"\r"),
+        Key::Backspace => terminal::write(&[0x7f]),
+        Key::Space => terminal::write(b" "),
+        Key::Tab => terminal::write(b"\t"),
+        Key::Esc => terminal::write(&[0x1b]),
+        Key::Up => terminal::write(b"\x1b[A"),
+        Key::Down => terminal::write(b"\x1b[B"),
+        Key::Right => terminal::write(b"\x1b[C"),
+        Key::Left => terminal::write(b"\x1b[D"),
+        _ => {}
+    }
+}
+
 /// Touch hit-test over the on-screen keyboard. Returns true if a key was hit.
-fn keyboard_tap(sx: usize, sy: usize) -> bool {
+fn keyboard_tap(sx: usize, sy: usize, terminal_mode: bool) -> bool {
     for (r, keys) in KB_ROWS.iter().enumerate() {
         for c in 0..keys.len() {
             let (x, y, w, h) = kb_key_rect(r, c);
             if sx >= x && sx < x + w && sy >= y && sy < y + h {
-                kb_press(keys[c].key);
+                kb_press(keys[c].key, terminal_mode);
                 return true;
             }
         }
@@ -2270,7 +2319,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.3 (Settings: brightness/sleep, keyboard, themes)...");
+    println!("[Kururu Display Daemon] Starting v2.4 (terminal with alacritty_terminal)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -2319,6 +2368,11 @@ fn main() {
     let wake_signal = Arc::new(AtomicBool::new(true));
     let wake_signal_power = wake_signal.clone();
     let wake_signal_keys = wake_signal.clone();
+
+    // Terminal: PTY + shell feeding the alacritty_terminal emulator.
+    if let Err(e) = terminal::init(TERM_COLS, TERM_ROWS, wake_signal.clone()) {
+        eprintln!("[Kururu Display] Terminal indisponivel: {}", e);
+    }
 
     // Start with display ON initially so user sees it right away
     set_display_hardware(true);
@@ -2382,6 +2436,8 @@ fn main() {
                                 f.focus = if up { (f.focus + 2) % 3 } else { (f.focus + 1) % 3 };
                             }
                         }
+                    } else if screen == SCREEN_TERMINAL {
+                        terminal::scroll(if up { 3 } else { -3 });
                     }
                 }
                 KEY_HOMEPAGE => {
@@ -2578,7 +2634,7 @@ fn main() {
                         SCREEN_MENU => render_menu(&mut fb, menu_cursor.load(Ordering::SeqCst)),
                         SCREEN_ABOUT => render_about(&mut fb, info),
                         SCREEN_SETTINGS => render_settings(&mut fb),
-                        SCREEN_TERMINAL => render_placeholder(&mut fb, "TERMINAL", "Terminal - em construcao (Fase 5)."),
+                        SCREEN_TERMINAL => render_terminal(&mut fb),
                         _ => {
                             let tab = current_tab.load(Ordering::SeqCst);
                             draw_header(&mut fb, tab);
