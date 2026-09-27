@@ -221,9 +221,9 @@ struct SystemInfo {
     lan_ip: String,
     tailscale_ip: String,
     tailnet_suffix: String,
-    peers_online_count: usize,
+    homelab_online_count: usize,
     peers_total_count: usize,
-    peers: Vec<PeerDisplayInfo>,
+    homelab_nodes: Vec<PeerDisplayInfo>,
     active_link_str: String,
     logs: Vec<String>,
 }
@@ -355,8 +355,8 @@ fn gather_system_info() -> SystemInfo {
     // Dynamic Tailscale status query
     let mut tailscale_ip = "100.127.188.45".to_string();
     let mut tailnet_suffix = "chimaera-heptatonic.ts.net".to_string();
-    let mut peers = Vec::new();
-    let mut peers_online_count = 0;
+    let mut homelab_nodes = Vec::new();
+    let mut homelab_online_count = 0;
     let mut peers_total_count = 0;
     let mut active_link_str = "None (Idle)".to_string();
 
@@ -384,6 +384,8 @@ fn gather_system_info() -> SystemInfo {
 
             if let Some(peer_map) = ts.peer {
                 peers_total_count = peer_map.len();
+                let mut all_peers = Vec::new();
+
                 for (_k, v) in peer_map {
                     let name = v.hostname.unwrap_or_else(|| "unknown".to_string());
                     let online = v.online.unwrap_or(false);
@@ -391,19 +393,15 @@ fn gather_system_info() -> SystemInfo {
                     let ip = v.tailscale_ips.and_then(|ips| ips.first().cloned()).unwrap_or_default();
                     let cur_addr = v.cur_addr.unwrap_or_default();
 
-                    if online {
-                        peers_online_count += 1;
-                    }
-
                     if active && !name.is_empty() {
                         active_link_str = if !cur_addr.is_empty() {
-                            format!("{} (direct {})", name, cur_addr)
+                            format!("{} ({})", name, cur_addr)
                         } else {
                             format!("{} (active)", name)
                         };
                     }
 
-                    peers.push(PeerDisplayInfo {
+                    all_peers.push(PeerDisplayInfo {
                         name,
                         ip,
                         online,
@@ -412,19 +410,38 @@ fn gather_system_info() -> SystemInfo {
                     });
                 }
 
-                // Priority sorting:
-                // 1. Core Homelab nodes first (kavure, psicopompo, ybytu, ybyra, kuaray, miracena, sumaenima)
-                // 2. Active nodes
-                // 3. Online nodes
-                // 4. Alphabetical
-                peers.sort_by(|a, b| {
-                    let is_homelab_a = is_core_homelab(&a.name);
-                    let is_homelab_b = is_core_homelab(&b.name);
-                    b.active.cmp(&a.active)
-                        .then_with(|| is_homelab_b.cmp(&is_homelab_a))
-                        .then_with(|| b.online.cmp(&a.online))
-                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                });
+                const HOMELAB_NODES: [&str; 5] = [
+                    "Psicopompo",
+                    "Kuaray",
+                    "Kavure",
+                    "Ybytu",
+                    "Ybyra",
+                ];
+
+                for &canonical in &HOMELAB_NODES {
+                    let needle = canonical.to_lowercase();
+                    let match_peer = all_peers.iter().find(|p| p.name.to_lowercase().contains(&needle));
+                    if let Some(p) = match_peer {
+                        if p.online {
+                            homelab_online_count += 1;
+                        }
+                        homelab_nodes.push(PeerDisplayInfo {
+                            name: canonical.to_string(),
+                            ip: p.ip.clone(),
+                            online: p.online,
+                            active: p.active,
+                            cur_addr: p.cur_addr.clone(),
+                        });
+                    } else {
+                        homelab_nodes.push(PeerDisplayInfo {
+                            name: canonical.to_string(),
+                            ip: "---".to_string(),
+                            online: false,
+                            active: false,
+                            cur_addr: "".to_string(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -457,23 +474,12 @@ fn gather_system_info() -> SystemInfo {
         lan_ip,
         tailscale_ip,
         tailnet_suffix,
-        peers_online_count,
+        homelab_online_count,
         peers_total_count,
-        peers,
+        homelab_nodes,
         active_link_str,
         logs,
     }
-}
-
-fn is_core_homelab(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    lower.contains("kavure")
-        || lower.contains("psicopompo")
-        || lower.contains("ybytu")
-        || lower.contains("ybyra")
-        || lower.contains("kuaray")
-        || lower.contains("miracena")
-        || lower.contains("sumaenima")
 }
 
 fn set_display_hardware(on: bool) {
@@ -551,25 +557,25 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
         ty += 19;
     }
 
-    // Dynamic Tailnet & Peers Card (Right)
+    // Dynamic Homelab Servers Card (Right)
     fb.draw_rect(512, 60, 496, 240, PANEL_BG);
     fb.draw_rect(512, 60, 496, 2, BORDER_COLOR);
 
     let header_peers = format!(
-        "TAILNET PEERS ({}/{} Online)",
-        info.peers_online_count, info.peers_total_count
+        "HOMELAB CLUSTER ({}/5 Online)",
+        info.homelab_online_count
     );
     fb.draw_text(524, 72, &header_peers, TEXT_AMBER, 1);
 
-    fb.draw_text(524, 94, "Tailnet:", TEXT_GRAY, 1);
-    fb.draw_text(630, 94, &info.tailnet_suffix, TEXT_CYAN, 1);
+    fb.draw_text(524, 93, "Tailnet:", TEXT_GRAY, 1);
+    fb.draw_text(615, 93, &info.tailnet_suffix, TEXT_CYAN, 1);
 
-    fb.draw_text(524, 113, "Active Link:", TEXT_GRAY, 1);
-    fb.draw_text(630, 113, &info.active_link_str, TEXT_EMERALD, 1);
+    fb.draw_text(524, 110, "Direct Link:", TEXT_GRAY, 1);
+    fb.draw_text(615, 110, &info.active_link_str, TEXT_EMERALD, 1);
 
-    // List top 7 dynamic peers
-    let mut py = 135;
-    for peer in info.peers.iter().take(7) {
+    // List the 5 core homelab servers
+    let mut py = 132;
+    for peer in &info.homelab_nodes {
         let (bullet, color) = if peer.active {
             ("★", TEXT_EMERALD)
         } else if peer.online {
@@ -579,14 +585,8 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
         };
 
         fb.draw_text(524, py, bullet, color, 1);
-        
-        let display_name = if peer.name.len() > 14 {
-            &peer.name[..14]
-        } else {
-            &peer.name
-        };
-        fb.draw_text(540, py, display_name, if peer.online { TEXT_WHITE } else { TEXT_DIM }, 1);
-        fb.draw_text(670, py, &peer.ip, TEXT_GRAY, 1);
+        fb.draw_text(540, py, &peer.name, if peer.online { TEXT_WHITE } else { TEXT_DIM }, 1);
+        fb.draw_text(655, py, &peer.ip, TEXT_GRAY, 1);
 
         let status_desc = if peer.active {
             "direct"
@@ -595,10 +595,13 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
         } else {
             "offline"
         };
-        fb.draw_text(810, py, status_desc, if peer.online { color } else { TEXT_DIM }, 1);
+        fb.draw_text(805, py, status_desc, if peer.online { color } else { TEXT_DIM }, 1);
 
         py += 21;
     }
+
+    let summary_line = format!("Mesh Total: {} nodes registered in Tailnet", info.peers_total_count);
+    fb.draw_text(524, 276, &summary_line, TEXT_DIM, 1);
 
     // Live Terminal Console Card (Bottom)
     fb.draw_rect(16, 312, 992, 244, PANEL_BG);
