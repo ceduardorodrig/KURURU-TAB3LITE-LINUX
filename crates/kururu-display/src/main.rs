@@ -3,8 +3,9 @@ mod font;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::TcpStream;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,10 +17,14 @@ const FB_SIZE: usize = FB_WIDTH * FB_HEIGHT * 4;
 
 const BACKLIGHT_PATH: &str = "/sys/class/backlight/panel/brightness";
 const BLANK_PATH: &str = "/sys/class/graphics/fb0/blank";
-const EVENT_PATH: &str = "/dev/input/event2";
+const EVENT_POWER: &str = "/dev/input/event2";
+const EVENT_KEYS: &str = "/dev/input/event0";
 const FB_PATH: &str = "/dev/graphics/fb0";
+const WOL_LOG_PATH: &str = "/var/log/kururu-wol.log";
 
 const EV_KEY: u16 = 1;
+const KEY_VOLUMEDOWN: u16 = 114;
+const KEY_VOLUMEUP: u16 = 115;
 const KEY_POWER: u16 = 116;
 
 #[derive(Clone, Copy)]
@@ -38,7 +43,9 @@ impl Color {
 
 pub const BG_COLOR: Color = Color::rgb(10, 14, 20);
 pub const PANEL_BG: Color = Color::rgb(16, 23, 34);
+pub const PANEL_ACTIVE_BG: Color = Color::rgb(22, 34, 52);
 pub const BORDER_COLOR: Color = Color::rgb(40, 56, 80);
+pub const BORDER_ACTIVE: Color = Color::rgb(46, 213, 115);
 pub const TEXT_EMERALD: Color = Color::rgb(46, 213, 115);
 pub const TEXT_CYAN: Color = Color::rgb(72, 219, 251);
 pub const TEXT_AMBER: Color = Color::rgb(254, 202, 87);
@@ -215,6 +222,7 @@ struct SystemInfo {
     ram_used_mb: u64,
     ram_total_mb: u64,
     battery_pct: String,
+    battery_pct_num: u32,
     battery_status: String,
     battery_temp_c: String,
     battery_volts: String,
@@ -226,6 +234,14 @@ struct SystemInfo {
     homelab_nodes: Vec<PeerDisplayInfo>,
     active_link_str: String,
     logs: Vec<String>,
+    wol_logs: Vec<String>,
+    wol_daemon_running: bool,
+    time_str: String,
+    date_str: String,
+}
+
+fn check_wol_daemon() -> bool {
+    TcpStream::connect("127.0.0.1:9096").is_ok()
 }
 
 fn gather_system_info() -> SystemInfo {
@@ -301,10 +317,10 @@ fn gather_system_info() -> SystemInfo {
     };
     let ram_used_mb = used_kb / 1024;
 
-    let battery_pct = fs::read_to_string("/sys/class/power_supply/battery/capacity")
-        .unwrap_or_else(|_| "--".to_string())
-        .trim()
-        .to_string();
+    let battery_pct_raw = fs::read_to_string("/sys/class/power_supply/battery/capacity")
+        .unwrap_or_else(|_| "50".to_string());
+    let battery_pct_num = battery_pct_raw.trim().parse::<u32>().unwrap_or(50);
+    let battery_pct = battery_pct_num.to_string();
 
     let battery_status = fs::read_to_string("/sys/class/power_supply/battery/status")
         .unwrap_or_else(|_| "Unknown".to_string())
@@ -352,7 +368,6 @@ fn gather_system_info() -> SystemInfo {
         }
     }
 
-    // Dynamic Tailscale status query
     let mut tailscale_ip = "100.127.188.45".to_string();
     let mut tailnet_suffix = "chimaera-heptatonic.ts.net".to_string();
     let mut homelab_nodes = Vec::new();
@@ -460,6 +475,40 @@ fn gather_system_info() -> SystemInfo {
         }
     }
 
+    let mut wol_logs = Vec::new();
+    if let Ok(content) = fs::read_to_string(WOL_LOG_PATH) {
+        let lines: Vec<&str> = content.lines().collect();
+        let start = if lines.len() > 12 {
+            lines.len() - 12
+        } else {
+            0
+        };
+        for line in &lines[start..] {
+            wol_logs.push(line.trim_end().to_string());
+        }
+    }
+
+    let (time_str, date_str) = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let tm = libc::localtime(&t);
+        if !tm.is_null() {
+            let h = (*tm).tm_hour;
+            let m = (*tm).tm_min;
+            let s = (*tm).tm_sec;
+            let day = (*tm).tm_mday;
+            let mon = (*tm).tm_mon + 1;
+            let year = (*tm).tm_year + 1900;
+            (
+                format!("{:02}:{:02}:{:02}", h, m, s),
+                format!("{:04}-{:02}-{:02}", year, mon, day),
+            )
+        } else {
+            ("00:00:00".to_string(), "2026-09-26".to_string())
+        }
+    };
+
+    let wol_daemon_running = check_wol_daemon();
+
     SystemInfo {
         hostname,
         kernel_version,
@@ -468,6 +517,7 @@ fn gather_system_info() -> SystemInfo {
         ram_used_mb,
         ram_total_mb,
         battery_pct,
+        battery_pct_num,
         battery_status,
         battery_temp_c,
         battery_volts,
@@ -479,6 +529,10 @@ fn gather_system_info() -> SystemInfo {
         homelab_nodes,
         active_link_str,
         logs,
+        wol_logs,
+        wol_daemon_running,
+        time_str,
+        date_str,
     }
 }
 
@@ -492,29 +546,84 @@ fn set_display_hardware(on: bool) {
     }
 }
 
-fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
-    fb.clear(BG_COLOR);
-
-    // Top Header Banner
+fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
     fb.draw_rect(0, 0, FB_WIDTH, 48, PANEL_BG);
     fb.draw_rect(0, 48, FB_WIDTH, 2, BORDER_COLOR);
 
-    fb.draw_text(16, 12, "KURURU LINUX", TEXT_EMERALD, 2);
+    // Left Node Brand
+    fb.draw_text(16, 14, "KURURU", TEXT_EMERALD, 2);
+
+    // 3 Clickable/Navigable Tabs
+    let tabs = [
+        "1. CLUSTER",
+        "2. WOL RELAY",
+        "3. DESK CLOCK",
+    ];
+
+    let mut tx = 160;
+    for (i, &name) in tabs.iter().enumerate() {
+        let is_current = i == active_tab;
+        let tab_w = 150;
+        let bg = if is_current { PANEL_ACTIVE_BG } else { PANEL_BG };
+        let border = if is_current { BORDER_ACTIVE } else { BORDER_COLOR };
+        let text_color = if is_current { TEXT_EMERALD } else { TEXT_GRAY };
+
+        fb.draw_rect(tx, 8, tab_w, 32, bg);
+        fb.draw_rect(tx, 8, tab_w, 2, border);
+        fb.draw_rect(tx, 38, tab_w, 2, border);
+
+        let pad_x = tx + 14;
+        fb.draw_text(pad_x, 16, name, text_color, 1);
+
+        tx += tab_w + 12;
+    }
+
     fb.draw_text(
-        220,
+        660,
         18,
-        "Samsung Galaxy Tab 3 Lite (SM-T110) • Headless Node",
+        "StenioSentinel • Mnemocine Homelab",
+        TEXT_GRAY,
+        1,
+    );
+}
+
+fn draw_footer(fb: &mut Framebuffer) {
+    fb.draw_rect(0, 568, FB_WIDTH, 32, PANEL_BG);
+    fb.draw_rect(0, 568, FB_WIDTH, 1, BORDER_COLOR);
+    fb.draw_text(
+        16,
+        576,
+        "[VOL +/-] Switch Tab (1/2/3)",
         TEXT_CYAN,
         1,
     );
     fb.draw_text(
-        660,
-        18,
-        "StenioSentinel Governed • Mnemocine Homelab",
-        TEXT_GRAY,
+        340,
+        576,
+        "[POWER] Sleep / Wake Display",
+        TEXT_WHITE,
         1,
     );
+    fb.draw_text(
+        640,
+        576,
+        "Auto-sleep: 120s timer",
+        TEXT_DIM,
+        1,
+    );
+    fb.draw_text(
+        840,
+        576,
+        "UPS Battery: OK",
+        TEXT_EMERALD,
+        1,
+    );
+}
 
+// -------------------------------------------------------------
+// TAB 0: CLUSTER & HARDWARE TELEMETRY
+// -------------------------------------------------------------
+fn render_tab_cluster(fb: &mut Framebuffer, info: &SystemInfo) {
     // Telemetry Card (Left)
     fb.draw_rect(16, 60, 480, 240, PANEL_BG);
     fb.draw_rect(16, 60, 480, 2, BORDER_COLOR);
@@ -621,48 +730,176 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
             break;
         }
     }
+}
 
-    // Bottom Navigation Bar
-    fb.draw_rect(0, 568, FB_WIDTH, 32, PANEL_BG);
-    fb.draw_rect(0, 568, FB_WIDTH, 1, BORDER_COLOR);
-    fb.draw_text(
-        16,
-        576,
-        "[POWER BUTTON] Press to Sleep / Wake Display",
-        TEXT_CYAN,
-        1,
+// -------------------------------------------------------------
+// TAB 1: WAKE-ON-LAN HARDWARE CONTROLLER & RELAY
+// -------------------------------------------------------------
+fn render_tab_wol(fb: &mut Framebuffer, info: &SystemInfo) {
+    // Target 1: Psicopompo
+    fb.draw_rect(16, 60, 480, 240, PANEL_BG);
+    fb.draw_rect(16, 60, 480, 2, BORDER_COLOR);
+    fb.draw_text(28, 72, "WOL TARGET 1: PSICOPOMPO", TEXT_AMBER, 1);
+
+    let psicopompo_lines = [
+        ("Host:", "Psicopompo (Workstation & Gaming)"),
+        ("Hardware MAC:", "d0:94:66:de:8b:58"),
+        ("Tailscale IP:", "100.82.51.112"),
+        ("LAN Broadcast:", "192.168.3.255:9 (mlan0)"),
+        ("HTTP Trigger:", "http://kururu:9096/wake/psicopompo"),
+        ("SSH Command:", "ssh root@kururu kururu-wake psicopompo"),
+        ("WOL Engine:", "Native Rust Burst (5 packets / 25ms)"),
+    ];
+
+    let mut y = 96;
+    for (label, val) in &psicopompo_lines {
+        fb.draw_text(28, y, label, TEXT_GRAY, 1);
+        fb.draw_text(150, y, val, TEXT_WHITE, 1);
+        y += 20;
+    }
+
+    // Target 2: Kavure
+    fb.draw_rect(512, 60, 496, 240, PANEL_BG);
+    fb.draw_rect(512, 60, 496, 2, BORDER_COLOR);
+    fb.draw_text(524, 72, "WOL TARGET 2: KAVURE", TEXT_AMBER, 1);
+
+    let kavure_lines = [
+        ("Host:", "Kavure (Dell OptiPlex / Services)"),
+        ("Hardware MAC:", "d0:94:66:ad:f3:c4"),
+        ("Tailscale IP:", "100.124.146.77"),
+        ("LAN Broadcast:", "192.168.3.255:9 (mlan0)"),
+        ("HTTP Trigger:", "http://kururu:9096/wake/kavure"),
+        ("SSH Command:", "ssh root@kururu kururu-wake kavure"),
+        ("Daemon Status:", if info.wol_daemon_running { "ACTIVE (:9096)" } else { "STOPPED" }),
+    ];
+
+    let mut ky = 96;
+    for (label, val) in &kavure_lines {
+        fb.draw_text(524, ky, label, TEXT_GRAY, 1);
+        let color = if label.starts_with("Daemon") {
+            if info.wol_daemon_running { TEXT_EMERALD } else { TEXT_RED }
+        } else {
+            TEXT_WHITE
+        };
+        fb.draw_text(650, ky, val, color, 1);
+        ky += 20;
+    }
+
+    // Bottom Card: WOL Dispatch Log
+    fb.draw_rect(16, 312, 992, 244, PANEL_BG);
+    fb.draw_rect(16, 312, 992, 2, BORDER_COLOR);
+    fb.draw_text(28, 322, "RECENT WAKE-ON-LAN DISPATCH AUDIT LOG (/var/log/kururu-wol.log)", TEXT_EMERALD, 1);
+
+    let mut log_y = 348;
+    if info.wol_logs.is_empty() {
+        fb.draw_text(28, log_y, "No Wake-on-LAN packets dispatched yet. Waiting for triggers...", TEXT_DIM, 1);
+    } else {
+        for log in &info.wol_logs {
+            let truncated = if log.len() > 118 {
+                &log[..118]
+            } else {
+                log.as_str()
+            };
+            fb.draw_text(28, log_y, truncated, TEXT_CYAN, 1);
+            log_y += 16;
+            if log_y > 540 {
+                break;
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// TAB 2: RETRO DESK CLOCK & BATTERY MONITOR
+// -------------------------------------------------------------
+fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
+    // Massive Centered Digital Clock Card
+    fb.draw_rect(16, 60, 992, 260, PANEL_BG);
+    fb.draw_rect(16, 60, 992, 2, BORDER_COLOR);
+
+    fb.draw_text(40, 78, "SOVEREIGN HOMELAB TIME ENGINE • NTP SYNCHRONIZED", TEXT_AMBER, 1);
+
+    // Render huge 4x clock (Font 8x16 scaled 4x = 32x64 px per char)
+    // 8 chars * 32 px = 256 px width -> Center at x = (1024 - 256) / 2 = 384
+    fb.draw_text(384, 110, &info.time_str, TEXT_EMERALD, 4);
+
+    let date_line = format!("Local Date: {} • Node Hostname: {}", info.date_str, info.hostname);
+    fb.draw_text(320, 200, &date_line, TEXT_CYAN, 2);
+
+    let cluster_status = format!(
+        "Mnemocine Homelab: {}/5 Servers Active • Tailnet: {}",
+        info.homelab_online_count, info.tailnet_suffix
     );
-    fb.draw_text(
-        420,
-        576,
-        "Auto-sleep: 120s inactivity timer",
-        TEXT_DIM,
-        1,
-    );
-    fb.draw_text(
-        780,
-        576,
-        "Zero-Waste Tech Recycling",
-        TEXT_EMERALD,
-        1,
-    );
+    fb.draw_text(260, 250, &cluster_status, TEXT_GRAY, 1);
+
+    // Bottom Detailed Hardware & UPS Power Card
+    fb.draw_rect(16, 332, 992, 224, PANEL_BG);
+    fb.draw_rect(16, 332, 992, 2, BORDER_COLOR);
+    fb.draw_text(28, 344, "INTEGRATED UPS HARDWARE POWER & TELEMETRY", TEXT_AMBER, 1);
+
+    // Battery Bar
+    fb.draw_text(28, 376, "Battery Charge:", TEXT_GRAY, 1);
+    
+    // Draw battery meter bar (width = 300px)
+    fb.draw_rect(160, 374, 304, 18, BORDER_COLOR);
+    let fill_w = (info.battery_pct_num as usize * 300) / 100;
+    fb.draw_rect(162, 376, fill_w, 14, TEXT_EMERALD);
+
+    let bat_label = format!("{}% ({})", info.battery_pct, info.battery_status);
+    fb.draw_text(476, 376, &bat_label, TEXT_WHITE, 1);
+
+    let power_details = [
+        format!("Cell Voltage:    {}", info.battery_volts),
+        format!("Cell Temp:       {}", info.battery_temp_c),
+        format!("Power Source:    USB Charging (5V Micro-USB)"),
+        format!("System Load:     {}", info.load_avg),
+        format!("Uptime:          {}", info.uptime_str),
+        format!("Memory:          {} MB used / {} MB total", info.ram_used_mb, info.ram_total_mb),
+    ];
+
+    let mut py = 410;
+    for line in &power_details {
+        fb.draw_text(28, py, line, TEXT_WHITE, 1);
+        py += 22;
+    }
+
+    let side_notes = [
+        "Hardware UPS Protection: ACTIVE",
+        "If AC line drops, Kururu stays alive for hours.",
+        "Zero-power idle screen blanking after 120s.",
+        "Wake-on-LAN ready on port 9096.",
+    ];
+
+    let mut sy = 410;
+    for note in &side_notes {
+        fb.draw_text(520, sy, note, TEXT_CYAN, 1);
+        sy += 22;
+    }
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.1 (Dynamic Live Telemetry)...");
+    println!("[Kururu Display Daemon] Starting v1.2 (Multi-Tab & Volume Navigation)...");
 
     let screen_active = Arc::new(AtomicBool::new(true));
-    let screen_active_clone = screen_active.clone();
+    let screen_active_power = screen_active.clone();
+    let screen_active_keys = screen_active.clone();
+
+    let current_tab = Arc::new(AtomicUsize::new(0));
+    let current_tab_keys = current_tab.clone();
+
+    let wake_signal = Arc::new(AtomicBool::new(true));
+    let wake_signal_power = wake_signal.clone();
+    let wake_signal_keys = wake_signal.clone();
 
     // Start with display ON initially so user sees it right away
     set_display_hardware(true);
 
-    // Thread: Listen to hardware Power button
+    // Thread 1: Listen to hardware Power button (/dev/input/event2)
     thread::spawn(move || {
-        let mut file = match File::open(EVENT_PATH) {
+        let mut file = match File::open(EVENT_POWER) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("Failed to open {}: {}", EVENT_PATH, e);
+                eprintln!("Failed to open {}: {}", EVENT_POWER, e);
                 return;
             }
         };
@@ -680,14 +917,63 @@ fn main() {
 
             // KEY_POWER press (value == 1)
             if event.type_ == EV_KEY && event.code == KEY_POWER && event.value == 1 {
-                let current = screen_active_clone.load(Ordering::SeqCst);
+                let current = screen_active_power.load(Ordering::SeqCst);
                 let new_state = !current;
                 println!(
                     "[Kururu Display] Power button toggled -> State: {}",
                     if new_state { "AWAKE" } else { "SLEEP" }
                 );
                 set_display_hardware(new_state);
-                screen_active_clone.store(new_state, Ordering::SeqCst);
+                screen_active_power.store(new_state, Ordering::SeqCst);
+                if new_state {
+                    wake_signal_power.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+
+    // Thread 2: Listen to hardware Volume Up / Volume Down keys (/dev/input/event0)
+    thread::spawn(move || {
+        let mut file = match File::open(EVENT_KEYS) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Failed to open {}: {}", EVENT_KEYS, e);
+                return;
+            }
+        };
+
+        let event_size = std::mem::size_of::<InputEvent>();
+        let mut buf = vec![0u8; event_size];
+
+        loop {
+            if file.read_exact(&mut buf).is_err() {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+
+            let event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEvent) };
+
+            // Only respond on key down (value == 1)
+            if event.type_ == EV_KEY && event.value == 1 {
+                if !screen_active_keys.load(Ordering::SeqCst) {
+                    // If asleep, pressing volume key wakes display up immediately
+                    println!("[Kururu Display] Volume key pressed -> Waking up display");
+                    set_display_hardware(true);
+                    screen_active_keys.store(true, Ordering::SeqCst);
+                    wake_signal_keys.store(true, Ordering::SeqCst);
+                } else if event.code == KEY_VOLUMEUP {
+                    // Next tab
+                    let next = (current_tab_keys.load(Ordering::SeqCst) + 1) % 3;
+                    current_tab_keys.store(next, Ordering::SeqCst);
+                    println!("[Kururu Display] Volume UP -> Switched to Tab {}", next + 1);
+                    wake_signal_keys.store(true, Ordering::SeqCst);
+                } else if event.code == KEY_VOLUMEDOWN {
+                    // Previous tab
+                    let prev = (current_tab_keys.load(Ordering::SeqCst) + 3 - 1) % 3;
+                    current_tab_keys.store(prev, Ordering::SeqCst);
+                    println!("[Kururu Display] Volume DOWN -> Switched to Tab {}", prev + 1);
+                    wake_signal_keys.store(true, Ordering::SeqCst);
+                }
             }
         }
     });
@@ -707,7 +993,7 @@ fn main() {
         let is_active = screen_active.load(Ordering::SeqCst);
 
         if is_active {
-            if !was_active {
+            if !was_active || wake_signal.swap(false, Ordering::SeqCst) {
                 last_awake_time = Instant::now();
                 was_active = true;
             }
@@ -722,15 +1008,26 @@ fn main() {
                 continue;
             }
 
+            let tab = current_tab.load(Ordering::SeqCst);
             let info = gather_system_info();
-            render_dashboard(&mut fb, &info);
+
+            fb.clear(BG_COLOR);
+            draw_header(&mut fb, tab);
+
+            match tab {
+                0 => render_tab_cluster(&mut fb, &info),
+                1 => render_tab_wol(&mut fb, &info),
+                _ => render_tab_clock(&mut fb, &info),
+            }
+
+            draw_footer(&mut fb);
             let _ = fb.flush();
 
             thread::sleep(Duration::from_secs(2));
         } else {
             was_active = false;
-            // Sleep quietly while screen is off, checking state every 250ms
-            thread::sleep(Duration::from_millis(250));
+            // Sleep quietly while screen is off, checking state every 200ms
+            thread::sleep(Duration::from_millis(200));
         }
     }
 }

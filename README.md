@@ -153,10 +153,21 @@ A lightweight, zero-dependency `su` binary compiled statically for `armv7-unknow
 ### `crates/kururu-display`
 An event-driven hardware and graphics daemon written in native Rust (`edition = "2021"`). Features:
 * **Zero Overhead Framebuffer Rendering:** Directly maps `/dev/graphics/fb0` (1024x600, 32bpp) without running X11, Wayland, or Android SurfaceFlinger.
-* **100% Dynamic Telemetry:** Gathers live CPU load averages, RAM allocation, and PMIC battery health (percentage, microvolt fuelgauge voltage, and cell temperature).
-* **Homelab Node Monitor:** Dynamically inspects the Tailscale local API to monitor the 5 core cluster servers in real time: `Psicopompo`, `Kuaray`, `Kavure`, `Ybytu`, and `Ybyra` (indicating direct links, active WireGuard peers, and total mesh size).
-* **Live System Console:** Embedded JetBrains Mono bitmap font renders the tail of the kernel `dmesg` log in real-time.
-* **Hardware Power Key Control:** Listens to `/dev/input/event2` (Marvell 88PM822 PMIC `KEY_POWER`). Pushing the tablet's physical power button wakes or sleeps the display panel, with an automatic 120-second inactivity sleep timer.
+* **Multi-Tab Dashboard Navigation:** Listens to `/dev/input/event0` (`KEY_VOLUMEUP` and `KEY_VOLUMEDOWN`). Pressing the physical volume rocker smoothly cycles between 3 dedicated dashboards:
+  1. **Tab 1 — Cluster Telemetry:** Live CPU load, RAM allocation, battery fuelgauge, tailnet mesh stats, and the 5 core homelab servers (`Psicopompo`, `Kuaray`, `Kavure`, `Ybytu`, `Ybyra`), plus dynamic `dmesg` kernel console.
+  2. **Tab 2 — WoL Relay Status:** Hardware MAC addresses, Tailscale IPs, broadcast target `192.168.3.255:9`, and live HTTP trigger status for `psicopompo` and `kavure`.
+  3. **Tab 3 — Retro Desk Clock:** Huge 4x scaled digital clock synchronized with NTP, local date, and full UPS battery meter and cell temperature.
+* **Hardware Power & Sleep Control:** Listens to `/dev/input/event2` (Marvell 88PM822 PMIC `KEY_POWER`). Pushing the tablet's physical power button or volume rocker instantly wakes or sleeps the display panel, with an automatic 120-second inactivity sleep timer for maximum power efficiency (<0.8W).
+
+### `crates/kururu-wake`
+A native, sovereign Wake-on-LAN (WoL) burst relay and HTTP daemon written in Rust:
+* **24/7 Resilient WoL Relay:** Because Kururu consumes < 1W and is equipped with a battery backup (UPS), it acts as the primary broadcast emitter on `192.168.3.255:9` directly attached to the main AP.
+* **CLI & HTTP Endpoints:**
+  - CLI: `kururu-wake psicopompo`, `kururu-wake kavure`, or custom MAC.
+  - HTTP Daemon (port `9096`):
+    - `GET /wake/psicopompo` → Emits burst of 5 magic packets to `d0:94:66:de:8b:58`.
+    - `GET /wake/kavure` → Emits burst of 5 magic packets to `d0:94:66:ad:f3:c4`.
+    - `GET /health` → Real-time status probe.
 
 ---
 

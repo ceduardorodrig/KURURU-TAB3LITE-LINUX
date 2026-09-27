@@ -148,4 +148,9 @@ echo "[Kururu] Starting Kururu Display & Power Daemon..."
 killall kururu-display 2>/dev/null
 nohup chroot /data/alpine /usr/local/bin/kururu-display > /data/kururu-display.log 2>&1 &
 
+# Start Kururu Wake-on-LAN (WOL) Relay Daemon on port 9096
+echo "[Kururu] Starting Wake-on-LAN HTTP Relay Daemon (port 9096)..."
+killall kururu-wake 2>/dev/null
+nohup chroot /data/alpine /usr/local/bin/kururu-wake --daemon 9096 > /var/log/kururu-wol-daemon.log 2>&1 &
+
 echo "=== [Kururu] Native Headless Boot Sequence Complete ==="
