@@ -375,6 +375,7 @@ struct PeerDisplayInfo {
 }
 
 #[allow(dead_code)]
+#[derive(Default)]
 struct SystemInfo {
     hostname: String,
     kernel_version: String,
@@ -602,18 +603,20 @@ impl TouchCal {
     }
 }
 
-fn gather_system_info() -> SystemInfo {
-    let hostname = fs::read_to_string("/proc/sys/kernel/hostname")
+/// Cheap telemetry: file reads / syscalls / clock only (no subprocesses).
+/// Refreshed every second so the clock and vitals stay live.
+fn gather_fast(info: &mut SystemInfo) {
+    info.hostname = fs::read_to_string("/proc/sys/kernel/hostname")
         .unwrap_or_else(|_| "kururu".to_string())
         .trim()
         .to_string();
 
-    let kernel_version = fs::read_to_string("/proc/sys/kernel/osrelease")
+    info.kernel_version = fs::read_to_string("/proc/sys/kernel/osrelease")
         .unwrap_or_else(|_| "3.4.5".to_string())
         .trim()
         .to_string();
 
-    let uptime_str = if let Ok(u) = fs::read_to_string("/proc/uptime") {
+    info.uptime_str = if let Ok(u) = fs::read_to_string("/proc/uptime") {
         if let Some(first) = u.split_whitespace().next() {
             if let Ok(sec) = first.parse::<f64>() {
                 let s = sec as u64;
@@ -636,14 +639,14 @@ fn gather_system_info() -> SystemInfo {
         "Unknown".to_string()
     };
 
-    let load_avg = if let Ok(l) = fs::read_to_string("/proc/loadavg") {
+    info.load_avg = if let Ok(l) = fs::read_to_string("/proc/loadavg") {
         let parts: Vec<&str> = l.split_whitespace().take(3).collect();
         parts.join(", ")
     } else {
         "Unknown".to_string()
     };
 
-    let cpu_freq_str = if let Ok(f) = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") {
+    info.cpu_freq_str = if let Ok(f) = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") {
         if let Ok(khz) = f.trim().parse::<u64>() {
             format!("{:.2} GHz", khz as f64 / 1_000_000.0)
         } else {
@@ -657,7 +660,6 @@ fn gather_system_info() -> SystemInfo {
     let mut free_kb = 0u64;
     let mut buffers_kb = 0u64;
     let mut cached_kb = 0u64;
-
     if let Ok(mem) = fs::read_to_string("/proc/meminfo") {
         for line in mem.lines() {
             let mut parts = line.split_whitespace();
@@ -675,15 +677,10 @@ fn gather_system_info() -> SystemInfo {
             }
         }
     }
-
-    let ram_total_mb = total_kb / 1024;
+    info.ram_total_mb = total_kb / 1024;
     let available_kb = free_kb + buffers_kb + cached_kb;
-    let used_kb = if total_kb > available_kb {
-        total_kb - available_kb
-    } else {
-        0
-    };
-    let ram_used_mb = used_kb / 1024;
+    let used_kb = if total_kb > available_kb { total_kb - available_kb } else { 0 };
+    info.ram_used_mb = used_kb / 1024;
 
     let (disk_total_mb, disk_free_mb) = unsafe {
         let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -697,28 +694,26 @@ fn gather_system_info() -> SystemInfo {
             (5120, 4400)
         }
     };
-    let disk_used_mb = if disk_total_mb > disk_free_mb {
-        disk_total_mb - disk_free_mb
-    } else {
-        0
-    };
+    info.disk_total_mb = disk_total_mb;
+    info.disk_free_mb = disk_free_mb;
+    info.disk_used_mb = if disk_total_mb > disk_free_mb { disk_total_mb - disk_free_mb } else { 0 };
 
     let battery_pct_raw = fs::read_to_string("/sys/class/power_supply/battery/capacity")
         .unwrap_or_else(|_| "50".to_string());
-    let battery_pct_num = battery_pct_raw.trim().parse::<u32>().unwrap_or(50);
-    let battery_pct = battery_pct_num.to_string();
+    info.battery_pct_num = battery_pct_raw.trim().parse::<u32>().unwrap_or(50);
+    info.battery_pct = info.battery_pct_num.to_string();
 
-    let battery_status = fs::read_to_string("/sys/class/power_supply/battery/status")
+    info.battery_status = fs::read_to_string("/sys/class/power_supply/battery/status")
         .unwrap_or_else(|_| "Unknown".to_string())
         .trim()
         .to_string();
 
-    let battery_health = fs::read_to_string("/sys/class/power_supply/battery/health")
+    info.battery_health = fs::read_to_string("/sys/class/power_supply/battery/health")
         .unwrap_or_else(|_| "Unknown".to_string())
         .trim()
         .to_string();
 
-    let battery_temp_c = if let Ok(t_raw) = fs::read_to_string("/sys/class/power_supply/battery/temp") {
+    info.battery_temp_c = if let Ok(t_raw) = fs::read_to_string("/sys/class/power_supply/battery/temp") {
         if let Ok(val) = t_raw.trim().parse::<f64>() {
             format!("{:.1}C", val / 10.0)
         } else {
@@ -728,7 +723,7 @@ fn gather_system_info() -> SystemInfo {
         "--C".to_string()
     };
 
-    let battery_volts = if let Ok(v_raw) = fs::read_to_string("/sys/class/power_supply/battery/voltage_now") {
+    info.battery_volts = if let Ok(v_raw) = fs::read_to_string("/sys/class/power_supply/battery/voltage_now") {
         if let Ok(val) = v_raw.trim().parse::<f64>() {
             format!("{:.2}V", val / 1_000_000.0)
         } else {
@@ -738,7 +733,59 @@ fn gather_system_info() -> SystemInfo {
         "--V".to_string()
     };
 
-    let mut lan_ip = "192.168.3.55".to_string();
+    info.wifi_signal_dbm = "-35 dBm".to_string();
+    if let Ok(content) = fs::read_to_string("/proc/net/wireless") {
+        for line in content.lines() {
+            if line.contains("mlan0:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    let lvl = parts[3].trim_end_matches('.');
+                    info.wifi_signal_dbm = format!("{} dBm", lvl);
+                }
+            }
+        }
+    }
+
+    const DAY_NAMES: [&str; 7] = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    const MONTH_NAMES: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December",
+    ];
+    // TZ is set once at process startup in main() via BRT3.
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let tm = libc::localtime(&t);
+        if !tm.is_null() {
+            let h = (*tm).tm_hour;
+            let m = (*tm).tm_min;
+            let s = (*tm).tm_sec;
+            let day = (*tm).tm_mday;
+            let mon = (*tm).tm_mon;
+            let year = (*tm).tm_year + 1900;
+            let wday = ((*tm).tm_wday as usize) % 7;
+            let mon_idx = (mon as usize) % 12;
+            info.time_str = format!("{:02}:{:02}:{:02}", h, m, s);
+            info.date_str = format!("{:02}/{:02}/{}", day, mon + 1, year);
+            info.day_name = DAY_NAMES[wday].to_string();
+            info.date_full_str = format!(
+                "{} | {} {} {}",
+                DAY_NAMES[wday].to_uppercase(), day, MONTH_NAMES[mon_idx].to_uppercase(), year
+            );
+        } else {
+            info.time_str = "00:00:00".to_string();
+            info.date_str = "01/01/1970".to_string();
+            info.day_name = "Monday".to_string();
+            info.date_full_str = "MONDAY | 1 JANUARY 1970".to_string();
+        }
+    }
+}
+
+/// Expensive telemetry: spawns subprocesses (ip, wpa_cli, tailscale, dmesg)
+/// and reads config/log files. Refreshed every few seconds.
+fn gather_slow(info: &mut SystemInfo) {
+    info.lan_ip = "192.168.3.55".to_string();
     if let Ok(output) = Command::new("ip").args(["-4", "addr", "show"]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut cur_iface = "";
@@ -752,56 +799,43 @@ fn gather_system_info() -> SystemInfo {
                 if let Some(ip_cidr) = trimmed.split_whitespace().nth(1) {
                     let ip = ip_cidr.split('/').next().unwrap_or(ip_cidr);
                     if cur_iface.starts_with("mlan") || cur_iface.starts_with("wlan") {
-                        lan_ip = ip.to_string();
+                        info.lan_ip = ip.to_string();
                     }
                 }
             }
         }
     }
 
-    let mut wifi_ssid = "Cratos".to_string();
-    let mut wifi_mac = "00:50:43:XX:XX:XX".to_string();
+    info.wifi_ssid = "Cratos".to_string();
+    info.wifi_mac = "00:50:43:XX:XX:XX".to_string();
     if let Ok(output) = Command::new("wpa_cli").arg("status").output() {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
             if let Some(rest) = line.strip_prefix("ssid=") {
-                wifi_ssid = rest.trim().to_string();
+                info.wifi_ssid = rest.trim().to_string();
             } else if let Some(rest) = line.strip_prefix("address=") {
-                wifi_mac = rest.trim().to_string();
+                info.wifi_mac = rest.trim().to_string();
             }
         }
     }
 
-    let mut wifi_signal_dbm = "-35 dBm".to_string();
-    if let Ok(content) = fs::read_to_string("/proc/net/wireless") {
-        for line in content.lines() {
-            if line.contains("mlan0:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    let lvl = parts[3].trim_end_matches('.');
-                    wifi_signal_dbm = format!("{} dBm", lvl);
-                }
-            }
-        }
-    }
-
-    let mut tailscale_ip = "100.127.188.45".to_string();
-    let mut tailnet_suffix = "chimaera-heptatonic.ts.net".to_string();
-    let mut homelab_nodes = Vec::new();
-    let mut homelab_online_count = 0;
-    let mut peers_total_count = 0;
-    let mut active_link_str = "None (Idle)".to_string();
+    info.tailscale_ip = "100.127.188.45".to_string();
+    info.tailnet_suffix = "chimaera-heptatonic.ts.net".to_string();
+    info.homelab_online_count = 0;
+    info.peers_total_count = 0;
+    info.active_link_str = "None (Idle)".to_string();
+    info.homelab_nodes.clear();
 
     if let Ok(output) = Command::new("tailscale").args(["status", "--json"]).output() {
         if let Ok(ts) = serde_json::from_slice::<TailscaleJson>(&output.stdout) {
             if let Some(suffix) = ts.magic_dns_suffix {
                 if !suffix.is_empty() {
-                    tailnet_suffix = suffix;
+                    info.tailnet_suffix = suffix;
                 }
             } else if let Some(ct) = ts.current_tailnet {
                 if let Some(suffix) = ct.magic_dns_suffix {
                     if !suffix.is_empty() {
-                        tailnet_suffix = suffix;
+                        info.tailnet_suffix = suffix;
                     }
                 }
             }
@@ -809,13 +843,13 @@ fn gather_system_info() -> SystemInfo {
             if let Some(self_node) = ts.self_node {
                 if let Some(ips) = self_node.tailscale_ips {
                     if let Some(first_ip) = ips.first() {
-                        tailscale_ip = first_ip.clone();
+                        info.tailscale_ip = first_ip.clone();
                     }
                 }
             }
 
             if let Some(peer_map) = ts.peer {
-                peers_total_count = peer_map.len();
+                info.peers_total_count = peer_map.len();
                 let mut all_peers = Vec::new();
 
                 for (_k, v) in peer_map {
@@ -826,7 +860,7 @@ fn gather_system_info() -> SystemInfo {
                     let cur_addr = v.cur_addr.unwrap_or_default();
 
                     if active && !name.is_empty() {
-                        active_link_str = if !cur_addr.is_empty() {
+                        info.active_link_str = if !cur_addr.is_empty() {
                             format!("{} ({})", name, cur_addr)
                         } else {
                             format!("{} (active)", name)
@@ -855,9 +889,9 @@ fn gather_system_info() -> SystemInfo {
                     let match_peer = all_peers.iter().find(|p| p.name.to_lowercase().contains(&needle));
                     if let Some(p) = match_peer {
                         if p.online {
-                            homelab_online_count += 1;
+                            info.homelab_online_count += 1;
                         }
-                        homelab_nodes.push(PeerDisplayInfo {
+                        info.homelab_nodes.push(PeerDisplayInfo {
                             name: canonical.to_string(),
                             ip: p.ip.clone(),
                             online: p.online,
@@ -865,7 +899,7 @@ fn gather_system_info() -> SystemInfo {
                             cur_addr: p.cur_addr.clone(),
                         });
                     } else {
-                        homelab_nodes.push(PeerDisplayInfo {
+                        info.homelab_nodes.push(PeerDisplayInfo {
                             name: canonical.to_string(),
                             ip: "---".to_string(),
                             online: false,
@@ -879,7 +913,7 @@ fn gather_system_info() -> SystemInfo {
     }
 
     let ts = local_time_str();
-    let mut logs = Vec::new();
+    info.logs.clear();
     if let Ok(output) = Command::new("dmesg").output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let lines: Vec<&str> = stdout.lines().collect();
@@ -890,11 +924,11 @@ fn gather_system_info() -> SystemInfo {
         };
         for line in &lines[start..] {
             // dmesg has no wall clock → prepend the TZ-aware timestamp.
-            logs.push(format!("{} {}", ts, line.trim_end()));
+            info.logs.push(format!("{} {}", ts, line.trim_end()));
         }
     }
 
-    let mut wol_logs = Vec::new();
+    info.wol_logs.clear();
     if let Ok(content) = fs::read_to_string(WOL_LOG_PATH) {
         let lines: Vec<&str> = content.lines().collect();
         let start = if lines.len() > 14 {
@@ -904,109 +938,27 @@ fn gather_system_info() -> SystemInfo {
         };
         for line in &lines[start..] {
             // kururu-wake already embeds [HH:MM:SS] in the file → no prefix here.
-            wol_logs.push(line.trim_end().to_string());
+            info.wol_logs.push(line.trim_end().to_string());
         }
     }
 
-    let day_names = [
-        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
-    ];
-    let month_names = [
-        "January", "February", "March", "April", "May", "June", "July", "August",
-        "September", "October", "November", "December",
-    ];
+    info.wol_daemon_running = check_wol_daemon();
 
-    // TZ is set once at process startup in main() via BRT3 — no re-set needed here.
-
-    let (time_str, date_str, day_name, date_full_str) = unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let tm = libc::localtime(&t);
-        if !tm.is_null() {
-            let h = (*tm).tm_hour;
-            let m = (*tm).tm_min;
-            let s = (*tm).tm_sec;
-            let day = (*tm).tm_mday;
-            let mon = (*tm).tm_mon;
-            let year = (*tm).tm_year + 1900;
-            let wday = ((*tm).tm_wday as usize) % 7;
-            let mon_idx = (mon as usize) % 12;
-
-            let d_name = day_names[wday].to_string();
-            let m_name = month_names[mon_idx];
-            let full = format!("{} | {} {} {}", d_name.to_uppercase(), day, m_name.to_uppercase(), year);
-
-            (
-                format!("{:02}:{:02}:{:02}", h, m, s),
-                format!("{:02}/{:02}/{}", day, mon + 1, year),
-                d_name,
-                full,
-            )
-        } else {
-            (
-                "00:00:00".to_string(),
-                "01/01/1970".to_string(),
-                "Monday".to_string(),
-                "MONDAY | 1 JANUARY 1970".to_string(),
-            )
-        }
-    };
-
-    let (wol_target1_mac, wol_target2_mac) = {
-        let mut psi = "d0:94:66:xx:xx:58".to_string();
-        let mut kav = "d0:94:66:xx:xx:c4".to_string();
-        if let Ok(content) = fs::read_to_string("/etc/kururu-wake.conf") {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if let Some((k, v)) = trimmed.split_once('=') {
-                    let k_clean = k.trim().to_lowercase();
-                    let v_clean = v.trim().trim_matches('"').trim_matches('\'');
-                    if k_clean == "psicopompo" {
-                        psi = v_clean.to_string();
-                    } else if k_clean == "kavure" {
-                        kav = v_clean.to_string();
-                    }
+    info.wol_target1_mac = "d0:94:66:xx:xx:58".to_string();
+    info.wol_target2_mac = "d0:94:66:xx:xx:c4".to_string();
+    if let Ok(content) = fs::read_to_string("/etc/kururu-wake.conf") {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some((k, v)) = trimmed.split_once('=') {
+                let k_clean = k.trim().to_lowercase();
+                let v_clean = v.trim().trim_matches('"').trim_matches('\'');
+                if k_clean == "psicopompo" {
+                    info.wol_target1_mac = v_clean.to_string();
+                } else if k_clean == "kavure" {
+                    info.wol_target2_mac = v_clean.to_string();
                 }
             }
         }
-        (psi, kav)
-    };
-
-    SystemInfo {
-        hostname,
-        kernel_version,
-        uptime_str,
-        load_avg,
-        cpu_freq_str,
-        ram_used_mb,
-        ram_total_mb,
-        disk_used_mb,
-        disk_total_mb,
-        disk_free_mb,
-        battery_pct,
-        battery_pct_num,
-        battery_status,
-        battery_health,
-        battery_temp_c,
-        battery_volts,
-        lan_ip,
-        wifi_ssid,
-        wifi_signal_dbm,
-        wifi_mac,
-        tailscale_ip,
-        tailnet_suffix,
-        homelab_online_count,
-        peers_total_count,
-        homelab_nodes,
-        active_link_str,
-        logs,
-        wol_logs,
-        wol_daemon_running: check_wol_daemon(),
-        wol_target1_mac,
-        wol_target2_mac,
-        time_str,
-        date_str,
-        day_name,
-        date_full_str,
     }
 }
 
@@ -1505,7 +1457,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.6 (Retro-HUD UI, live UPS, touch, boot-safe PATH)...");
+    println!("[Kururu Display Daemon] Starting v1.7 (1s live refresh, Retro-HUD UI, live UPS, touch)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -1648,14 +1600,17 @@ fn main() {
     let mut last_awake_time = Instant::now();
     let mut was_active = false;
 
-    // Cached system info — refreshed every REFRESH_INTERVAL, rendered on every wake
+    // Telemetry cache: cheap fields refresh every FAST_SECS (so the clock ticks
+    // second-by-second); subprocess-heavy fields every SLOW_SECS.
     let mut cached_info: Option<SystemInfo> = None;
-    let mut last_refresh = Instant::now()
+    let mut last_fast = Instant::now()
         .checked_sub(Duration::from_secs(10))
         .unwrap_or_else(Instant::now);
+    let mut last_slow = last_fast;
 
     const TICK_MS: u64 = 50;          // Poll interval: 50ms max button latency
-    const REFRESH_SECS: u64 = 2;      // Full telemetry refresh cadence
+    const FAST_SECS: u64 = 1;         // Cheap telemetry + render cadence
+    const SLOW_SECS: u64 = 5;         // Subprocess-heavy telemetry cadence
 
     loop {
         let is_active = screen_active.load(Ordering::SeqCst);
@@ -1664,11 +1619,12 @@ fn main() {
             let got_wake = wake_signal.swap(false, Ordering::SeqCst);
 
             if !was_active {
-                // Just woke up — reset activity timer and force immediate refresh
+                // Just woke up — reset activity timer and force a full refresh
                 last_awake_time = Instant::now();
-                last_refresh = last_awake_time
+                last_fast = last_awake_time
                     .checked_sub(Duration::from_secs(10))
                     .unwrap_or(last_awake_time);
+                last_slow = last_fast;
                 was_active = true;
             }
 
@@ -1688,17 +1644,28 @@ fn main() {
                 continue;
             }
 
-            // Refresh telemetry every REFRESH_SECS, or immediately on first paint
-            let needs_refresh = cached_info.is_none()
-                || last_refresh.elapsed() >= Duration::from_secs(REFRESH_SECS);
+            // Cheap refresh (and render) every FAST_SECS; heavy telemetry every
+            // SLOW_SECS. A wake forces both. Rendering each fast tick keeps the
+            // retro clock's seconds live.
+            let fast_due = cached_info.is_none()
+                || last_fast.elapsed() >= Duration::from_secs(FAST_SECS);
+            let slow_due = cached_info.is_none()
+                || last_slow.elapsed() >= Duration::from_secs(SLOW_SECS);
 
-            // Render immediately on button press even without a full refresh,
-            // so the tab switch feels instant (<50ms).
-            let should_render = got_wake || needs_refresh;
+            let should_render = got_wake || fast_due;
 
-            if needs_refresh {
-                cached_info = Some(gather_system_info());
-                last_refresh = Instant::now();
+            if fast_due {
+                if cached_info.is_none() {
+                    cached_info = Some(SystemInfo::default());
+                }
+                if let Some(info) = cached_info.as_mut() {
+                    gather_fast(info);
+                    last_fast = Instant::now();
+                    if slow_due {
+                        gather_slow(info);
+                        last_slow = Instant::now();
+                    }
+                }
             }
 
             if should_render {
