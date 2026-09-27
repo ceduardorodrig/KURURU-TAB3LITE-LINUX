@@ -172,6 +172,19 @@ static EFFECTS: AtomicU32 = AtomicU32::new(EFFECT_ALL);
 static BRIGHTNESS: AtomicUsize = AtomicUsize::new(180);
 /// Auto-sleep timeout in seconds (0 = never).
 static SLEEP_SECS: AtomicUsize = AtomicUsize::new(120);
+/// Output volume (0..=100). Best-effort: maps to the codec's headphone-amp
+/// register (PM805_CODEC_HEADPHONE_AMP_SETTING) — the 88pm805 has no standard
+/// ALSA mixer control.
+static VOLUME: AtomicUsize = AtomicUsize::new(60);
+
+fn set_volume(pct: usize) {
+    let pct = pct.min(100);
+    VOLUME.store(pct, Ordering::Relaxed);
+    let val = (pct * 255 / 100).to_string();
+    let _ = Command::new("amixer")
+        .args(["-c", "0", "cset", "numid=77", &val])
+        .output();
+}
 
 const BACKLIGHT_PATHS: [&str; 2] = [
     "/sys/class/backlight/panel/brightness",
@@ -1480,21 +1493,21 @@ const KB_ROWS: &[&[KKey]] = &[
         k("4", Key::Ch('4'), 1), k("5", Key::Ch('5'), 1), k("6", Key::Ch('6'), 1),
         k("7", Key::Ch('7'), 1), k("8", Key::Ch('8'), 1), k("9", Key::Ch('9'), 1),
         k("0", Key::Ch('0'), 1), k("-", Key::Ch('-'), 1), k("=", Key::Ch('='), 1),
-        k("Bksp", Key::Backspace, 2),
+        k("Bksp", Key::Backspace, 4),
     ],
     &[
-        k("Tab", Key::Tab, 2), k("q", Key::Ch('q'), 1), k("w", Key::Ch('w'), 1),
+        k("Tab", Key::Tab, 3), k("q", Key::Ch('q'), 1), k("w", Key::Ch('w'), 1),
         k("e", Key::Ch('e'), 1), k("r", Key::Ch('r'), 1), k("t", Key::Ch('t'), 1),
         k("y", Key::Ch('y'), 1), k("u", Key::Ch('u'), 1), k("i", Key::Ch('i'), 1),
         k("o", Key::Ch('o'), 1), k("p", Key::Ch('p'), 1), k("[", Key::Ch('['), 1),
-        k("]", Key::Ch(']'), 1),
+        k("]", Key::Ch(']'), 1), k("\\", Key::Ch('\\'), 1),
     ],
     &[
         k("Ctrl", Key::Ctrl, 2), k("a", Key::Ch('a'), 1), k("s", Key::Ch('s'), 1),
         k("d", Key::Ch('d'), 1), k("f", Key::Ch('f'), 1), k("g", Key::Ch('g'), 1),
         k("h", Key::Ch('h'), 1), k("j", Key::Ch('j'), 1), k("k", Key::Ch('k'), 1),
         k("l", Key::Ch('l'), 1), k(";", Key::Ch(';'), 1), k("'", Key::Ch('\''), 1),
-        k("Enter", Key::Enter, 2),
+        k("Enter", Key::Enter, 3),
     ],
     &[
         k("Shift", Key::Shift, 3), k("z", Key::Ch('z'), 1), k("x", Key::Ch('x'), 1),
@@ -1504,11 +1517,12 @@ const KB_ROWS: &[&[KKey]] = &[
     ],
     &[
         k("Alt", Key::Alt, 2), k("Esc", Key::Esc, 2), k("Space", Key::Space, 8),
-        k("<-", Key::Left, 1), k("^", Key::Up, 1), k("v", Key::Down, 1), k("->", Key::Right, 1),
+        k("<", Key::Left, 1), k("^", Key::Up, 1), k("v", Key::Down, 1), k(">", Key::Right, 1),
     ],
 ];
 
-const KB_U: usize = 56;      // key unit width
+const KB_UNITS: usize = 16; // every row totals 16 units (fills the width)
+const KB_U: usize = (FB_WIDTH - (KB_UNITS - 1) * KB_GAP) / KB_UNITS;
 const KB_GAP: usize = 6;
 const KB_H: usize = 44;
 const KB_TOP: usize = 300;
@@ -1584,9 +1598,66 @@ fn draw_keyboard(fb: &mut Framebuffer) {
 struct WifiForm {
     ssid: String,
     psk: String,
-    focus: usize, // 0 = SSID, 1 = Password, 2 = Connect
+    focus: usize, // 0 = password, 1 = connect
     editing: bool,
     status: String,
+    nets: Vec<(String, i32, String)>, // (ssid, signal dBm, flags)
+    sel: usize,
+    connected: String,
+    scanned: bool,
+}
+
+/// Trigger a Wi-Fi scan (once per Settings visit) and populate the network
+/// list in the background.
+fn start_wifi_scan() {
+    {
+        match wifi_form().lock() {
+            Ok(mut f) => {
+                if f.scanned {
+                    return;
+                }
+                f.scanned = true;
+                f.status = "Procurando redes...".to_string();
+            }
+            Err(_) => return,
+        }
+    }
+    thread::spawn(|| {
+        let _ = Command::new("wpa_cli").arg("scan").output();
+        thread::sleep(Duration::from_secs(4));
+        let connected = Command::new("wpa_cli")
+            .arg("status")
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .find_map(|l| l.strip_prefix("ssid=").map(|s| s.trim().to_string()))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let mut nets: Vec<(String, i32, String)> = Vec::new();
+        if let Ok(out) = Command::new("wpa_cli").arg("scan_results").output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines().skip(1) {
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() >= 5 {
+                    let signal = cols[2].trim().parse::<i32>().unwrap_or(0);
+                    let flags = cols[3].trim().to_string();
+                    let ssid = cols[4].trim().to_string();
+                    if !ssid.is_empty() && !nets.iter().any(|(s, _, _)| s == &ssid) {
+                        nets.push((ssid, signal, flags));
+                    }
+                }
+            }
+        }
+        nets.sort_by(|a, b| b.1.cmp(&a.1));
+        if let Ok(mut f) = wifi_form().lock() {
+            f.status = format!("{} redes encontradas", nets.len());
+            f.nets = nets;
+            f.connected = connected;
+        }
+    });
 }
 
 static WIFI_FORM: OnceLock<Mutex<WifiForm>> = OnceLock::new();
@@ -1603,14 +1674,27 @@ const SET_MINUS_X: usize = SET_X + 140;
 const SET_BAR_X: usize = SET_MINUS_X + SET_BTN_W + 8;
 const SET_BAR_W: usize = 300;
 const SET_PLUS_X: usize = SET_BAR_X + SET_BAR_W + 8;
-const SET_Y_BRIGHT: usize = 78;
-const SET_Y_SLEEP: usize = 108;
-const SET_Y_VOLUME: usize = 156;
-const SET_Y_SSID: usize = 204;
-const SET_Y_PSK: usize = 234;
-const SET_Y_CONNECT: usize = 264;
+const SET_Y_BRIGHT: usize = 66;
+const SET_Y_SLEEP: usize = 90;
+const SET_Y_VOLUME: usize = 128;
+const SET_LIST_Y0: usize = 168;
+const SET_LIST_STEP: usize = 18;
+const SET_LIST_N: usize = 3;
+const SET_Y_REDE: usize = 222;
+const SET_Y_PSK: usize = 240;
+const SET_Y_CONNECT: usize = 266;
 const SET_CONNECT_W: usize = 160;
-const SET_CONNECT_H: usize = 28;
+const SET_CONNECT_H: usize = 26;
+
+/// First visible network index for the scrolling list window.
+fn wifi_start(nets_len: usize, sel: usize) -> usize {
+    let n = SET_LIST_N.min(nets_len);
+    if n == 0 {
+        0
+    } else {
+        sel.saturating_sub(1).min(nets_len - n)
+    }
+}
 
 fn draw_field(fb: &mut Framebuffer, y: usize, label: &str, value: &str, focused: bool, editing: bool) {
     fb.draw_text(SET_X, y, label, theme().text_muted, 1);
@@ -1654,36 +1738,67 @@ fn draw_stepper(fb: &mut Framebuffer, y: usize, label: &str, value: &str) {
 }
 
 fn render_settings(fb: &mut Framebuffer) {
-    let (ssid, psk_mask, focus, editing, status) = match wifi_form().lock() {
-        Ok(f) => (f.ssid.clone(), "*".repeat(f.psk.chars().count()), f.focus, f.editing, f.status.clone()),
-        Err(_) => (String::new(), String::new(), 0, false, String::new()),
+    let (focus, editing, status, nets, sel, connected, psk_mask, ssid) = match wifi_form().lock() {
+        Ok(f) => (
+            f.focus,
+            f.editing,
+            f.status.clone(),
+            f.nets.clone(),
+            f.sel,
+            f.connected.clone(),
+            "*".repeat(f.psk.chars().count()),
+            f.ssid.clone(),
+        ),
+        Err(_) => (0, false, String::new(), Vec::new(), 0, String::new(), String::new(), String::new()),
     };
 
     let hint = if editing { "[BACK] Done" } else { "[HOME] Edit" };
     draw_topbar(fb, "SETTINGS", hint);
 
-    fb.draw_text(SET_X, 56, "DISPLAY", theme().warn, 1);
+    fb.draw_text(SET_X, 48, "DISPLAY", theme().warn, 1);
     draw_slider(fb, SET_Y_BRIGHT, "Brightness", BRIGHTNESS.load(Ordering::Relaxed), 255);
     let sleep = SLEEP_SECS.load(Ordering::Relaxed);
     let sleep_str = if sleep == 0 { "Off".to_string() } else { format!("{}s", sleep) };
     draw_stepper(fb, SET_Y_SLEEP, "Auto-sleep", &sleep_str);
 
-    fb.draw_text(SET_X, 128, "AUDIO", theme().warn, 1);
-    fb.draw_text(SET_X, SET_Y_VOLUME, "Volume", theme().text_muted, 1);
-    fb.draw_text(SET_FIELD_BX, SET_Y_VOLUME, "n/d (codec sem mixer)", theme().text_dim, 1);
+    fb.draw_text(SET_X, 110, "AUDIO", theme().warn, 1);
+    draw_slider(fb, SET_Y_VOLUME, "Volume", VOLUME.load(Ordering::Relaxed), 100);
 
-    fb.draw_text(SET_X, 180, "WI-FI", theme().warn, 1);
-    draw_field(fb, SET_Y_SSID, "SSID", &ssid, focus == 0, editing && focus == 0);
-    draw_field(fb, SET_Y_PSK, "Password", &psk_mask, focus == 1, editing && focus == 1);
-    draw_button(fb, SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H, "Connect", focus == 2);
+    fb.draw_text(SET_X, 150, "WI-FI", theme().warn, 1);
+    if nets.is_empty() {
+        fb.draw_text(SET_X, SET_LIST_Y0, "(procurando redes...)", theme().text_dim, 1);
+    } else {
+        let start = wifi_start(nets.len(), sel);
+        for (i, (s, sig, _)) in nets.iter().skip(start).take(SET_LIST_N).enumerate() {
+            let idx = start + i;
+            let y = SET_LIST_Y0 + i * SET_LIST_STEP;
+            let selected = idx == sel;
+            let conn = s == &connected;
+            let prefix = if conn { '*' } else if selected { '>' } else { ' ' };
+            let color = if selected {
+                theme().accent
+            } else if conn {
+                theme().info
+            } else {
+                theme().text_muted
+            };
+            fb.draw_text(SET_X, y, &format!("{} {}  {} dBm", prefix, s, sig), color, 1);
+        }
+    }
+
+    let ssid_label = if ssid.is_empty() { "(selecione uma rede)".to_string() } else { ssid.clone() };
+    fb.draw_text(SET_X, SET_Y_REDE, "Rede:", theme().text_muted, 1);
+    fb.draw_text(SET_X + 60, SET_Y_REDE, &ssid_label, theme().text, 1);
+    draw_field(fb, SET_Y_PSK, "Password", &psk_mask, focus == 0, editing && focus == 0);
+    draw_button(fb, SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H, "Connect", focus == 1);
 
     if editing {
         draw_keyboard(fb);
     } else {
         if !status.is_empty() {
-            fb.draw_text(SET_X, 308, &status, theme().info, 1);
+            fb.draw_text(SET_X, 300, &status, theme().info, 1);
         }
-        draw_hint_footer(fb, "[VOL+] Field   [VOL-] Field   [HOME] Edit/Connect   [BACK] Menu");
+        draw_hint_footer(fb, "[VOL+] Net   [VOL-] Net   [HOME] Edit   [MENU] Menu   [BACK] Back");
     }
 }
 
@@ -1856,13 +1971,45 @@ fn settings_tap(sx: usize, sy: usize) {
         cycle_sleep(-1);
     } else if in_rect(SET_PLUS_X, SET_Y_SLEEP - 4, SET_BTN_W, SET_BTN_H) {
         cycle_sleep(1);
-    } else if in_rect(SET_FIELD_BX, SET_Y_SSID - 4, SET_FIELD_BW, 24) {
-        if let Ok(mut f) = wifi_form().lock() { f.focus = 0; f.editing = true; }
-    } else if in_rect(SET_FIELD_BX, SET_Y_PSK - 4, SET_FIELD_BW, 24) {
-        if let Ok(mut f) = wifi_form().lock() { f.focus = 1; f.editing = true; }
-    } else if in_rect(SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H) {
-        if let Ok(mut f) = wifi_form().lock() { f.focus = 2; }
-        wifi_submit();
+    } else if in_rect(SET_MINUS_X, SET_Y_VOLUME - 4, SET_BTN_W, SET_BTN_H) {
+        set_volume(VOLUME.load(Ordering::Relaxed).saturating_sub(10));
+        save_display_config();
+    } else if in_rect(SET_PLUS_X, SET_Y_VOLUME - 4, SET_BTN_W, SET_BTN_H) {
+        set_volume((VOLUME.load(Ordering::Relaxed) + 10).min(100));
+        save_display_config();
+    } else {
+        // network list rows
+        let mut hit = false;
+        for i in 0..SET_LIST_N {
+            let y = SET_LIST_Y0 + i * SET_LIST_STEP;
+            if in_rect(SET_X, y.saturating_sub(2), SET_FIELD_BW + 130, SET_LIST_STEP) {
+                if let Ok(mut f) = wifi_form().lock() {
+                    let total = f.nets.len();
+                    if total > 0 {
+                        let start = wifi_start(total, f.sel);
+                        let idx = (start + i).min(total - 1);
+                        let name = f.nets[idx].0.clone();
+                        f.sel = idx;
+                        f.ssid = name;
+                        f.psk.clear();
+                        f.focus = 0;
+                        f.editing = true;
+                    }
+                }
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            if in_rect(SET_FIELD_BX, SET_Y_PSK - 4, SET_FIELD_BW, 24) {
+                if let Ok(mut f) = wifi_form().lock() {
+                    f.focus = 0;
+                    f.editing = true;
+                }
+            } else if in_rect(SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H) {
+                wifi_submit();
+            }
+        }
     }
 }
 
@@ -1885,8 +2032,8 @@ fn apply_menu_action(action: MenuAction) -> Option<usize> {
     }
 }
 
-/// Central navigation "activate" (HOME / MENU touchkey).
-fn nav_activate(screen: &AtomicUsize, cursor: &AtomicUsize) {
+/// HOME = OK / primary action of the current screen.
+fn nav_home(screen: &AtomicUsize, cursor: &AtomicUsize) {
     match screen.load(Ordering::SeqCst) {
         SCREEN_DASHBOARD => {
             cursor.store(0, Ordering::SeqCst);
@@ -1898,10 +2045,20 @@ fn nav_activate(screen: &AtomicUsize, cursor: &AtomicUsize) {
                 screen.store(target, Ordering::SeqCst);
             }
         }
+        SCREEN_TERMINAL => terminal::write(b"\r"),
         _ => {
             screen.store(SCREEN_MENU, Ordering::SeqCst);
         }
     }
+}
+
+/// MENU = open the Menu from anywhere (and close any on-screen keyboard).
+fn nav_open_menu(screen: &AtomicUsize, cursor: &AtomicUsize) {
+    if let Ok(mut f) = wifi_form().lock() {
+        f.editing = false;
+    }
+    cursor.store(0, Ordering::SeqCst);
+    screen.store(SCREEN_MENU, Ordering::SeqCst);
 }
 
 /// Central navigation "back" (BACK touchkey).
@@ -1940,6 +2097,7 @@ fn load_display_config() {
             "vignette" => set_effect(EFFECT_VIGNETTE, parse_flag(val)),
             "brightness" => if let Ok(n) = val.parse() { BRIGHTNESS.store(n, Ordering::Relaxed); },
             "sleep" => if let Ok(n) = val.parse() { SLEEP_SECS.store(n, Ordering::Relaxed); },
+            "volume" => if let Ok(n) = val.parse() { VOLUME.store(n, Ordering::Relaxed); },
             _ => {}
         }
     });
@@ -1961,12 +2119,13 @@ fn load_display_config() {
 fn save_display_config() {
     let e = EFFECTS.load(Ordering::Relaxed);
     let content = format!(
-        "# Kururu display config (managed; env KURURU_THEME overrides theme)\ntheme={}\nscanlines={}\nvignette={}\nbrightness={}\nsleep={}\n",
+        "# Kururu display config (managed; env KURURU_THEME overrides theme)\ntheme={}\nscanlines={}\nvignette={}\nbrightness={}\nsleep={}\nvolume={}\n",
         theme().key,
         e & EFFECT_SCANLINES != 0,
         e & EFFECT_VIGNETTE != 0,
         BRIGHTNESS.load(Ordering::Relaxed),
         SLEEP_SECS.load(Ordering::Relaxed),
+        VOLUME.load(Ordering::Relaxed),
     );
     let _ = fs::write("/etc/kururu-display.conf", content);
 }
@@ -2319,7 +2478,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.4 (terminal with alacritty_terminal)...");
+    println!("[Kururu Display Daemon] Starting v2.5 (UX: consistent buttons, full-width keyboard, Wi-Fi scan)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -2433,7 +2592,10 @@ fn main() {
                         let editing = wifi_form().lock().map(|f| f.editing).unwrap_or(false);
                         if !editing {
                             if let Ok(mut f) = wifi_form().lock() {
-                                f.focus = if up { (f.focus + 2) % 3 } else { (f.focus + 1) % 3 };
+                                let total = f.nets.len();
+                                if total > 0 {
+                                    f.sel = if up { (f.sel + total - 1) % total } else { (f.sel + 1) % total };
+                                }
                             }
                         }
                     } else if screen == SCREEN_TERMINAL {
@@ -2447,16 +2609,12 @@ fn main() {
                             if let Ok(mut f) = wifi_form().lock() {
                                 f.editing = false;
                             }
-                        } else {
-                            let focus = wifi_form().lock().map(|f| f.focus).unwrap_or(0);
-                            if focus == 2 {
-                                wifi_submit();
-                            } else if let Ok(mut f) = wifi_form().lock() {
-                                f.editing = true;
-                            }
+                        } else if let Ok(mut f) = wifi_form().lock() {
+                            f.focus = 0;
+                            f.editing = true;
                         }
                     } else {
-                        nav_activate(&current_screen_keys, &menu_cursor_keys);
+                        nav_home(&current_screen_keys, &menu_cursor_keys);
                         println!(
                             "[Kururu Display] HOME: screen {} -> {}",
                             screen,
@@ -2522,7 +2680,7 @@ fn main() {
                         touch_wake.store(true, Ordering::SeqCst);
                         if event.code == KEY_MENU {
                             println!("[Kururu Display] MENU touchkey");
-                            nav_activate(&touch_screen, &touch_menu);
+                            nav_open_menu(&touch_screen, &touch_menu);
                         } else {
                             println!("[Kururu Display] BACK touchkey");
                             let editing = touch_screen.load(Ordering::SeqCst) == SCREEN_SETTINGS
@@ -2626,6 +2784,13 @@ fn main() {
             if should_render {
                 if let Some(ref info) = cached_info {
                     let screen = current_screen.load(Ordering::SeqCst);
+
+                    // Wi-Fi: scan once when entering Settings; allow rescan on re-entry.
+                    if screen == SCREEN_SETTINGS {
+                        start_wifi_scan();
+                    } else if let Ok(mut f) = wifi_form().lock() {
+                        f.scanned = false;
+                    }
 
                     fb.clear(theme().bg);
                     draw_background_grid(&mut fb);
