@@ -4,7 +4,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +30,9 @@ const KEY_POWER: u16 = 116;
 const KEY_VOLUMEUP: u16 = 115;
 const KEY_VOLUMEDOWN: u16 = 114;
 const KEY_HOMEPAGE: u16 = 102;
+// Capacitive touchkeys: delivered by the touchscreen controller (event1).
+const KEY_MENU: u16 = 139;
+const KEY_BACK: u16 = 158;
 
 // ── Touch input (Samsung sec_touchscreen on /dev/input/event1) ─────────
 const EVENT_TOUCH: &str = "/dev/input/event1";
@@ -49,19 +53,72 @@ struct Color {
     a: u8,
 }
 
-const BG_COLOR: Color = Color { r: 10, g: 14, b: 20, a: 255 };
-const PANEL_BG: Color = Color { r: 16, g: 22, b: 32, a: 255 };
-const PANEL_ACTIVE_BG: Color = Color { r: 24, g: 36, b: 54, a: 255 };
-const BORDER_COLOR: Color = Color { r: 35, g: 48, b: 68, a: 255 };
-const BORDER_ACTIVE: Color = Color { r: 0, g: 230, b: 118, a: 255 };
+// ── Themes (runtime-selectable palettes) ───────────────────────────────
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: Color,
+    panel: Color,
+    panel_active: Color,
+    border: Color,
+    text: Color,
+    text_muted: Color,
+    text_dim: Color,
+    accent: Color,
+    info: Color,
+    warn: Color,
+    error: Color,
+    grid: Color,
+}
 
-const TEXT_WHITE: Color = Color { r: 240, g: 244, b: 250, a: 255 };
-const TEXT_GRAY: Color = Color { r: 140, g: 155, b: 175, a: 255 };
-const TEXT_DIM: Color = Color { r: 80, g: 95, b: 115, a: 255 };
-const TEXT_EMERALD: Color = Color { r: 0, g: 230, b: 118, a: 255 };
-const TEXT_CYAN: Color = Color { r: 0, g: 210, b: 255, a: 255 };
-const TEXT_AMBER: Color = Color { r: 255, g: 180, b: 0, a: 255 };
-const TEXT_RED: Color = Color { r: 255, g: 82, b: 82, a: 255 };
+impl Theme {
+    /// Original dark retro-HUD palette (emerald / cyan).
+    const GREEN: Theme = Theme {
+        bg: Color { r: 10, g: 14, b: 20, a: 255 },
+        panel: Color { r: 16, g: 22, b: 32, a: 255 },
+        panel_active: Color { r: 24, g: 36, b: 54, a: 255 },
+        border: Color { r: 35, g: 48, b: 68, a: 255 },
+        text: Color { r: 240, g: 244, b: 250, a: 255 },
+        text_muted: Color { r: 140, g: 155, b: 175, a: 255 },
+        text_dim: Color { r: 80, g: 95, b: 115, a: 255 },
+        accent: Color { r: 0, g: 230, b: 118, a: 255 },
+        info: Color { r: 0, g: 210, b: 255, a: 255 },
+        warn: Color { r: 255, g: 180, b: 0, a: 255 },
+        error: Color { r: 255, g: 82, b: 82, a: 255 },
+        grid: Color { r: 22, g: 30, b: 42, a: 255 },
+    };
+
+    /// "Amber CRT" — adapted from cool-retro-term's Default Amber (#ff8100 on black).
+    const AMBER: Theme = Theme {
+        bg: Color { r: 5, g: 3, b: 0, a: 255 },
+        panel: Color { r: 16, g: 9, b: 0, a: 255 },
+        panel_active: Color { r: 40, g: 22, b: 2, a: 255 },
+        border: Color { r: 72, g: 40, b: 8, a: 255 },
+        text: Color { r: 255, g: 201, b: 130, a: 255 },
+        text_muted: Color { r: 190, g: 120, b: 45, a: 255 },
+        text_dim: Color { r: 110, g: 66, b: 22, a: 255 },
+        accent: Color { r: 255, g: 129, b: 0, a: 255 },
+        info: Color { r: 255, g: 176, b: 64, a: 255 },
+        warn: Color { r: 255, g: 200, b: 40, a: 255 },
+        error: Color { r: 255, g: 77, b: 46, a: 255 },
+        grid: Color { r: 42, g: 23, b: 4, a: 255 },
+    };
+}
+
+const THEME_GREEN: usize = 0;
+const THEME_AMBER: usize = 1;
+static THEMES: [Theme; 2] = [Theme::GREEN, Theme::AMBER];
+static THEME_IDX: AtomicUsize = AtomicUsize::new(THEME_GREEN);
+
+/// Current palette (selected via config/env or the Menu).
+fn theme() -> &'static Theme {
+    &THEMES[THEME_IDX.load(Ordering::Relaxed).min(THEMES.len() - 1)]
+}
+
+//── CRT effect flags (toggleable post-process) ────────────────────────
+const EFFECT_SCANLINES: u32 = 1 << 0;
+const EFFECT_VIGNETTE: u32 = 1 << 1;
+const EFFECT_FLICKER: u32 = 1 << 2;
+static EFFECTS: AtomicU32 = AtomicU32::new(EFFECT_SCANLINES | EFFECT_VIGNETTE | EFFECT_FLICKER);
 
 // ── Layout design system (dark retro-HUD) ──────────────────────────────
 const MARGIN: usize = 16;        // outer screen margin
@@ -71,7 +128,6 @@ const TITLE_H: usize = 28;       // card title band height
 const ROW_H: usize = 19;         // telemetry row pitch
 const LOG_ROW_H: usize = 17;     // log console row pitch
 const GRID_DOT: usize = 32;      // background dot-grid spacing
-const GRID_COLOR: Color = Color { r: 22, g: 30, b: 42, a: 255 };
 
 // Derived geometry — single source of truth for card placement.
 const CONTENT_W: usize = FB_WIDTH - 2 * MARGIN;             // 992
@@ -93,13 +149,23 @@ const SCREEN_ABOUT: usize = 2;
 const SCREEN_SETTINGS: usize = 3;
 const SCREEN_TERMINAL: usize = 4;
 
-/// Menu entries: (label, target screen). Single source of truth for the
-/// renderer AND the touch hit-test.
-const MENU_ITEMS: [(&str, usize); 4] = [
-    ("Dashboard", SCREEN_DASHBOARD),
-    ("Settings", SCREEN_SETTINGS),
-    ("Terminal", SCREEN_TERMINAL),
-    ("About", SCREEN_ABOUT),
+/// Action triggered by selecting a menu entry.
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Screen(usize),
+    ToggleTheme,
+    ToggleEffects,
+}
+
+/// Menu entries: (label, action). Single source of truth for the renderer AND
+/// the input handlers (buttons + touch).
+const MENU_ITEMS: [(&str, MenuAction); 6] = [
+    ("Dashboard", MenuAction::Screen(SCREEN_DASHBOARD)),
+    ("Settings", MenuAction::Screen(SCREEN_SETTINGS)),
+    ("Terminal", MenuAction::Screen(SCREEN_TERMINAL)),
+    ("Theme", MenuAction::ToggleTheme),
+    ("Effects", MenuAction::ToggleEffects),
+    ("About", MenuAction::Screen(SCREEN_ABOUT)),
 ];
 const MENU_COUNT: usize = MENU_ITEMS.len();
 const MENU_ITEM_H: usize = 40;
@@ -547,6 +613,22 @@ fn parse_flag(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
+/// Iterate `key=value` lines of a config file, skipping blanks and comments.
+/// Shared by the touch calibration and display config parsers (DRY).
+fn for_each_conf_line<F: FnMut(&str, &str)>(path: &str, mut f: F) {
+    if let Ok(content) = fs::read_to_string(path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                f(k.trim(), v.trim());
+            }
+        }
+    }
+}
+
 /// Raw→screen calibration. Priority: `/etc/kururu-touch.conf` → kernel
 /// auto-detected abs ranges → panel-native defaults (1024×600).
 #[derive(Clone, Copy)]
@@ -568,26 +650,18 @@ impl TouchCal {
     fn load() -> Self {
         let mut cal = Self::defaults();
         let mut saw_range_key = false;
-        if let Ok(content) = fs::read_to_string(TOUCH_CONF_PATH) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let Some((k, v)) = line.split_once('=') else { continue };
-                let val = v.trim();
-                match k.trim().to_ascii_lowercase().as_str() {
-                    "x_min" => if let Ok(n) = val.parse() { cal.x_min = n; saw_range_key = true; },
-                    "x_max" => if let Ok(n) = val.parse() { cal.x_max = n; saw_range_key = true; },
-                    "y_min" => if let Ok(n) = val.parse() { cal.y_min = n; saw_range_key = true; },
-                    "y_max" => if let Ok(n) = val.parse() { cal.y_max = n; saw_range_key = true; },
-                    "swap_xy" => cal.swap_xy = parse_flag(val),
-                    "invert_x" => cal.invert_x = parse_flag(val),
-                    "invert_y" => cal.invert_y = parse_flag(val),
-                    _ => {}
-                }
+        for_each_conf_line(TOUCH_CONF_PATH, |k, val| {
+            match k.to_ascii_lowercase().as_str() {
+                "x_min" => if let Ok(n) = val.parse() { cal.x_min = n; saw_range_key = true; },
+                "x_max" => if let Ok(n) = val.parse() { cal.x_max = n; saw_range_key = true; },
+                "y_min" => if let Ok(n) = val.parse() { cal.y_min = n; saw_range_key = true; },
+                "y_max" => if let Ok(n) = val.parse() { cal.y_max = n; saw_range_key = true; },
+                "swap_xy" => cal.swap_xy = parse_flag(val),
+                "invert_x" => cal.invert_x = parse_flag(val),
+                "invert_y" => cal.invert_y = parse_flag(val),
+                _ => {}
             }
-        }
+        });
         if !saw_range_key {
             if let Some((x, y)) = detect_ranges(EVENT_TOUCH) {
                 cal.x_min = x.0;
@@ -1007,11 +1081,11 @@ fn set_display_hardware(enable: bool) {
 /// Traffic-light accent colour for charge/health values.
 fn battery_color(pct: u32) -> Color {
     if pct >= 50 {
-        TEXT_EMERALD
+        theme().accent
     } else if pct >= 20 {
-        TEXT_AMBER
+        theme().warn
     } else {
-        TEXT_RED
+        theme().error
     }
 }
 
@@ -1021,7 +1095,7 @@ fn draw_background_grid(fb: &mut Framebuffer) {
     while y < 568 {
         let mut x = MARGIN;
         while x < FB_WIDTH - MARGIN {
-            fb.draw_rect(x, y, 2, 2, GRID_COLOR);
+            fb.draw_rect(x, y, 2, 2, theme().grid);
             x += GRID_DOT;
         }
         y += GRID_DOT;
@@ -1043,11 +1117,11 @@ fn draw_card(
     let right = x + w;
     let bottom = y + h;
 
-    fb.draw_rect(x, y, w, h, PANEL_BG);
-    fb.draw_rect(x, y, w, 1, BORDER_COLOR);
-    fb.draw_rect(x, bottom - 1, w, 1, BORDER_COLOR);
-    fb.draw_rect(x, y, 1, h, BORDER_COLOR);
-    fb.draw_rect(right - 1, y, 1, h, BORDER_COLOR);
+    fb.draw_rect(x, y, w, h, theme().panel);
+    fb.draw_rect(x, y, w, 1, theme().border);
+    fb.draw_rect(x, bottom - 1, w, 1, theme().border);
+    fb.draw_rect(x, y, 1, h, theme().border);
+    fb.draw_rect(right - 1, y, 1, h, theme().border);
 
     // Left accent bar across the title band
     fb.draw_rect(x, y, 3, TITLE_H, accent);
@@ -1070,10 +1144,10 @@ fn draw_card(
         fb.draw_sprite(tx, y + (TITLE_H - 8) / 2, ic, accent, 1);
         tx += 12;
     }
-    fb.draw_text(tx, y + (TITLE_H - 16) / 2, title, TEXT_WHITE, 1);
+    fb.draw_text(tx, y + (TITLE_H - 16) / 2, title, theme().text, 1);
 
     // Divider under the title band
-    fb.draw_rect(x + PAD, y + TITLE_H, w - 2 * PAD, 1, BORDER_COLOR);
+    fb.draw_rect(x + PAD, y + TITLE_H, w - 2 * PAD, 1, theme().border);
 }
 
 /// Header tab rectangles (x, y, w, h) — single source of truth shared by the
@@ -1129,8 +1203,10 @@ fn handle_tap(
                 let (x, y, w, h) = menu_item_rect(i);
                 if sx >= x && sx < x + w && sy >= y && sy < y + h {
                     menu_cursor.store(i, Ordering::SeqCst);
-                    screen.store(MENU_ITEMS[i].1, Ordering::SeqCst);
                     println!("[Kururu Display] Touch -> Menu '{}'", MENU_ITEMS[i].0);
+                    if let Some(target) = apply_menu_action(MENU_ITEMS[i].1) {
+                        screen.store(target, Ordering::SeqCst);
+                    }
                     break;
                 }
             }
@@ -1144,32 +1220,32 @@ fn handle_tap(
 
 fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
     // Header panel: 48px tall + 2px border at y=48
-    fb.draw_rect(0, 0, FB_WIDTH, 48, PANEL_BG);
-    fb.draw_rect(0, 48, FB_WIDTH, 2, BORDER_COLOR);
+    fb.draw_rect(0, 0, FB_WIDTH, 48, theme().panel);
+    fb.draw_rect(0, 48, FB_WIDTH, 2, theme().border);
 
     // Frog mascot: green body + dark pupils/mouth (header bg shows through).
     // 14px tall, vertically centred in the 48px header: (48-14)/2 = 17.
-    fb.draw_sprite(MARGIN, 17, SP_FROG_BODY, TEXT_EMERALD, 1);
-    fb.draw_sprite(MARGIN, 17, SP_FROG_DETAIL, PANEL_BG, 1);
+    fb.draw_sprite(MARGIN, 17, SP_FROG_BODY, theme().accent, 1);
+    fb.draw_sprite(MARGIN, 17, SP_FROG_DETAIL, theme().panel, 1);
 
     // Brand — scale-2 (32px tall), vertically centred: (48-32)/2 = 8
     let brand_x = MARGIN + 22 + 10; // frog is 22px wide + 10px gap
-    fb.draw_text(brand_x, 8, "KURURU", TEXT_EMERALD, 2);
+    fb.draw_text(brand_x, 8, "KURURU", theme().accent, 2);
 
     // Dynamic tabs fill the remaining span, right-aligned to the margin.
     // Geometry comes from tab_rects() so touch hit-testing stays in sync.
     for (i, name) in TABS.iter().take(TAB_COUNT.min(MAX_TABS)).enumerate() {
         let (tx, ty, tab_w, tab_h) = tab_rects()[i];
         let is_active = i == active_tab;
-        let bg = if is_active { PANEL_ACTIVE_BG } else { PANEL_BG };
-        let border = if is_active { BORDER_ACTIVE } else { BORDER_COLOR };
-        let text_color = if is_active { TEXT_EMERALD } else { TEXT_GRAY };
+        let bg = if is_active { theme().panel_active } else { theme().panel };
+        let border = if is_active { theme().accent } else { theme().border };
+        let text_color = if is_active { theme().accent } else { theme().text_muted };
 
         fb.draw_rect(tx, ty, tab_w, tab_h, bg);
         fb.draw_rect(tx, ty, tab_w, 2, border);
         fb.draw_rect(tx, ty + tab_h - 2, tab_w, 2, border);
         if is_active {
-            fb.draw_rect(tx, ty, 3, tab_h, BORDER_ACTIVE);
+            fb.draw_rect(tx, ty, 3, tab_h, theme().accent);
         }
 
         // Adaptive label: "N NAME" when it fits, otherwise just "N".
@@ -1187,24 +1263,24 @@ fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
 
 fn draw_footer(fb: &mut Framebuffer, info: &SystemInfo) {
     // Footer panel: y=568, height=32. Text vertically centered: y = 576.
-    fb.draw_rect(0, 568, FB_WIDTH, 32, PANEL_BG);
-    fb.draw_rect(0, 568, FB_WIDTH, 1, BORDER_COLOR);
+    fb.draw_rect(0, 568, FB_WIDTH, 32, theme().panel);
+    fb.draw_rect(0, 568, FB_WIDTH, 1, theme().border);
 
     // LEFT: volume navigation
-    fb.draw_text(MARGIN - 2, 576, "[VOL+] <- Prev", TEXT_AMBER, 1);
-    fb.draw_text(130, 576, "|", TEXT_DIM, 1);
-    fb.draw_text(142, 576, "[VOL-] -> Next", TEXT_CYAN, 1);
+    fb.draw_text(MARGIN - 2, 576, "[VOL+] <- Prev", theme().warn, 1);
+    fb.draw_text(130, 576, "|", theme().text_dim, 1);
+    fb.draw_text(142, 576, "[VOL-] -> Next", theme().info, 1);
 
     // CENTER: power button hint (centered on 512)
-    fb.draw_text(432, 576, "[POWER] Wake / Sleep", TEXT_WHITE, 1);
+    fb.draw_text(432, 576, "[POWER] Wake / Sleep", theme().text, 1);
 
     // RIGHT: auto-sleep + live UPS (on-board battery) status, right-aligned
     let ups = format!("UPS: {}% ({})", info.battery_pct, info.battery_health);
     let ups_x = FB_WIDTH - MARGIN - ups.len() * 8;
     let sep_x = ups_x - 12;
     let sleep = "Auto-sleep: 120s";
-    fb.draw_text(sep_x - 8 - sleep.len() * 8, 576, sleep, TEXT_DIM, 1);
-    fb.draw_text(sep_x, 576, "|", TEXT_DIM, 1);
+    fb.draw_text(sep_x - 8 - sleep.len() * 8, 576, sleep, theme().text_dim, 1);
+    fb.draw_text(sep_x, 576, "|", theme().text_dim, 1);
     fb.draw_text(ups_x, 576, &ups, battery_color(info.battery_pct_num), 1);
 }
 
@@ -1213,35 +1289,35 @@ fn draw_footer(fb: &mut Framebuffer, info: &SystemInfo) {
 // -------------------------------------------------------------
 /// Top bar for non-dashboard screens (consistent with the dashboard header).
 fn draw_topbar(fb: &mut Framebuffer, title: &str, hint: &str) {
-    fb.draw_rect(0, 0, FB_WIDTH, 48, PANEL_BG);
-    fb.draw_rect(0, 48, FB_WIDTH, 2, BORDER_COLOR);
-    fb.draw_rect(MARGIN, 18, 12, 12, TEXT_EMERALD); // accent marker
-    fb.draw_text(MARGIN + 24, 8, title, TEXT_WHITE, 2);
+    fb.draw_rect(0, 0, FB_WIDTH, 48, theme().panel);
+    fb.draw_rect(0, 48, FB_WIDTH, 2, theme().border);
+    fb.draw_rect(MARGIN, 18, 12, 12, theme().accent); // accent marker
+    fb.draw_text(MARGIN + 24, 8, title, theme().text, 2);
     if !hint.is_empty() {
         let hx = FB_WIDTH - MARGIN - hint.len() * 8;
-        fb.draw_text(hx, 16, hint, TEXT_GRAY, 1);
+        fb.draw_text(hx, 16, hint, theme().text_muted, 1);
     }
 }
 
 /// Bottom hint bar for non-dashboard screens.
 fn draw_hint_footer(fb: &mut Framebuffer, hint: &str) {
-    fb.draw_rect(0, 568, FB_WIDTH, 32, PANEL_BG);
-    fb.draw_rect(0, 568, FB_WIDTH, 1, BORDER_COLOR);
+    fb.draw_rect(0, 568, FB_WIDTH, 32, theme().panel);
+    fb.draw_rect(0, 568, FB_WIDTH, 1, theme().border);
     let x = (FB_WIDTH.saturating_sub(hint.len() * 8)) / 2;
-    fb.draw_text(x, 576, hint, TEXT_DIM, 1);
+    fb.draw_text(x, 576, hint, theme().text_dim, 1);
 }
 
 /// Reusable list row (menu / settings). `selected` draws the active style.
 fn draw_list_item(fb: &mut Framebuffer, x: usize, y: usize, w: usize, label: &str, selected: bool) {
     let h = MENU_ITEM_H;
-    let bg = if selected { PANEL_ACTIVE_BG } else { PANEL_BG };
-    let border = if selected { BORDER_ACTIVE } else { BORDER_COLOR };
-    let fg = if selected { TEXT_EMERALD } else { TEXT_WHITE };
+    let bg = if selected { theme().panel_active } else { theme().panel };
+    let border = if selected { theme().accent } else { theme().border };
+    let fg = if selected { theme().accent } else { theme().text };
     fb.draw_rect(x, y, w, h, bg);
     fb.draw_rect(x, y, w, 1, border);
     fb.draw_rect(x, y + h - 1, w, 1, border);
     if selected {
-        fb.draw_rect(x, y, 3, h, BORDER_ACTIVE);
+        fb.draw_rect(x, y, 3, h, theme().accent);
     }
     fb.draw_rect(x + 16, y + (h - 8) / 2, 8, 8, fg); // bullet
     fb.draw_text(x + 36, y + (h - 16) / 2, label, fg, 1);
@@ -1249,9 +1325,20 @@ fn draw_list_item(fb: &mut Framebuffer, x: usize, y: usize, w: usize, label: &st
 
 fn render_menu(fb: &mut Framebuffer, cursor: usize) {
     draw_topbar(fb, "MENU", "[HOME] Enter");
-    for (i, (label, _)) in MENU_ITEMS.iter().enumerate() {
+    for (i, (label, action)) in MENU_ITEMS.iter().enumerate() {
         let (x, y, w, _) = menu_item_rect(i);
-        draw_list_item(fb, x, y, w, label, i == cursor);
+        let text = match action {
+            MenuAction::ToggleTheme => {
+                let on = THEME_IDX.load(Ordering::Relaxed) == THEME_AMBER;
+                format!("{}: {}", label, if on { "AMBER" } else { "GREEN" })
+            }
+            MenuAction::ToggleEffects => {
+                let on = EFFECTS.load(Ordering::Relaxed) != 0;
+                format!("{}: {}", label, if on { "ON" } else { "OFF" })
+            }
+            MenuAction::Screen(_) => (*label).to_string(),
+        };
+        draw_list_item(fb, x, y, w, &text, i == cursor);
     }
     draw_hint_footer(fb, "[VOL+] Up   [VOL-] Down   [HOME] Select   [POWER] Sleep");
 }
@@ -1269,7 +1356,7 @@ fn render_about(fb: &mut Framebuffer, info: &SystemInfo) {
     let mut y = 150;
     for line in &lines {
         let x = (FB_WIDTH.saturating_sub(line.len() * 8)) / 2;
-        fb.draw_text(x, y, line, TEXT_GRAY, 1);
+        fb.draw_text(x, y, line, theme().text_muted, 1);
         y += 28;
     }
     draw_hint_footer(fb, "[HOME] Back");
@@ -1278,8 +1365,155 @@ fn render_about(fb: &mut Framebuffer, info: &SystemInfo) {
 fn render_placeholder(fb: &mut Framebuffer, title: &str, msg: &str) {
     draw_topbar(fb, title, "[HOME] Back");
     let x = (FB_WIDTH.saturating_sub(msg.len() * 8)) / 2;
-    fb.draw_text(x, 280, msg, TEXT_DIM, 1);
+    fb.draw_text(x, 280, msg, theme().text_dim, 1);
     draw_hint_footer(fb, "[HOME] Back");
+}
+
+/// Execute a menu action. Returns Some(screen) when the UI must switch screens.
+fn apply_menu_action(action: MenuAction) -> Option<usize> {
+    match action {
+        MenuAction::Screen(target) => Some(target),
+        MenuAction::ToggleTheme => {
+            let next = if THEME_IDX.load(Ordering::Relaxed) == THEME_AMBER { THEME_GREEN } else { THEME_AMBER };
+            THEME_IDX.store(next, Ordering::Relaxed);
+            None
+        }
+        MenuAction::ToggleEffects => {
+            let all = EFFECT_SCANLINES | EFFECT_VIGNETTE | EFFECT_FLICKER;
+            let next = if EFFECTS.load(Ordering::Relaxed) != 0 { 0 } else { all };
+            EFFECTS.store(next, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Central navigation "activate" (HOME / MENU touchkey).
+fn nav_activate(screen: &AtomicUsize, cursor: &AtomicUsize) {
+    match screen.load(Ordering::SeqCst) {
+        SCREEN_DASHBOARD => {
+            cursor.store(0, Ordering::SeqCst);
+            screen.store(SCREEN_MENU, Ordering::SeqCst);
+        }
+        SCREEN_MENU => {
+            let c = cursor.load(Ordering::SeqCst);
+            if let Some(target) = apply_menu_action(MENU_ITEMS[c].1) {
+                screen.store(target, Ordering::SeqCst);
+            }
+        }
+        _ => {
+            screen.store(SCREEN_MENU, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Central navigation "back" (BACK touchkey).
+fn nav_back(screen: &AtomicUsize) {
+    let target = match screen.load(Ordering::SeqCst) {
+        SCREEN_DASHBOARD => SCREEN_DASHBOARD,
+        SCREEN_MENU => SCREEN_DASHBOARD,
+        _ => SCREEN_MENU,
+    };
+    screen.store(target, Ordering::SeqCst);
+}
+
+fn set_effect(bit: u32, on: bool) {
+    let cur = EFFECTS.load(Ordering::Relaxed);
+    EFFECTS.store(if on { cur | bit } else { cur & !bit }, Ordering::Relaxed);
+}
+
+/// Load theme/effects from the environment (override) and /etc/kururu-display.conf.
+fn load_display_config() {
+    let env_theme = std::env::var("KURURU_THEME").ok();
+    if let Some(t) = &env_theme {
+        THEME_IDX.store(
+            if t.eq_ignore_ascii_case("amber") { THEME_AMBER } else { THEME_GREEN },
+            Ordering::Relaxed,
+        );
+    }
+    for_each_conf_line("/etc/kururu-display.conf", |k, val| {
+        match k.to_ascii_lowercase().as_str() {
+            "theme" => {
+                if env_theme.is_none() {
+                    THEME_IDX.store(
+                        if val.eq_ignore_ascii_case("amber") { THEME_AMBER } else { THEME_GREEN },
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+            "scanlines" => set_effect(EFFECT_SCANLINES, parse_flag(val)),
+            "vignette" => set_effect(EFFECT_VIGNETTE, parse_flag(val)),
+            "flicker" => set_effect(EFFECT_FLICKER, parse_flag(val)),
+            _ => {}
+        }
+    });
+    println!(
+        "[Kururu Display] Theme: {}  Effects: {:?}",
+        if THEME_IDX.load(Ordering::Relaxed) == THEME_AMBER { "AMBER" } else { "GREEN" },
+        EFFECTS.load(Ordering::Relaxed)
+    );
+}
+
+/// Vignette brightness mask (0..=255), computed once.
+fn vignette_mask() -> &'static [u8] {
+    static MASK: OnceLock<Vec<u8>> = OnceLock::new();
+    MASK.get_or_init(|| {
+        let mut m = vec![255u8; FB_WIDTH * FB_HEIGHT];
+        let cx = FB_WIDTH as f32 / 2.0;
+        let cy = FB_HEIGHT as f32 / 2.0;
+        let max_d2 = cx * cx + cy * cy;
+        for y in 0..FB_HEIGHT {
+            for x in 0..FB_WIDTH {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let t = ((dx * dx + dy * dy) / max_d2).min(1.0);
+                m[y * FB_WIDTH + x] = ((1.0 - 0.45 * t) * 255.0) as u8;
+            }
+        }
+        m
+    })
+}
+
+/// Cheap CRT post-process on the BGRA buffer: scanlines + vignette + flicker in
+/// a single pass. Runs once per rendered frame.
+fn apply_crt_effects(fb: &mut Framebuffer) {
+    let effects = EFFECTS.load(Ordering::Relaxed);
+    if effects == 0 {
+        return;
+    }
+    let scan = effects & EFFECT_SCANLINES != 0;
+    let vign = effects & EFFECT_VIGNETTE != 0;
+    let flick = effects & EFFECT_FLICKER != 0;
+    let flick_f = if flick { 95 + flicker_phase() } else { 100 };
+    let mask = if vign { vignette_mask() } else { &[] };
+
+    for y in 0..FB_HEIGHT {
+        let row_f = if scan && (y & 1) == 1 { 72 } else { 100 };
+        let f_base = row_f * flick_f / 100;
+        let row_off = y * FB_STRIDE;
+        let mrow = y * FB_WIDTH;
+        for x in 0..FB_WIDTH {
+            let mut f = f_base;
+            if vign {
+                f = f * mask[mrow + x] as u32 / 255;
+            }
+            if f >= 100 {
+                continue;
+            }
+            let off = row_off + x * 4;
+            fb.buffer[off] = (fb.buffer[off] as u32 * f / 100) as u8;
+            fb.buffer[off + 1] = (fb.buffer[off + 1] as u32 * f / 100) as u8;
+            fb.buffer[off + 2] = (fb.buffer[off + 2] as u32 * f / 100) as u8;
+        }
+    }
+}
+
+/// Slow flicker phase (0..=5) from the wall clock.
+fn flicker_phase() -> u32 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    ((ms / 130) % 6) as u32
 }
 
 // -------------------------------------------------------------
@@ -1312,7 +1546,7 @@ fn draw_log_console(
         .into_iter().rev().collect();
 
     if shown.is_empty() {
-        fb.draw_text(content_x, content_y, empty_msg, TEXT_DIM, 1);
+        fb.draw_text(content_x, content_y, empty_msg, theme().text_dim, 1);
         return;
     }
 
@@ -1333,7 +1567,7 @@ fn draw_log_console(
 
 fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Card A: System, APU & Memory ────────────────────────────────────────
-    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_CHIP), "KURURU ARCHITECTURE & COMPUTE", TEXT_AMBER);
+    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_CHIP), "KURURU ARCHITECTURE & COMPUTE", theme().warn);
 
     let free_pct = if info.ram_total_mb > 0 {
         100 - (info.ram_used_mb * 100 / info.ram_total_mb)
@@ -1362,20 +1596,20 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
 
     let mut ty = 96;
     for (label, val) in &telemetry_lines {
-        fb.draw_text(28, ty, label, TEXT_GRAY, 1);
-        fb.draw_text(165, ty, val, TEXT_WHITE, 1);
+        fb.draw_text(28, ty, label, theme().text_muted, 1);
+        fb.draw_text(165, ty, val, theme().text, 1);
         ty += ROW_H;
     }
 
     // ── Card B: On-board battery (UPS) & Wi-Fi radio ────────────────────────
-    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_WIFI), "BATTERY (UPS) & WI-FI RADIO", TEXT_AMBER);
+    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_WIFI), "BATTERY (UPS) & WI-FI RADIO", theme().warn);
 
-    fb.draw_text(532, 92, "Battery:", TEXT_GRAY, 1);
-    fb.draw_rect(628, 90, 200, 16, BORDER_COLOR);
+    fb.draw_text(532, 92, "Battery:", theme().text_muted, 1);
+    fb.draw_rect(628, 90, 200, 16, theme().border);
     let fill_w = (info.battery_pct_num as usize * 196) / 100;
     fb.draw_rect(630, 92, fill_w, 12, battery_color(info.battery_pct_num));
     let bat_label = format!("{}% ({})", info.battery_pct, info.battery_status);
-    fb.draw_text(840, 92, &bat_label, TEXT_WHITE, 1);
+    fb.draw_text(840, 92, &bat_label, theme().text, 1);
 
     let power_radio_lines = [
         ("Fuelgauge:", format!("{} | Temp: {} | Health: {}", info.battery_volts, info.battery_temp_c, info.battery_health)),
@@ -1391,8 +1625,8 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
 
     let mut ry = 118;
     for (label, val) in &power_radio_lines {
-        fb.draw_text(532, ry, label, TEXT_GRAY, 1);
-        fb.draw_text(676, ry, val, TEXT_WHITE, 1);
+        fb.draw_text(532, ry, label, theme().text_muted, 1);
+        fb.draw_text(676, ry, val, theme().text, 1);
         ry += ROW_H;
     }
 
@@ -1401,7 +1635,7 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
         fb, &info.logs, &info.time_str,
         MARGIN, 308, CONTENT_W, 252,
         "KERNEL LOG CONSOLE (DMESG TAIL)", ICON_TERMINAL,
-        TEXT_EMERALD, TEXT_GRAY,
+        theme().accent, theme().text_muted,
         "Waiting for kernel messages...",
     );
 }
@@ -1412,30 +1646,30 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
 fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Card A: Tailnet cluster & core servers ──────────────────────────────
     let cluster_title = format!("MNEMOCINE TAILNET ({}/5 ONLINE)", info.homelab_online_count);
-    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_SERVER), &cluster_title, TEXT_AMBER);
+    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_SERVER), &cluster_title, theme().warn);
 
-    fb.draw_text(28, 96, "Tailnet:", TEXT_GRAY, 1);
-    fb.draw_text(130, 96, &info.tailnet_suffix, TEXT_CYAN, 1);
+    fb.draw_text(28, 96, "Tailnet:", theme().text_muted, 1);
+    fb.draw_text(130, 96, &info.tailnet_suffix, theme().info, 1);
 
-    fb.draw_text(28, 115, "Kururu IP:", TEXT_GRAY, 1);
-    fb.draw_text(130, 115, &info.tailscale_ip, TEXT_WHITE, 1);
+    fb.draw_text(28, 115, "Kururu IP:", theme().text_muted, 1);
+    fb.draw_text(130, 115, &info.tailscale_ip, theme().text, 1);
 
-    fb.draw_text(28, 134, "Direct Link:", TEXT_GRAY, 1);
-    fb.draw_text(130, 134, &info.active_link_str, TEXT_EMERALD, 1);
+    fb.draw_text(28, 134, "Direct Link:", theme().text_muted, 1);
+    fb.draw_text(130, 134, &info.active_link_str, theme().accent, 1);
 
     // Server list with pixel status squares (active / online / offline)
     let mut py = 162;
     for peer in &info.homelab_nodes {
         let color = if peer.active {
-            TEXT_EMERALD
+            theme().accent
         } else if peer.online {
-            TEXT_CYAN
+            theme().info
         } else {
-            BORDER_COLOR
+            theme().border
         };
         fb.draw_rect(28, py + 4, 8, 8, color);
-        fb.draw_text(44, py, &peer.name, if peer.online { TEXT_WHITE } else { TEXT_DIM }, 1);
-        fb.draw_text(145, py, &peer.ip, TEXT_GRAY, 1);
+        fb.draw_text(44, py, &peer.name, if peer.online { theme().text } else { theme().text_dim }, 1);
+        fb.draw_text(145, py, &peer.ip, theme().text_muted, 1);
 
         let status_desc = if peer.active {
             "direct"
@@ -1444,39 +1678,39 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
         } else {
             "offline"
         };
-        fb.draw_text(295, py, status_desc, if peer.online { color } else { TEXT_DIM }, 1);
+        fb.draw_text(295, py, status_desc, if peer.online { color } else { theme().text_dim }, 1);
 
         py += ROW_H;
     }
 
     let summary_line = format!("Mesh Total: {} nodes registered in Tailnet", info.peers_total_count);
-    fb.draw_text(28, 278, &summary_line, TEXT_DIM, 1);
+    fb.draw_text(28, 278, &summary_line, theme().text_dim, 1);
 
     // ── Card B: Wake-on-LAN controller & relay targets ──────────────────────
-    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_POWER), "WAKE-ON-LAN CONTROLLER", TEXT_AMBER);
+    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_POWER), "WAKE-ON-LAN CONTROLLER", theme().warn);
 
     let daemon_label = if info.wol_daemon_running {
         "ACTIVE (:9096) - Kururu Native Rust"
     } else {
         "STOPPED"
     };
-    let daemon_color = if info.wol_daemon_running { TEXT_EMERALD } else { TEXT_RED };
+    let daemon_color = if info.wol_daemon_running { theme().accent } else { theme().error };
 
     let wol_lines = [
         ("Daemon Status:", daemon_label, daemon_color),
-        ("Broadcast Target:", "192.168.3.255:9 (mlan0 direct AP)", TEXT_WHITE),
-        ("Target 1 (Host):", "Psicopompo (Workstation & Gaming)", TEXT_WHITE),
-        ("Target 1 (MAC):", info.wol_target1_mac.as_str(), TEXT_AMBER),
-        ("Target 1 (URI):", "http://kururu:9096/wake/psicopompo", TEXT_CYAN),
-        ("Target 2 (Host):", "Kavure (Services & Microserver)", TEXT_WHITE),
-        ("Target 2 (MAC):", info.wol_target2_mac.as_str(), TEXT_AMBER),
-        ("Target 2 (URI):", "http://kururu:9096/wake/kavure", TEXT_CYAN),
-        ("Transmission:", "Layer 2 Magic Packet Burst (5x / 25ms)", TEXT_GRAY),
+        ("Broadcast Target:", "192.168.3.255:9 (mlan0 direct AP)", theme().text),
+        ("Target 1 (Host):", "Psicopompo (Workstation & Gaming)", theme().text),
+        ("Target 1 (MAC):", info.wol_target1_mac.as_str(), theme().warn),
+        ("Target 1 (URI):", "http://kururu:9096/wake/psicopompo", theme().info),
+        ("Target 2 (Host):", "Kavure (Services & Microserver)", theme().text),
+        ("Target 2 (MAC):", info.wol_target2_mac.as_str(), theme().warn),
+        ("Target 2 (URI):", "http://kururu:9096/wake/kavure", theme().info),
+        ("Transmission:", "Layer 2 Magic Packet Burst (5x / 25ms)", theme().text_muted),
     ];
 
     let mut wy = 96;
     for (label, val, col) in &wol_lines {
-        fb.draw_text(532, wy, label, TEXT_GRAY, 1);
+        fb.draw_text(532, wy, label, theme().text_muted, 1);
         fb.draw_text(676, wy, val, *col, 1);
         wy += ROW_H;
     }
@@ -1486,7 +1720,7 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
         fb, &info.wol_logs, &info.time_str,
         MARGIN, 308, CONTENT_W, 252,
         "WAKE-ON-LAN DISPATCH AUDIT LOG", ICON_TERMINAL,
-        TEXT_CYAN, TEXT_CYAN,
+        theme().info, theme().info,
         "No Wake-on-LAN packets dispatched yet. Waiting on port 9096...",
     );
 }
@@ -1497,30 +1731,30 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
 fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Hero: ambient retro clock ───────────────────────────────────────────
     draw_card(fb, MARGIN, 56, CONTENT_W, 294, Some(ICON_CLOCK),
-              "MNEMOCINE TIME STATION - SOVEREIGN NTP CLOCK", TEXT_AMBER);
+              "MNEMOCINE TIME STATION - SOVEREIGN NTP CLOCK", theme().warn);
 
     // Huge clock: font 8x16 at scale 5 = 40x80 px/char; 8 chars = 320px wide.
-    fb.draw_text(352, 100, &info.time_str, TEXT_EMERALD, 5);
+    fb.draw_text(352, 100, &info.time_str, theme().accent, 5);
 
     // Date banner (scale 2, centered)
     let date_x = (FB_WIDTH.saturating_sub(info.date_full_str.len() * 16)) / 2;
-    fb.draw_text(date_x, 196, &info.date_full_str, TEXT_CYAN, 2);
+    fb.draw_text(date_x, 196, &info.date_full_str, theme().info, 2);
 
     // Sub-banner + status pill (centered)
     let sub = format!("Timezone: America/Sao_Paulo (UTC-3) | Host: {} | Uptime: {}", info.hostname, info.uptime_str);
-    fb.draw_text((FB_WIDTH.saturating_sub(sub.len() * 8)) / 2, 250, &sub, TEXT_GRAY, 1);
+    fb.draw_text((FB_WIDTH.saturating_sub(sub.len() * 8)) / 2, 250, &sub, theme().text_muted, 1);
 
     let pill = format!(
         "Homelab: {}/5 Servers Online   |   Wi-Fi: {} ({})   |   WOL Relay: Port 9096 Ready",
         info.homelab_online_count, info.wifi_ssid, info.wifi_signal_dbm
     );
-    fb.draw_text((FB_WIDTH.saturating_sub(pill.len() * 8)) / 2, 286, &pill, TEXT_DIM, 1);
+    fb.draw_text((FB_WIDTH.saturating_sub(pill.len() * 8)) / 2, 286, &pill, theme().text_dim, 1);
 
     // ── Ambient ribbon: 3 symmetric vitals cards (320px each) ──────────────
     // Card 1: Hardware UPS / no-break
-    draw_card(fb, MARGIN, 358, RIBBON_W, 202, Some(ICON_BATTERY), "HARDWARE UPS / NO-BREAK", TEXT_AMBER);
+    draw_card(fb, MARGIN, 358, RIBBON_W, 202, Some(ICON_BATTERY), "HARDWARE UPS / NO-BREAK", theme().warn);
 
-    fb.draw_rect(28, 394, 292, 16, BORDER_COLOR);
+    fb.draw_rect(28, 394, 292, 16, theme().border);
     let fill_w = (info.battery_pct_num as usize * 288) / 100;
     fb.draw_rect(30, 396, fill_w, 12, battery_color(info.battery_pct_num));
 
@@ -1534,13 +1768,13 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 
     let mut uy = 420;
     for (label, val) in &ups_lines {
-        fb.draw_text(28, uy, label, TEXT_GRAY, 1);
-        fb.draw_text(115, uy, val, TEXT_WHITE, 1);
+        fb.draw_text(28, uy, label, theme().text_muted, 1);
+        fb.draw_text(115, uy, val, theme().text, 1);
         uy += ROW_H;
     }
 
     // Card 2: Kururu node vitals
-    draw_card(fb, RIBBON_2_X, 358, RIBBON_W, 202, Some(ICON_CHIP), "KURURU NODE VITALS", TEXT_AMBER);
+    draw_card(fb, RIBBON_2_X, 358, RIBBON_W, 202, Some(ICON_CHIP), "KURURU NODE VITALS", theme().warn);
 
     let vitals_lines = [
         ("Device:", "Samsung SM-T110".to_string()),
@@ -1553,13 +1787,13 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 
     let mut vy = 396;
     for (label, val) in &vitals_lines {
-        fb.draw_text(364, vy, label, TEXT_GRAY, 1);
-        fb.draw_text(440, vy, val, TEXT_WHITE, 1);
+        fb.draw_text(364, vy, label, theme().text_muted, 1);
+        fb.draw_text(440, vy, val, theme().text, 1);
         vy += ROW_H;
     }
 
     // Card 3: Homelab network
-    draw_card(fb, RIBBON_3_X, 358, RIBBON_W, 202, Some(ICON_GLOBE), "HOMELAB NETWORK", TEXT_AMBER);
+    draw_card(fb, RIBBON_3_X, 358, RIBBON_W, 202, Some(ICON_GLOBE), "HOMELAB NETWORK", theme().warn);
 
     let net_lines = [
         ("Tailnet:", info.tailnet_suffix.clone()),
@@ -1572,14 +1806,14 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 
     let mut ny = 396;
     for (label, val) in &net_lines {
-        fb.draw_text(700, ny, label, TEXT_GRAY, 1);
-        fb.draw_text(796, ny, val, TEXT_WHITE, 1);
+        fb.draw_text(700, ny, label, theme().text_muted, 1);
+        fb.draw_text(796, ny, val, theme().text, 1);
         ny += ROW_H;
     }
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.8 (UI shell: menu + screen-aware buttons, 1s live refresh)...");
+    println!("[Kururu Display Daemon] Starting v1.9 (Amber CRT themes + effects, UI shell)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -1608,6 +1842,9 @@ fn main() {
     // lacks Alpine's /bin, /usr/bin and /usr/local/bin, which made dmesg, ip,
     // wpa_cli and tailscale silently fail on every boot-started instance.
     std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin");
+
+    // Theme + CRT effects (env overrides config file).
+    load_display_config();
 
     let screen_active = Arc::new(AtomicBool::new(true));
     let screen_active_power = screen_active.clone();
@@ -1684,18 +1921,12 @@ fn main() {
                     }
                 }
                 KEY_HOMEPAGE => {
-                    if screen == SCREEN_DASHBOARD {
-                        menu_cursor_keys.store(0, Ordering::SeqCst);
-                        current_screen_keys.store(SCREEN_MENU, Ordering::SeqCst);
-                        println!("[Kururu Display] Home -> Menu");
-                    } else if screen == SCREEN_MENU {
-                        let cursor = menu_cursor_keys.load(Ordering::SeqCst);
-                        current_screen_keys.store(MENU_ITEMS[cursor].1, Ordering::SeqCst);
-                        println!("[Kururu Display] Home -> '{}'", MENU_ITEMS[cursor].0);
-                    } else {
-                        current_screen_keys.store(SCREEN_MENU, Ordering::SeqCst);
-                        println!("[Kururu Display] Home -> Back to Menu");
-                    }
+                    nav_activate(&current_screen_keys, &menu_cursor_keys);
+                    println!(
+                        "[Kururu Display] HOME: screen {} -> {}",
+                        screen,
+                        current_screen_keys.load(Ordering::SeqCst)
+                    );
                 }
                 _ => {}
             }
@@ -1737,14 +1968,33 @@ fn main() {
                 }
                 _ => {}
             },
-            EV_KEY if event.code == BTN_TOUCH => {
-                if event.value == 1 {
-                    touch_down = true;
-                } else if event.value == 0 && touch_down {
-                    touch_down = false;
-                    handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab, &touch_screen, &touch_menu);
+            EV_KEY => match event.code {
+                BTN_TOUCH => {
+                    if event.value == 1 {
+                        touch_down = true;
+                    } else if event.value == 0 && touch_down {
+                        touch_down = false;
+                        handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab, &touch_screen, &touch_menu);
+                    }
                 }
-            }
+                KEY_MENU | KEY_BACK => {
+                    if event.value == 1 {
+                        if !touch_active.load(Ordering::SeqCst) {
+                            set_display_hardware(true);
+                            touch_active.store(true, Ordering::SeqCst);
+                        }
+                        touch_wake.store(true, Ordering::SeqCst);
+                        if event.code == KEY_MENU {
+                            println!("[Kururu Display] MENU touchkey");
+                            nav_activate(&touch_screen, &touch_menu);
+                        } else {
+                            println!("[Kururu Display] BACK touchkey");
+                            nav_back(&touch_screen);
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     });
@@ -1832,7 +2082,7 @@ fn main() {
                 if let Some(ref info) = cached_info {
                     let screen = current_screen.load(Ordering::SeqCst);
 
-                    fb.clear(BG_COLOR);
+                    fb.clear(theme().bg);
                     draw_background_grid(&mut fb);
 
                     match screen {
@@ -1852,6 +2102,7 @@ fn main() {
                         }
                     }
 
+                    apply_crt_effects(&mut fb);
                     let _ = fb.flush();
                 }
             }
