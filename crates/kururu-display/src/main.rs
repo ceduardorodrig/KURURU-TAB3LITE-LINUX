@@ -1169,9 +1169,10 @@ fn draw_background_grid(fb: &mut Framebuffer) {
 
 /// Frog mascot overlay (pixel-art) — drawn on top of the ratatui Menu.
 fn draw_frog(fb: &mut Framebuffer) {
-    let x = (FB_WIDTH - 22) / 2;
-    fb.draw_sprite(x, 60, SP_FROG_BODY, theme().accent, 1);
-    fb.draw_sprite(x, 60, SP_FROG_DETAIL, theme().bg, 1);
+    let scale = 3;
+    let x = (FB_WIDTH - 22 * scale) / 2;
+    fb.draw_sprite(x, 100, SP_FROG_BODY, theme().accent, scale);
+    fb.draw_sprite(x, 100, SP_FROG_DETAIL, theme().bg, scale);
 }
 
 fn about_lines(info: &SystemInfo) -> Vec<String> {
@@ -1440,7 +1441,7 @@ const KB_ROWS: &[&[KKey]] = &[
 const TERM_X: usize = MARGIN;
 const TERM_Y: usize = 56;
 const TERM_COLS: usize = (FB_WIDTH - 2 * MARGIN) / 8;
-const TERM_ROWS: usize = (ui::KB_CELL_Y0 as usize * 16 - TERM_Y) / 16;
+const TERM_ROWS: usize = (ui::KB_TOP_PX - TERM_Y) / 16;
 
 static KB_SHIFT: AtomicBool = AtomicBool::new(false);
 static KB_CTRL: AtomicBool = AtomicBool::new(false);
@@ -2202,7 +2203,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.7 (ratatui app shell, touch-sized controls)...");
+    println!("[Kururu Display Daemon] Starting v2.8 (scale-2 touch UI: big text, 64px targets)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
