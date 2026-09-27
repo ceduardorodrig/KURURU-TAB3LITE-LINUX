@@ -135,16 +135,16 @@ while [ "$i" -lt 8 ]; do
     i=$((i + 1))
     sleep 1
 done
-echo "[Kururu NTP] Syncing clock before daemons..." >> "$LOGFILE"
+echo "[Kururu NTP] Syncing clock before daemons..."
 sync_clock
-echo "[Kururu NTP] Clock now: $(date)" >> "$LOGFILE"
+echo "[Kururu NTP] Clock now: $(date)"
 
 # Background service: Tailscale connection (clock already synced above)
 (
-    # Self-heal if the pre-boot sync failed because the network was still down.
-    for _ in $(seq 1 30); do
-        [ "$(date +%Y)" -ge 2026 ] && break
-        ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 && sync_clock
+    # Retry the clock sync in case the network was still down during the
+    # pre-boot attempt (harmless if it already succeeded).
+    for _ in $(seq 1 15); do
+        ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 && sync_clock && break
         sleep 2
     done
 
