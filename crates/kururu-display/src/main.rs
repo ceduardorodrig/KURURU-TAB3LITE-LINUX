@@ -51,6 +51,144 @@ const TEXT_CYAN: Color = Color { r: 0, g: 210, b: 255, a: 255 };
 const TEXT_AMBER: Color = Color { r: 255, g: 180, b: 0, a: 255 };
 const TEXT_RED: Color = Color { r: 255, g: 82, b: 82, a: 255 };
 
+// ── Layout design system (dark retro-HUD) ──────────────────────────────
+const MARGIN: usize = 16;        // outer screen margin
+const GUTTER: usize = 16;        // gap between adjacent cards
+const PAD: usize = 12;           // inner card padding
+const TITLE_H: usize = 28;       // card title band height
+const ROW_H: usize = 19;         // telemetry row pitch
+const LOG_ROW_H: usize = 17;     // log console row pitch
+const GRID_DOT: usize = 32;      // background dot-grid spacing
+const GRID_COLOR: Color = Color { r: 22, g: 30, b: 42, a: 255 };
+
+// Derived geometry — single source of truth for card placement.
+const CONTENT_W: usize = FB_WIDTH - 2 * MARGIN;             // 992
+const HALF_W: usize = (CONTENT_W - GUTTER) / 2;             // 488
+const COL_B_X: usize = MARGIN + HALF_W + GUTTER;            // 520
+const RIBBON_W: usize = (CONTENT_W - 2 * GUTTER) / 3;       // 320
+const RIBBON_2_X: usize = MARGIN + RIBBON_W + GUTTER;       // 352
+const RIBBON_3_X: usize = MARGIN + 2 * (RIBBON_W + GUTTER); // 688
+
+// ── Tab registry: single source of truth for header AND input handler ──
+const TABS: [&str; 3] = ["KURURU", "HOMELAB", "RETRO CLOCK"];
+const TAB_COUNT: usize = TABS.len();
+const MAX_TABS: usize = 8;
+
+// ── Pixel-art sprites ('#' = pixel). Data-driven masks rendered by
+//    Framebuffer::draw_sprite — adding art is just adding a mask. ──────
+const SP_FROG_BODY: &[&str] = &[
+    "  ####          ####  ",
+    " ######        ###### ",
+    " ######        ###### ",
+    " ######        ###### ",
+    "  ####          ####  ",
+    "   ################   ",
+    " #################### ",
+    "######################",
+    "######################",
+    "######################",
+    " #################### ",
+    " #################### ",
+    "  ##################  ",
+    "    ##############    ",
+];
+const SP_FROG_DETAIL: &[&str] = &[
+    "                      ",
+    "   ##            ##   ",
+    "   ##            ##   ",
+    "                      ",
+    "                      ",
+    "                      ",
+    "                      ",
+    "                      ",
+    "                      ",
+    "                      ",
+    "      ##########      ",
+    "                      ",
+    "                      ",
+    "                      ",
+];
+const ICON_CHIP: &[&str] = &[
+    "..####..",
+    ".#....#.",
+    "##....##",
+    "#.####.#",
+    "#.####.#",
+    "##....##",
+    ".#....#.",
+    "..####..",
+];
+const ICON_BATTERY: &[&str] = &[
+    ".######.",
+    "#......#",
+    "#.####.#",
+    "#.####.#",
+    "#......#",
+    ".######.",
+    "...##...",
+    "........",
+];
+const ICON_WIFI: &[&str] = &[
+    "........",
+    "..####..",
+    ".#....#.",
+    "#..##..#",
+    "...##...",
+    "..#..#..",
+    ".#....#.",
+    "........",
+];
+const ICON_GLOBE: &[&str] = &[
+    "..####..",
+    ".#.##.#.",
+    "#..##..#",
+    "#.####.#",
+    "#.####.#",
+    "#..##..#",
+    ".#.##.#.",
+    "..####..",
+];
+const ICON_CLOCK: &[&str] = &[
+    "..####..",
+    ".#....#.",
+    "#...#..#",
+    "#...#..#",
+    "#...####",
+    "#......#",
+    ".#....#.",
+    "..####..",
+];
+const ICON_TERMINAL: &[&str] = &[
+    "########",
+    "#......#",
+    "#.##...#",
+    "#..#...#",
+    "#.#....#",
+    "#......#",
+    "########",
+    "........",
+];
+const ICON_SERVER: &[&str] = &[
+    ".######.",
+    ".#....#.",
+    ".######.",
+    ".#....#.",
+    ".######.",
+    ".#....#.",
+    ".######.",
+    "........",
+];
+const ICON_POWER: &[&str] = &[
+    "...##...",
+    "..####..",
+    ".######.",
+    "########",
+    "###..###",
+    "##....##",
+    "##....##",
+    ".######.",
+];
+
 #[repr(C)]
 struct InputEvent {
     time_sec: usize,
@@ -159,6 +297,18 @@ impl Framebuffer {
         self.file.write_all(&self.buffer)?;
         self.file.flush()
     }
+
+    /// Blit a pixel-art mask ('#' = pixel, anything else = transparent).
+    /// Used for every icon and the frog so art stays data-driven and DRY.
+    fn draw_sprite(&mut self, x: usize, y: usize, sprite: &[&str], color: Color, scale: usize) {
+        for (ry, row) in sprite.iter().enumerate() {
+            for (cx, ch) in row.chars().enumerate() {
+                if ch == '#' {
+                    self.draw_rect(x + cx * scale, y + ry * scale, scale, scale, color);
+                }
+            }
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -227,6 +377,7 @@ struct SystemInfo {
     battery_pct: String,
     battery_pct_num: u32,
     battery_status: String,
+    battery_health: String,
     battery_temp_c: String,
     battery_volts: String,
     lan_ip: String,
@@ -266,6 +417,56 @@ fn local_time_str() -> String {
             "[--:--:--]".to_string()
         }
     }
+}
+
+/// Char-safe truncation — never panics on multibyte UTF-8 boundaries.
+fn truncate_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
+/// Open an input device, logging (and returning None) on failure. Shared by
+/// both the power and volume listener threads (DRY).
+fn open_input_device(path: &str) -> Option<File> {
+    match File::open(path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("Failed to open {}: {}", path, e);
+            None
+        }
+    }
+}
+
+/// Blocking read of a single input event into `buf`. Returns None on error so
+/// the caller can back off. Shared by both listener threads (DRY).
+fn read_event(file: &mut File, buf: &mut [u8]) -> Option<InputEvent> {
+    file.read_exact(buf).ok()?;
+    Some(unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEvent) })
+}
+
+/// Spawn a blocking listener thread for an input device, forwarding every
+/// decoded event to `handler`. The shared setup (open + buffer + backoff loop)
+/// lives here once so the power and volume listeners stay DRY.
+fn spawn_input_listener<F>(path: &'static str, mut handler: F)
+where
+    F: FnMut(InputEvent) + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut file = match open_input_device(path) {
+            Some(f) => f,
+            None => return,
+        };
+        let mut buf = vec![0u8; std::mem::size_of::<InputEvent>()];
+
+        loop {
+            match read_event(&mut file, &mut buf) {
+                Some(event) => handler(event),
+                None => thread::sleep(Duration::from_millis(200)),
+            }
+        }
+    });
 }
 
 fn gather_system_info() -> SystemInfo {
@@ -379,14 +580,19 @@ fn gather_system_info() -> SystemInfo {
         .trim()
         .to_string();
 
+    let battery_health = fs::read_to_string("/sys/class/power_supply/battery/health")
+        .unwrap_or_else(|_| "Unknown".to_string())
+        .trim()
+        .to_string();
+
     let battery_temp_c = if let Ok(t_raw) = fs::read_to_string("/sys/class/power_supply/battery/temp") {
         if let Ok(val) = t_raw.trim().parse::<f64>() {
-            format!("{:.1}°C", val / 10.0)
+            format!("{:.1}C", val / 10.0)
         } else {
-            "--°C".to_string()
+            "--C".to_string()
         }
     } else {
-        "--°C".to_string()
+        "--C".to_string()
     };
 
     let battery_volts = if let Ok(v_raw) = fs::read_to_string("/sys/class/power_supply/battery/voltage_now") {
@@ -550,7 +756,7 @@ fn gather_system_info() -> SystemInfo {
             0
         };
         for line in &lines[start..] {
-            // Prepend wall-clock timestamp so dmesg lines are clock-aligned
+            // dmesg has no wall clock → prepend the TZ-aware timestamp.
             logs.push(format!("{} {}", ts, line.trim_end()));
         }
     }
@@ -564,7 +770,8 @@ fn gather_system_info() -> SystemInfo {
             0
         };
         for line in &lines[start..] {
-            wol_logs.push(format!("{} {}", ts, line.trim_end()));
+            // kururu-wake already embeds [HH:MM:SS] in the file → no prefix here.
+            wol_logs.push(line.trim_end().to_string());
         }
     }
 
@@ -593,7 +800,7 @@ fn gather_system_info() -> SystemInfo {
 
             let d_name = day_names[wday].to_string();
             let m_name = month_names[mon_idx];
-            let full = format!("{} • {} {} {}", d_name.to_uppercase(), day, m_name.to_uppercase(), year);
+            let full = format!("{} | {} {} {}", d_name.to_uppercase(), day, m_name.to_uppercase(), year);
 
             (
                 format!("{:02}:{:02}:{:02}", h, m, s),
@@ -606,14 +813,14 @@ fn gather_system_info() -> SystemInfo {
                 "00:00:00".to_string(),
                 "01/01/1970".to_string(),
                 "Monday".to_string(),
-                "MONDAY • 1 JANUARY 1970".to_string(),
+                "MONDAY | 1 JANUARY 1970".to_string(),
             )
         }
     };
 
     let (wol_target1_mac, wol_target2_mac) = {
-        let mut psi = "d0:94:66:••:••:58".to_string();
-        let mut kav = "d0:94:66:••:••:c4".to_string();
+        let mut psi = "d0:94:66:xx:xx:58".to_string();
+        let mut kav = "d0:94:66:xx:xx:c4".to_string();
         if let Ok(content) = fs::read_to_string("/etc/kururu-wake.conf") {
             for line in content.lines() {
                 let trimmed = line.trim();
@@ -645,6 +852,7 @@ fn gather_system_info() -> SystemInfo {
         battery_pct,
         battery_pct_num,
         battery_status,
+        battery_health,
         battery_temp_c,
         battery_volts,
         lan_ip,
@@ -684,78 +892,205 @@ fn set_display_hardware(enable: bool) {
     }
 }
 
+/// Traffic-light accent colour for charge/health values.
+fn battery_color(pct: u32) -> Color {
+    if pct >= 50 {
+        TEXT_EMERALD
+    } else if pct >= 20 {
+        TEXT_AMBER
+    } else {
+        TEXT_RED
+    }
+}
+
+/// Sparse dot-grid drawn on the raw background (visible only in the gutters).
+fn draw_background_grid(fb: &mut Framebuffer) {
+    let mut y = 56;
+    while y < 568 {
+        let mut x = MARGIN;
+        while x < FB_WIDTH - MARGIN {
+            fb.draw_rect(x, y, 2, 2, GRID_COLOR);
+            x += GRID_DOT;
+        }
+        y += GRID_DOT;
+    }
+}
+
+/// Retro-HUD card frame: panel, 1px border, accent corner brackets, left
+/// accent bar, optional pixel icon + title, and a divider under the title.
+fn draw_card(
+    fb: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    icon: Option<&[&str]>,
+    title: &str,
+    accent: Color,
+) {
+    let right = x + w;
+    let bottom = y + h;
+
+    fb.draw_rect(x, y, w, h, PANEL_BG);
+    fb.draw_rect(x, y, w, 1, BORDER_COLOR);
+    fb.draw_rect(x, bottom - 1, w, 1, BORDER_COLOR);
+    fb.draw_rect(x, y, 1, h, BORDER_COLOR);
+    fb.draw_rect(right - 1, y, 1, h, BORDER_COLOR);
+
+    // Left accent bar across the title band
+    fb.draw_rect(x, y, 3, TITLE_H, accent);
+
+    // HUD corner brackets
+    let b = 9;
+    let t = 2;
+    fb.draw_rect(x, y, b, t, accent);
+    fb.draw_rect(x, y, t, b, accent);
+    fb.draw_rect(right - b, y, b, t, accent);
+    fb.draw_rect(right - t, y, t, b, accent);
+    fb.draw_rect(x, bottom - t, b, t, accent);
+    fb.draw_rect(x, bottom - b, t, b, accent);
+    fb.draw_rect(right - b, bottom - t, b, t, accent);
+    fb.draw_rect(right - t, bottom - b, t, b, accent);
+
+    // Title row: icon + label, vertically centred in the title band
+    let mut tx = x + PAD + 6;
+    if let Some(ic) = icon {
+        fb.draw_sprite(tx, y + (TITLE_H - 8) / 2, ic, accent, 1);
+        tx += 12;
+    }
+    fb.draw_text(tx, y + (TITLE_H - 16) / 2, title, TEXT_WHITE, 1);
+
+    // Divider under the title band
+    fb.draw_rect(x + PAD, y + TITLE_H, w - 2 * PAD, 1, BORDER_COLOR);
+}
+
 fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
-    // Header panel: 48px tall, 2px border at y=48
+    // Header panel: 48px tall + 2px border at y=48
     fb.draw_rect(0, 0, FB_WIDTH, 48, PANEL_BG);
     fb.draw_rect(0, 48, FB_WIDTH, 2, BORDER_COLOR);
 
-    // Brand: "KURURU" at scale-2 (32px tall). Vertically centered: (48-32)/2 = 8
-    fb.draw_text(16, 8, "KURURU", TEXT_EMERALD, 2);
+    // Frog mascot: green body + dark pupils/mouth (header bg shows through).
+    // 14px tall, vertically centred in the 48px header: (48-14)/2 = 17.
+    fb.draw_sprite(MARGIN, 17, SP_FROG_BODY, TEXT_EMERALD, 1);
+    fb.draw_sprite(MARGIN, 17, SP_FROG_DETAIL, PANEL_BG, 1);
 
-    // 3 Tab buttons — each 150px wide, 8px from top/bottom (height 32px, y=8..40)
-    let tabs = [
-        "1. KURURU",
-        "2. HOMELAB",
-        "3. RETRO CLOCK",
-    ];
+    // Brand — scale-2 (32px tall), vertically centred: (48-32)/2 = 8
+    let brand_x = MARGIN + 22 + 10; // frog is 22px wide + 10px gap
+    fb.draw_text(brand_x, 8, "KURURU", TEXT_EMERALD, 2);
 
-    let mut tx = 160;
-    for (i, &name) in tabs.iter().enumerate() {
-        let is_current = i == active_tab;
-        let tab_w = 150;
-        let bg = if is_current { PANEL_ACTIVE_BG } else { PANEL_BG };
-        let border = if is_current { BORDER_ACTIVE } else { BORDER_COLOR };
-        let text_color = if is_current { TEXT_EMERALD } else { TEXT_GRAY };
+    // Dynamic tabs fill the remaining span, right-aligned to the margin.
+    // Registry-driven: supports up to MAX_TABS, labels degrade to the index.
+    let n = TAB_COUNT.min(MAX_TABS);
+    let gap = 8usize;
+    let tab_start = brand_x + 6 * 16 + 24; // brand (96px) + gap
+    let tab_end = FB_WIDTH - MARGIN;
+    let available = tab_end.saturating_sub(tab_start);
+    let tab_w = available.saturating_sub((n - 1) * gap) / n;
 
-        fb.draw_rect(tx, 8, tab_w, 32, bg);
-        fb.draw_rect(tx, 8, tab_w, 2, border);
-        fb.draw_rect(tx, 38, tab_w, 2, border);
+    let mut tx = tab_start;
+    for (i, name) in TABS.iter().take(n).enumerate() {
+        let is_active = i == active_tab;
+        let bg = if is_active { PANEL_ACTIVE_BG } else { PANEL_BG };
+        let border = if is_active { BORDER_ACTIVE } else { BORDER_COLOR };
+        let text_color = if is_active { TEXT_EMERALD } else { TEXT_GRAY };
 
-        // Tab text vertically centered: y = 8 + (32-16)/2 = 16
-        let pad_x = tx + 14;
-        fb.draw_text(pad_x, 16, name, text_color, 1);
+        fb.draw_rect(tx, 6, tab_w, 36, bg);
+        fb.draw_rect(tx, 6, tab_w, 2, border);
+        fb.draw_rect(tx, 40, tab_w, 2, border);
+        if is_active {
+            fb.draw_rect(tx, 6, 3, 36, BORDER_ACTIVE);
+        }
 
-        tx += tab_w + 12;
+        // Adaptive label: "N NAME" when it fits, otherwise just "N".
+        let num = format!("{}", i + 1);
+        let full = format!("{} {}", num, name);
+        let (label, label_px) = if full.len() * 8 + 16 <= tab_w {
+            (full.as_str(), full.len() * 8)
+        } else {
+            (num.as_str(), num.len() * 8)
+        };
+        let text_x = tx + tab_w.saturating_sub(label_px) / 2;
+        fb.draw_text(text_x, 16, label, text_color, 1);
+
+        tx += tab_w + gap;
     }
-
-    // Right: brand/subtitle — align to same vertical center as tab text (y=16)
-    fb.draw_text(660, 16, "StenioSentinel • Mnemocine Homelab", TEXT_GRAY, 1);
 }
 
-fn draw_footer(fb: &mut Framebuffer) {
-    // Footer panel: y=568, height=32. Text vertically centered: y = 568 + (32-16)/2 = 576.
+fn draw_footer(fb: &mut Framebuffer, info: &SystemInfo) {
+    // Footer panel: y=568, height=32. Text vertically centered: y = 576.
     fb.draw_rect(0, 568, FB_WIDTH, 32, PANEL_BG);
     fb.draw_rect(0, 568, FB_WIDTH, 1, BORDER_COLOR);
 
-    // ── LEFT SECTION: Volume navigation ─────────────────────────────────────
-    // "[VOL+] <- Prev" = 14 chars × 8px = 112px → x=14..126
-    fb.draw_text(14, 576, "[VOL+] <- Prev", TEXT_AMBER, 1);
-    // Separator at x=130 (4px gap after end of text)
+    // LEFT: volume navigation
+    fb.draw_text(MARGIN - 2, 576, "[VOL+] <- Prev", TEXT_AMBER, 1);
     fb.draw_text(130, 576, "|", TEXT_DIM, 1);
-    // "[VOL-] -> Next" = 14 chars × 8px = 112px → x=142..254
     fb.draw_text(142, 576, "[VOL-] -> Next", TEXT_CYAN, 1);
 
-    // ── CENTER: Power button hint (centered around x=512) ───────────────────
-    // "[POWER] Wake / Sleep" = 20 chars × 8px = 160px → center at 512 = x=432..592
+    // CENTER: power button hint (centered on 512)
     fb.draw_text(432, 576, "[POWER] Wake / Sleep", TEXT_WHITE, 1);
 
-    // ── RIGHT SECTION: Status info ───────────────────────────────────────────
-    // "Auto-sleep: 120s" = 16 chars × 8px = 128px → x=640..768
-    fb.draw_text(640, 576, "Auto-sleep: 120s", TEXT_DIM, 1);
-    // Separator at x=776
-    fb.draw_text(776, 576, "|", TEXT_DIM, 1);
-    // "UPS: OK" = 7 chars × 8px = 56px → x=788..844
-    fb.draw_text(788, 576, "UPS: OK", TEXT_EMERALD, 1);
+    // RIGHT: auto-sleep + live UPS (on-board battery) status, right-aligned
+    let ups = format!("UPS: {}% ({})", info.battery_pct, info.battery_health);
+    let ups_x = FB_WIDTH - MARGIN - ups.len() * 8;
+    let sep_x = ups_x - 12;
+    let sleep = "Auto-sleep: 120s";
+    fb.draw_text(sep_x - 8 - sleep.len() * 8, 576, sleep, TEXT_DIM, 1);
+    fb.draw_text(sep_x, 576, "|", TEXT_DIM, 1);
+    fb.draw_text(ups_x, 576, &ups, battery_color(info.battery_pct_num), 1);
 }
 
 // -------------------------------------------------------------
 // TAB 0: KURURU NODE (Exclusive Local Device Telemetry)
 // -------------------------------------------------------------
+/// Shared log-console card (used by both dashboards). Draws the card frame,
+/// the tail of `lines`, a blinking terminal cursor and an empty-state message.
+fn draw_log_console(
+    fb: &mut Framebuffer,
+    lines: &[String],
+    time_str: &str,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    title: &str,
+    icon: &[&str],
+    accent: Color,
+    text_color: Color,
+    empty_msg: &str,
+) {
+    draw_card(fb, x, y, w, h, Some(icon), title, accent);
+
+    let content_x = x + PAD;
+    let content_y = y + TITLE_H + PAD;
+    let max_rows = (y + h - PAD).saturating_sub(content_y) / LOG_ROW_H;
+    let max_chars = (w - 2 * PAD - 4) / 8;
+
+    let shown: Vec<&String> = lines.iter().rev().take(max_rows).collect::<Vec<_>>()
+        .into_iter().rev().collect();
+
+    if shown.is_empty() {
+        fb.draw_text(content_x, content_y, empty_msg, TEXT_DIM, 1);
+        return;
+    }
+
+    let mut last_len = 0;
+    for (i, line) in shown.iter().enumerate() {
+        let trunc = truncate_chars(line, max_chars);
+        fb.draw_text(content_x, content_y + i * LOG_ROW_H, trunc, text_color, 1);
+        last_len = trunc.len();
+    }
+
+    // Blinking cursor — same 1Hz beat for both consoles.
+    let sec = time_str.get(6..8).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    if sec % 2 == 0 {
+        let last_y = content_y + (shown.len() - 1) * LOG_ROW_H;
+        fb.draw_rect(content_x + last_len * 8 + 4, last_y, 8, 16, accent);
+    }
+}
+
 fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
-    // Card 1: Top Left - System, APU & Memory
-    fb.draw_rect(16, 56, 480, 244, PANEL_BG);
-    fb.draw_rect(16, 56, 480, 2, BORDER_COLOR);
-    fb.draw_text(28, 68, "KURURU ARCHITECTURE & COMPUTE", TEXT_AMBER, 1);
+    // ── Card A: System, APU & Memory ────────────────────────────────────────
+    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_CHIP), "KURURU ARCHITECTURE & COMPUTE", TEXT_AMBER);
 
     let free_pct = if info.ram_total_mb > 0 {
         100 - (info.ram_used_mb * 100 / info.ram_total_mb)
@@ -782,28 +1117,25 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
         ("Init Mode:", "Native Headless Bare-Metal"),
     ];
 
-    let mut ty = 92;
+    let mut ty = 96;
     for (label, val) in &telemetry_lines {
         fb.draw_text(28, ty, label, TEXT_GRAY, 1);
         fb.draw_text(165, ty, val, TEXT_WHITE, 1);
-        ty += 19;
+        ty += ROW_H;
     }
 
-    // Card 2: Top Right - PMIC Battery & Local Wi-Fi Radio
-    fb.draw_rect(512, 56, 496, 244, PANEL_BG);
-    fb.draw_rect(512, 56, 496, 2, BORDER_COLOR);
-    fb.draw_text(524, 68, "PMIC BATTERY (UPS) & LOCAL WI-FI RADIO", TEXT_AMBER, 1);
+    // ── Card B: On-board battery (UPS) & Wi-Fi radio ────────────────────────
+    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_WIFI), "BATTERY (UPS) & WI-FI RADIO", TEXT_AMBER);
 
-    // Battery bar inside Card 2
-    fb.draw_text(524, 92, "Battery Level:", TEXT_GRAY, 1);
-    fb.draw_rect(656, 90, 200, 16, BORDER_COLOR);
+    fb.draw_text(532, 92, "Battery:", TEXT_GRAY, 1);
+    fb.draw_rect(628, 90, 200, 16, BORDER_COLOR);
     let fill_w = (info.battery_pct_num as usize * 196) / 100;
-    fb.draw_rect(658, 92, fill_w, 12, TEXT_EMERALD);
+    fb.draw_rect(630, 92, fill_w, 12, battery_color(info.battery_pct_num));
     let bat_label = format!("{}% ({})", info.battery_pct, info.battery_status);
-    fb.draw_text(866, 92, &bat_label, TEXT_WHITE, 1);
+    fb.draw_text(840, 92, &bat_label, TEXT_WHITE, 1);
 
     let power_radio_lines = [
-        ("Fuelgauge:", format!("{} • Temp: {}", info.battery_volts, info.battery_temp_c)),
+        ("Fuelgauge:", format!("{} | Temp: {} | Health: {}", info.battery_volts, info.battery_temp_c, info.battery_health)),
         ("Hardware PMIC:", "Marvell 88PM822 / AXP228 Driver".to_string()),
         ("UPS Protection:", "Active (3600 mAh Built-in Buffer)".to_string()),
         ("Wi-Fi Chipset:", "Marvell SD8777 (Interface: mlan0)".to_string()),
@@ -814,68 +1146,51 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
         ("SSH Service:", "Dropbear (authorized keys root)".to_string()),
     ];
 
-    let mut ry = 114;
+    let mut ry = 118;
     for (label, val) in &power_radio_lines {
-        fb.draw_text(524, ry, label, TEXT_GRAY, 1);
-        fb.draw_text(668, ry, val, TEXT_WHITE, 1);
-        ry += 19;
+        fb.draw_text(532, ry, label, TEXT_GRAY, 1);
+        fb.draw_text(676, ry, val, TEXT_WHITE, 1);
+        ry += ROW_H;
     }
 
-    // Card 3: Bottom - Live Kernel Log Console (dmesg tail)
-    fb.draw_rect(16, 308, 992, 252, PANEL_BG);
-    fb.draw_rect(16, 308, 992, 2, BORDER_COLOR);
-    fb.draw_text(28, 318, "KURURU KERNEL LOG CONSOLE (DMESG TAIL)", TEXT_EMERALD, 1);
-
-    let mut log_y = 338;
-    for log in &info.logs {
-        let truncated = if log.len() > 118 {
-            &log[..118]
-        } else {
-            log.as_str()
-        };
-        fb.draw_text(28, log_y, truncated, TEXT_GRAY, 1);
-        log_y += 17;
-        if log_y > 546 {
-            break;
-        }
-    }
+    // ── Card C: Live kernel log console ─────────────────────────────────────
+    draw_log_console(
+        fb, &info.logs, &info.time_str,
+        MARGIN, 308, CONTENT_W, 252,
+        "KERNEL LOG CONSOLE (DMESG TAIL)", ICON_TERMINAL,
+        TEXT_EMERALD, TEXT_GRAY,
+        "Waiting for kernel messages...",
+    );
 }
 
 // -------------------------------------------------------------
 // TAB 1: HOMELAB & WOL (Cluster Telemetry & Wake-on-LAN)
 // -------------------------------------------------------------
 fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
-    // Card 1: Top Left - Tailnet Cluster & Core Servers
-    fb.draw_rect(16, 56, 480, 244, PANEL_BG);
-    fb.draw_rect(16, 56, 480, 2, BORDER_COLOR);
+    // ── Card A: Tailnet cluster & core servers ──────────────────────────────
+    let cluster_title = format!("MNEMOCINE TAILNET ({}/5 ONLINE)", info.homelab_online_count);
+    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_SERVER), &cluster_title, TEXT_AMBER);
 
-    let cluster_header = format!(
-        "MNEMOCINE TAILNET CLUSTER ({}/5 Online)",
-        info.homelab_online_count
-    );
-    fb.draw_text(28, 68, &cluster_header, TEXT_AMBER, 1);
+    fb.draw_text(28, 96, "Tailnet:", TEXT_GRAY, 1);
+    fb.draw_text(130, 96, &info.tailnet_suffix, TEXT_CYAN, 1);
 
-    fb.draw_text(28, 90, "Tailnet:", TEXT_GRAY, 1);
-    fb.draw_text(130, 90, &info.tailnet_suffix, TEXT_CYAN, 1);
+    fb.draw_text(28, 115, "Kururu IP:", TEXT_GRAY, 1);
+    fb.draw_text(130, 115, &info.tailscale_ip, TEXT_WHITE, 1);
 
-    fb.draw_text(28, 108, "Kururu IP:", TEXT_GRAY, 1);
-    fb.draw_text(130, 108, &info.tailscale_ip, TEXT_WHITE, 1);
+    fb.draw_text(28, 134, "Direct Link:", TEXT_GRAY, 1);
+    fb.draw_text(130, 134, &info.active_link_str, TEXT_EMERALD, 1);
 
-    fb.draw_text(28, 126, "Direct Link:", TEXT_GRAY, 1);
-    fb.draw_text(130, 126, &info.active_link_str, TEXT_EMERALD, 1);
-
-    // Dynamic Server List (5 core servers)
-    let mut py = 148;
+    // Server list with pixel status squares (active / online / offline)
+    let mut py = 162;
     for peer in &info.homelab_nodes {
-        let (bullet, color) = if peer.active {
-            ("★", TEXT_EMERALD)
+        let color = if peer.active {
+            TEXT_EMERALD
         } else if peer.online {
-            ("●", TEXT_CYAN)
+            TEXT_CYAN
         } else {
-            ("○", TEXT_DIM)
+            BORDER_COLOR
         };
-
-        fb.draw_text(28, py, bullet, color, 1);
+        fb.draw_rect(28, py + 4, 8, 8, color);
         fb.draw_text(44, py, &peer.name, if peer.online { TEXT_WHITE } else { TEXT_DIM }, 1);
         fb.draw_text(145, py, &peer.ip, TEXT_GRAY, 1);
 
@@ -888,18 +1203,20 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
         };
         fb.draw_text(295, py, status_desc, if peer.online { color } else { TEXT_DIM }, 1);
 
-        py += 19;
+        py += ROW_H;
     }
 
     let summary_line = format!("Mesh Total: {} nodes registered in Tailnet", info.peers_total_count);
-    fb.draw_text(28, 276, &summary_line, TEXT_DIM, 1);
+    fb.draw_text(28, 278, &summary_line, TEXT_DIM, 1);
 
-    // Card 2: Top Right - Wake-on-LAN Controller & Relay Targets
-    fb.draw_rect(512, 56, 496, 244, PANEL_BG);
-    fb.draw_rect(512, 56, 496, 2, BORDER_COLOR);
-    fb.draw_text(524, 68, "WAKE-ON-LAN CONTROLLER & RELAY", TEXT_AMBER, 1);
+    // ── Card B: Wake-on-LAN controller & relay targets ──────────────────────
+    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_POWER), "WAKE-ON-LAN CONTROLLER", TEXT_AMBER);
 
-    let daemon_label = if info.wol_daemon_running { "ACTIVE (:9096) — Kururu Native Rust" } else { "STOPPED" };
+    let daemon_label = if info.wol_daemon_running {
+        "ACTIVE (:9096) - Kururu Native Rust"
+    } else {
+        "STOPPED"
+    };
     let daemon_color = if info.wol_daemon_running { TEXT_EMERALD } else { TEXT_RED };
 
     let wol_lines = [
@@ -914,120 +1231,92 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
         ("Transmission:", "Layer 2 Magic Packet Burst (5x / 25ms)", TEXT_GRAY),
     ];
 
-    let mut wy = 90;
+    let mut wy = 96;
     for (label, val, col) in &wol_lines {
-        fb.draw_text(524, wy, label, TEXT_GRAY, 1);
-        fb.draw_text(678, wy, val, *col, 1);
-        wy += 19;
+        fb.draw_text(532, wy, label, TEXT_GRAY, 1);
+        fb.draw_text(676, wy, val, *col, 1);
+        wy += ROW_H;
     }
 
-    // Card 3: Bottom - Wake-on-LAN Dispatch Audit Log
-    fb.draw_rect(16, 308, 992, 252, PANEL_BG);
-    fb.draw_rect(16, 308, 992, 2, BORDER_COLOR);
-    fb.draw_text(28, 318, "RECENT WAKE-ON-LAN DISPATCH AUDIT LOG (/var/log/kururu-wol.log)", TEXT_EMERALD, 1);
-
-    let mut log_y = 338;
-    if info.wol_logs.is_empty() {
-        fb.draw_text(28, log_y, "No Wake-on-LAN packets dispatched yet. Waiting for triggers on port 9096...", TEXT_DIM, 1);
-    } else {
-        for log in &info.wol_logs {
-            let truncated = if log.len() > 118 {
-                &log[..118]
-            } else {
-                log.as_str()
-            };
-            fb.draw_text(28, log_y, truncated, TEXT_CYAN, 1);
-            log_y += 17;
-            if log_y > 546 {
-                break;
-            }
-        }
-    }
+    // ── Card C: WoL dispatch audit log ──────────────────────────────────────
+    draw_log_console(
+        fb, &info.wol_logs, &info.time_str,
+        MARGIN, 308, CONTENT_W, 252,
+        "WAKE-ON-LAN DISPATCH AUDIT LOG", ICON_TERMINAL,
+        TEXT_CYAN, TEXT_CYAN,
+        "No Wake-on-LAN packets dispatched yet. Waiting on port 9096...",
+    );
 }
 
 // -------------------------------------------------------------
 // TAB 2: RETRO DESK CLOCK & AMBIENT STATION
 // -------------------------------------------------------------
 fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
-    // Massive Centered Digital Clock Card (Clean & Uncluttered)
-    fb.draw_rect(16, 56, 992, 294, PANEL_BG);
-    fb.draw_rect(16, 56, 992, 2, BORDER_COLOR);
+    // ── Hero: ambient retro clock ───────────────────────────────────────────
+    draw_card(fb, MARGIN, 56, CONTENT_W, 294, Some(ICON_CLOCK),
+              "MNEMOCINE TIME STATION - SOVEREIGN NTP CLOCK", TEXT_AMBER);
 
-    fb.draw_text(32, 70, "MNEMOCINE TIME STATION • SOVEREIGN NTP CLOCK", TEXT_AMBER, 1);
+    // Huge clock: font 8x16 at scale 5 = 40x80 px/char; 8 chars = 320px wide.
+    fb.draw_text(352, 100, &info.time_str, TEXT_EMERALD, 5);
 
-    // Render huge 5x clock (Font 8x16 scaled 5x = 40x80 px per char)
-    // 8 chars * 40 px = 320 px width -> Center at x = (1024 - 320) / 2 = 352
-    fb.draw_text(352, 96, &info.time_str, TEXT_EMERALD, 5);
-
-    // Date banner (Scale 2, centered)
-    let date_char_w = 8 * 2;
-    let date_width = info.date_full_str.len() * date_char_w;
-    let date_x = (FB_WIDTH.saturating_sub(date_width)) / 2;
+    // Date banner (scale 2, centered)
+    let date_x = (FB_WIDTH.saturating_sub(info.date_full_str.len() * 16)) / 2;
     fb.draw_text(date_x, 196, &info.date_full_str, TEXT_CYAN, 2);
 
-    // Minimal Sub-banner
-    let sub = format!("Timezone: America/Sao_Paulo (UTC-3) • Host: {} • Uptime: {}", info.hostname, info.uptime_str);
-    let sub_x = (FB_WIDTH.saturating_sub(sub.len() * 8)) / 2;
-    fb.draw_text(sub_x, 244, &sub, TEXT_GRAY, 1);
+    // Sub-banner + status pill (centered)
+    let sub = format!("Timezone: America/Sao_Paulo (UTC-3) | Host: {} | Uptime: {}", info.hostname, info.uptime_str);
+    fb.draw_text((FB_WIDTH.saturating_sub(sub.len() * 8)) / 2, 250, &sub, TEXT_GRAY, 1);
 
-    // Status Dots
-    let cluster_pill = format!(
-        "Homelab: {}/5 Servers Online   •   Wi-Fi: {} ({})   •   WOL Relay: Port 9096 Ready",
+    let pill = format!(
+        "Homelab: {}/5 Servers Online   |   Wi-Fi: {} ({})   |   WOL Relay: Port 9096 Ready",
         info.homelab_online_count, info.wifi_ssid, info.wifi_signal_dbm
     );
-    let dots_x = (FB_WIDTH.saturating_sub(cluster_pill.len() * 8)) / 2;
-    fb.draw_text(dots_x, 272, &cluster_pill, TEXT_DIM, 1);
+    fb.draw_text((FB_WIDTH.saturating_sub(pill.len() * 8)) / 2, 286, &pill, TEXT_DIM, 1);
 
-    // Bottom Ambient Ribbon: 3 Clean Symmetrical Vitals Cards (Each 316px wide)
-    // Card 1: Hardware UPS & Power (Left)
-    fb.draw_rect(16, 358, 316, 202, PANEL_BG);
-    fb.draw_rect(16, 358, 316, 2, BORDER_COLOR);
-    fb.draw_text(28, 370, "HARDWARE UPS / NO-BREAK", TEXT_AMBER, 1);
+    // ── Ambient ribbon: 3 symmetric vitals cards (320px each) ──────────────
+    // Card 1: Hardware UPS / no-break
+    draw_card(fb, MARGIN, 358, RIBBON_W, 202, Some(ICON_BATTERY), "HARDWARE UPS / NO-BREAK", TEXT_AMBER);
 
-    fb.draw_rect(28, 396, 292, 16, BORDER_COLOR);
+    fb.draw_rect(28, 394, 292, 16, BORDER_COLOR);
     let fill_w = (info.battery_pct_num as usize * 288) / 100;
-    fb.draw_rect(30, 398, fill_w, 12, TEXT_EMERALD);
+    fb.draw_rect(30, 396, fill_w, 12, battery_color(info.battery_pct_num));
 
     let ups_lines = [
         ("Charge:", format!("{}% ({})", info.battery_pct, info.battery_status)),
+        ("Health:", info.battery_health.clone()),
         ("Voltage:", info.battery_volts.clone()),
         ("Thermal:", info.battery_temp_c.clone()),
-        ("AC Supply:", "5V Micro-USB Continuous".to_string()),
         ("Buffer:", "3600 mAh Li-ion Cell".to_string()),
     ];
 
-    let mut uy = 422;
+    let mut uy = 420;
     for (label, val) in &ups_lines {
         fb.draw_text(28, uy, label, TEXT_GRAY, 1);
         fb.draw_text(115, uy, val, TEXT_WHITE, 1);
-        uy += 22;
+        uy += ROW_H;
     }
 
-    // Card 2: Kururu Node Vitals (Center)
-    fb.draw_rect(348, 358, 328, 202, PANEL_BG);
-    fb.draw_rect(348, 358, 328, 2, BORDER_COLOR);
-    fb.draw_text(360, 370, "KURURU NODE VITALS", TEXT_AMBER, 1);
+    // Card 2: Kururu node vitals
+    draw_card(fb, RIBBON_2_X, 358, RIBBON_W, 202, Some(ICON_CHIP), "KURURU NODE VITALS", TEXT_AMBER);
 
     let vitals_lines = [
-        ("Device:", "Samsung SM-T110 (Goyawifi)".to_string()),
+        ("Device:", "Samsung SM-T110".to_string()),
         ("APU:", format!("Marvell PXA988 @ {}", info.cpu_freq_str)),
         ("Load:", format!("{} (1m, 5m, 15m)", info.load_avg)),
         ("RAM:", format!("{} MB used / {} MB", info.ram_used_mb, info.ram_total_mb)),
         ("Storage:", format!("{} MB free in rootfs", info.disk_free_mb)),
-        ("Cooling:", "Passive Thermal (Silent 0 dB)".to_string()),
+        ("Cooling:", "Passive (0 dB Silent)".to_string()),
     ];
 
-    let mut vy = 398;
+    let mut vy = 396;
     for (label, val) in &vitals_lines {
-        fb.draw_text(360, vy, label, TEXT_GRAY, 1);
+        fb.draw_text(364, vy, label, TEXT_GRAY, 1);
         fb.draw_text(440, vy, val, TEXT_WHITE, 1);
-        vy += 22;
+        vy += ROW_H;
     }
 
-    // Card 3: Homelab Network (Right)
-    fb.draw_rect(692, 358, 316, 202, PANEL_BG);
-    fb.draw_rect(692, 358, 316, 2, BORDER_COLOR);
-    fb.draw_text(704, 370, "HOMELAB NETWORK", TEXT_AMBER, 1);
+    // Card 3: Homelab network
+    draw_card(fb, RIBBON_3_X, 358, RIBBON_W, 202, Some(ICON_GLOBE), "HOMELAB NETWORK", TEXT_AMBER);
 
     let net_lines = [
         ("Tailnet:", info.tailnet_suffix.clone()),
@@ -1038,16 +1327,23 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
         ("WOL Engine:", "Port 9096 Listener Ready".to_string()),
     ];
 
-    let mut ny = 398;
+    let mut ny = 396;
     for (label, val) in &net_lines {
-        fb.draw_text(704, ny, label, TEXT_GRAY, 1);
-        fb.draw_text(800, ny, val, TEXT_WHITE, 1);
-        ny += 22;
+        fb.draw_text(700, ny, label, TEXT_GRAY, 1);
+        fb.draw_text(796, ny, val, TEXT_WHITE, 1);
+        ny += ROW_H;
     }
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.3 (Inverted Volume Navigation & Modular Dashboards)...");
+    println!("[Kururu Display Daemon] Starting v1.4 (Retro-HUD UI, sprite engine, live UPS)...");
+
+    // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
+    let initial_tab = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse::<usize>().ok())
+        .map(|t| t.min(TAB_COUNT - 1))
+        .unwrap_or(0);
 
     // Force Brazil / Brasília time (UTC-3, fixed — no DST since 2019).
     // Use POSIX inline string "BRT3" instead of "America/Sao_Paulo" which
@@ -1061,7 +1357,7 @@ fn main() {
     let screen_active_power = screen_active.clone();
     let screen_active_keys = screen_active.clone();
 
-    let current_tab = Arc::new(AtomicUsize::new(0));
+    let current_tab = Arc::new(AtomicUsize::new(initial_tab));
     let current_tab_keys = current_tab.clone();
 
     let wake_signal = Arc::new(AtomicBool::new(true));
@@ -1071,92 +1367,52 @@ fn main() {
     // Start with display ON initially so user sees it right away
     set_display_hardware(true);
 
-    // Thread 1: Listen to hardware Power button (/dev/input/event2)
-    thread::spawn(move || {
-        let mut file = match File::open(EVENT_POWER) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to open {}: {}", EVENT_POWER, e);
-                return;
-            }
-        };
-
-        let event_size = std::mem::size_of::<InputEvent>();
-        let mut buf = vec![0u8; event_size];
-
-        loop {
-            if file.read_exact(&mut buf).is_err() {
-                thread::sleep(Duration::from_millis(200));
-                continue;
-            }
-
-            let event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEvent) };
-
-            // KEY_POWER press (value == 1)
-            if event.type_ == EV_KEY && event.code == KEY_POWER && event.value == 1 {
-                let current = screen_active_power.load(Ordering::SeqCst);
-                let new_state = !current;
-                println!(
-                    "[Kururu Display] Power button toggled -> State: {}",
-                    if new_state { "AWAKE" } else { "SLEEP" }
-                );
-                set_display_hardware(new_state);
-                screen_active_power.store(new_state, Ordering::SeqCst);
-                if new_state {
-                    wake_signal_power.store(true, Ordering::SeqCst);
-                }
+    // Listener: hardware Power button (/dev/input/event2)
+    spawn_input_listener(EVENT_POWER, move |event| {
+        // KEY_POWER press (value == 1)
+        if event.type_ == EV_KEY && event.code == KEY_POWER && event.value == 1 {
+            let current = screen_active_power.load(Ordering::SeqCst);
+            let new_state = !current;
+            println!(
+                "[Kururu Display] Power button toggled -> State: {}",
+                if new_state { "AWAKE" } else { "SLEEP" }
+            );
+            set_display_hardware(new_state);
+            screen_active_power.store(new_state, Ordering::SeqCst);
+            if new_state {
+                wake_signal_power.store(true, Ordering::SeqCst);
             }
         }
     });
 
-    // Thread 2: Listen to hardware Volume Up / Volume Down keys (/dev/input/event0)
+    // Listener: hardware Volume Up / Volume Down keys (/dev/input/event0)
     // INVERTED: Volume Up goes right-to-left (prev tab); Volume Down goes left-to-right (next tab)
-    thread::spawn(move || {
-        let mut file = match File::open(EVENT_KEYS) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to open {}: {}", EVENT_KEYS, e);
-                return;
-            }
-        };
-
-        let event_size = std::mem::size_of::<InputEvent>();
-        let mut buf = vec![0u8; event_size];
-
-        loop {
-            if file.read_exact(&mut buf).is_err() {
-                thread::sleep(Duration::from_millis(200));
-                continue;
+    spawn_input_listener(EVENT_KEYS, move |event| {
+        // Only respond on key down (value == 1)
+        if event.type_ == EV_KEY && event.value == 1 {
+            let was_asleep = !screen_active_keys.load(Ordering::SeqCst);
+            if was_asleep {
+                println!("[Kururu Display] Key pressed while asleep -> Waking display up");
+                set_display_hardware(true);
+                screen_active_keys.store(true, Ordering::SeqCst);
+                wake_signal_keys.store(true, Ordering::SeqCst);
             }
 
-            let event = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const InputEvent) };
-
-            // Only respond on key down (value == 1)
-            if event.type_ == EV_KEY && event.value == 1 {
-                let was_asleep = !screen_active_keys.load(Ordering::SeqCst);
-                if was_asleep {
-                    println!("[Kururu Display] Key pressed while asleep -> Waking display up");
-                    set_display_hardware(true);
-                    screen_active_keys.store(true, Ordering::SeqCst);
-                    wake_signal_keys.store(true, Ordering::SeqCst);
-                }
-
-                if event.code == KEY_VOLUMEUP {
-                    // Volume Up: right-to-left (previous tab: 2 -> 1 -> 0 -> 2)
-                    let prev = (current_tab_keys.load(Ordering::SeqCst) + 3 - 1) % 3;
-                    current_tab_keys.store(prev, Ordering::SeqCst);
-                    println!("[Kururu Display] Volume UP -> Switched to Tab {} (<-)", prev + 1);
-                    wake_signal_keys.store(true, Ordering::SeqCst);
-                } else if event.code == KEY_VOLUMEDOWN {
-                    // Volume Down: left-to-right (next tab: 0 -> 1 -> 2 -> 0)
-                    let next = (current_tab_keys.load(Ordering::SeqCst) + 1) % 3;
-                    current_tab_keys.store(next, Ordering::SeqCst);
-                    println!("[Kururu Display] Volume DOWN -> Switched to Tab {} (->)", next + 1);
-                    wake_signal_keys.store(true, Ordering::SeqCst);
-                } else if event.code == KEY_HOMEPAGE {
-                    println!("[Kururu Display] Home key pressed -> Wake/Refreshed");
-                    wake_signal_keys.store(true, Ordering::SeqCst);
-                }
+            if event.code == KEY_VOLUMEUP {
+                // Volume Up: right-to-left (previous tab)
+                let prev = (current_tab_keys.load(Ordering::SeqCst) + TAB_COUNT - 1) % TAB_COUNT;
+                current_tab_keys.store(prev, Ordering::SeqCst);
+                println!("[Kururu Display] Volume UP -> Switched to Tab {} (<-)", prev + 1);
+                wake_signal_keys.store(true, Ordering::SeqCst);
+            } else if event.code == KEY_VOLUMEDOWN {
+                // Volume Down: left-to-right (next tab)
+                let next = (current_tab_keys.load(Ordering::SeqCst) + 1) % TAB_COUNT;
+                current_tab_keys.store(next, Ordering::SeqCst);
+                println!("[Kururu Display] Volume DOWN -> Switched to Tab {} (->)", next + 1);
+                wake_signal_keys.store(true, Ordering::SeqCst);
+            } else if event.code == KEY_HOMEPAGE {
+                println!("[Kururu Display] Home key pressed -> Wake/Refreshed");
+                wake_signal_keys.store(true, Ordering::SeqCst);
             }
         }
     });
@@ -1230,6 +1486,7 @@ fn main() {
                     let tab = current_tab.load(Ordering::SeqCst);
 
                     fb.clear(BG_COLOR);
+                    draw_background_grid(&mut fb);
                     draw_header(&mut fb, tab);
 
                     match tab {
@@ -1238,7 +1495,7 @@ fn main() {
                         _ => render_tab_clock(&mut fb, info),
                     }
 
-                    draw_footer(&mut fb);
+                    draw_footer(&mut fb, info);
                     let _ = fb.flush();
                 }
             }

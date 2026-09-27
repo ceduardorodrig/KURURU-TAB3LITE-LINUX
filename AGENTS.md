@@ -8,7 +8,7 @@ This repository contains **KURURU-TAB3LITE-LINUX**, the bare-metal headless Linu
 
 When modifying any file in this repository, follow these mandatory governance rules:
 
-**Language Tier:** A (Public OSS) — see [language-policy.md](file:///mnt/NVME_PCI/agentic-ai/governance/language-policy.md). All logs, CLI strings, documentation, and comments MUST be in English.
+**Language Tier:** A (Public OSS) — see [language-policy.md](../../agentic-ai/governance/language-policy.md). All logs, CLI strings, documentation, and comments MUST be in English.
 
 ## 🦀 Standards & Integrity
 
@@ -28,3 +28,5 @@ When modifying any file in this repository, follow these mandatory governance ru
 
    </div>
    ```
+
+5. **DRY PRINCIPLE (`ARCH-DRY-DUPLICATION`)** — Never duplicate substantive logic. Extract shared code into helpers (e.g. the data-driven framebuffer sprite blitter and the shared input-device listener). Run `stenio --dry --path .` and require **zero** duplicated blocks before every commit.
