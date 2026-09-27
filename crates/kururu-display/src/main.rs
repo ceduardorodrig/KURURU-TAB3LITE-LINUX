@@ -1505,7 +1505,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.5 (Retro-HUD UI, sprite engine, live UPS, touch input)...");
+    println!("[Kururu Display Daemon] Starting v1.6 (Retro-HUD UI, live UPS, touch, boot-safe PATH)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -1521,6 +1521,12 @@ fn main() {
     unsafe {
         tzset();
     }
+
+    // Guarantee external-tool resolution regardless of the launching shell's
+    // PATH: the Android boot hook starts us with an Android-only PATH that
+    // lacks Alpine's /bin, /usr/bin and /usr/local/bin, which made dmesg, ip,
+    // wpa_cli and tailscale silently fail on every boot-started instance.
+    std::env::set_var("PATH", "/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin");
 
     let screen_active = Arc::new(AtomicBool::new(true));
     let screen_active_power = screen_active.clone();
