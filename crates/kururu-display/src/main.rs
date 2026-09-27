@@ -1,5 +1,6 @@
 mod font;
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::process::Command;
@@ -44,6 +45,7 @@ pub const TEXT_AMBER: Color = Color::rgb(254, 202, 87);
 pub const TEXT_WHITE: Color = Color::rgb(245, 246, 250);
 pub const TEXT_GRAY: Color = Color::rgb(130, 140, 155);
 pub const TEXT_DIM: Color = Color::rgb(80, 92, 108);
+pub const TEXT_RED: Color = Color::rgb(255, 71, 87);
 
 #[repr(C)]
 struct InputEvent {
@@ -154,22 +156,86 @@ impl Framebuffer {
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct TailscaleJson {
+    #[serde(rename = "MagicDNSSuffix")]
+    magic_dns_suffix: Option<String>,
+    #[serde(rename = "CurrentTailnet")]
+    current_tailnet: Option<CurrentTailnet>,
+    #[serde(rename = "Self")]
+    self_node: Option<SelfNode>,
+    #[serde(rename = "Peer")]
+    peer: Option<HashMap<String, PeerNode>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct CurrentTailnet {
+    #[serde(rename = "MagicDNSSuffix")]
+    magic_dns_suffix: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, Default)]
+struct SelfNode {
+    #[serde(rename = "HostName")]
+    hostname: Option<String>,
+    #[serde(rename = "TailscaleIPs")]
+    tailscale_ips: Option<Vec<String>>,
+}
+
+#[allow(dead_code)]
+#[derive(serde::Deserialize, Default, Clone)]
+struct PeerNode {
+    #[serde(rename = "HostName")]
+    hostname: Option<String>,
+    #[serde(rename = "Online")]
+    online: Option<bool>,
+    #[serde(rename = "Active")]
+    active: Option<bool>,
+    #[serde(rename = "TailscaleIPs")]
+    tailscale_ips: Option<Vec<String>>,
+    #[serde(rename = "CurAddr")]
+    cur_addr: Option<String>,
+}
+
+#[allow(dead_code)]
+struct PeerDisplayInfo {
+    name: String,
+    ip: String,
+    online: bool,
+    active: bool,
+    cur_addr: String,
+}
+
 struct SystemInfo {
     hostname: String,
+    kernel_version: String,
     uptime_str: String,
     load_avg: String,
     ram_used_mb: u64,
     ram_total_mb: u64,
     battery_pct: String,
     battery_status: String,
+    battery_temp_c: String,
+    battery_volts: String,
     lan_ip: String,
     tailscale_ip: String,
+    tailnet_suffix: String,
+    peers_online_count: usize,
+    peers_total_count: usize,
+    peers: Vec<PeerDisplayInfo>,
+    active_link_str: String,
     logs: Vec<String>,
 }
 
 fn gather_system_info() -> SystemInfo {
     let hostname = fs::read_to_string("/proc/sys/kernel/hostname")
         .unwrap_or_else(|_| "kururu".to_string())
+        .trim()
+        .to_string();
+
+    let kernel_version = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_else(|_| "3.4.5".to_string())
         .trim()
         .to_string();
 
@@ -245,9 +311,27 @@ fn gather_system_info() -> SystemInfo {
         .trim()
         .to_string();
 
-    let mut lan_ip = "Connecting...".to_string();
-    let mut tailscale_ip = "Connecting...".to_string();
+    let battery_temp_c = if let Ok(t_raw) = fs::read_to_string("/sys/class/power_supply/battery/temp") {
+        if let Ok(val) = t_raw.trim().parse::<f64>() {
+            format!("{:.1}°C", val / 10.0)
+        } else {
+            "--°C".to_string()
+        }
+    } else {
+        "--°C".to_string()
+    };
 
+    let battery_volts = if let Ok(v_raw) = fs::read_to_string("/sys/class/power_supply/battery/voltage_now") {
+        if let Ok(val) = v_raw.trim().parse::<f64>() {
+            format!("{:.2}V", val / 1_000_000.0)
+        } else {
+            "--V".to_string()
+        }
+    } else {
+        "--V".to_string()
+    };
+
+    let mut lan_ip = "Connecting...".to_string();
     if let Ok(output) = Command::new("ip").args(["-4", "addr", "show"]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut cur_iface = "";
@@ -262,10 +346,85 @@ fn gather_system_info() -> SystemInfo {
                     let ip = ip_cidr.split('/').next().unwrap_or(ip_cidr);
                     if cur_iface.starts_with("mlan") || cur_iface.starts_with("wlan") {
                         lan_ip = ip.to_string();
-                    } else if cur_iface.starts_with("tailscale") {
-                        tailscale_ip = ip.to_string();
                     }
                 }
+            }
+        }
+    }
+
+    // Dynamic Tailscale status query
+    let mut tailscale_ip = "100.127.188.45".to_string();
+    let mut tailnet_suffix = "chimaera-heptatonic.ts.net".to_string();
+    let mut peers = Vec::new();
+    let mut peers_online_count = 0;
+    let mut peers_total_count = 0;
+    let mut active_link_str = "None (Idle)".to_string();
+
+    if let Ok(output) = Command::new("tailscale").args(["status", "--json"]).output() {
+        if let Ok(ts) = serde_json::from_slice::<TailscaleJson>(&output.stdout) {
+            if let Some(suffix) = ts.magic_dns_suffix {
+                if !suffix.is_empty() {
+                    tailnet_suffix = suffix;
+                }
+            } else if let Some(ct) = ts.current_tailnet {
+                if let Some(suffix) = ct.magic_dns_suffix {
+                    if !suffix.is_empty() {
+                        tailnet_suffix = suffix;
+                    }
+                }
+            }
+
+            if let Some(self_node) = ts.self_node {
+                if let Some(ips) = self_node.tailscale_ips {
+                    if let Some(first_ip) = ips.first() {
+                        tailscale_ip = first_ip.clone();
+                    }
+                }
+            }
+
+            if let Some(peer_map) = ts.peer {
+                peers_total_count = peer_map.len();
+                for (_k, v) in peer_map {
+                    let name = v.hostname.unwrap_or_else(|| "unknown".to_string());
+                    let online = v.online.unwrap_or(false);
+                    let active = v.active.unwrap_or(false);
+                    let ip = v.tailscale_ips.and_then(|ips| ips.first().cloned()).unwrap_or_default();
+                    let cur_addr = v.cur_addr.unwrap_or_default();
+
+                    if online {
+                        peers_online_count += 1;
+                    }
+
+                    if active && !name.is_empty() {
+                        active_link_str = if !cur_addr.is_empty() {
+                            format!("{} (direct {})", name, cur_addr)
+                        } else {
+                            format!("{} (active)", name)
+                        };
+                    }
+
+                    peers.push(PeerDisplayInfo {
+                        name,
+                        ip,
+                        online,
+                        active,
+                        cur_addr,
+                    });
+                }
+
+                // Priority sorting:
+                // 1. Core Homelab nodes first (kavure, psicopompo, ybytu, ybyra, kuaray, miracena, sumaenima)
+                // 2. Active nodes
+                // 3. Online nodes
+                // 4. Alphabetical
+                peers.sort_by(|a, b| {
+                    let is_homelab_a = is_core_homelab(&a.name);
+                    let is_homelab_b = is_core_homelab(&b.name);
+                    b.active.cmp(&a.active)
+                        .then_with(|| is_homelab_b.cmp(&is_homelab_a))
+                        .then_with(|| b.online.cmp(&a.online))
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                });
             }
         }
     }
@@ -286,16 +445,35 @@ fn gather_system_info() -> SystemInfo {
 
     SystemInfo {
         hostname,
+        kernel_version,
         uptime_str,
         load_avg,
         ram_used_mb,
         ram_total_mb,
         battery_pct,
         battery_status,
+        battery_temp_c,
+        battery_volts,
         lan_ip,
         tailscale_ip,
+        tailnet_suffix,
+        peers_online_count,
+        peers_total_count,
+        peers,
+        active_link_str,
         logs,
     }
+}
+
+fn is_core_homelab(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("kavure")
+        || lower.contains("psicopompo")
+        || lower.contains("ybytu")
+        || lower.contains("ybyra")
+        || lower.contains("kuaray")
+        || lower.contains("miracena")
+        || lower.contains("sumaenima")
 }
 
 fn set_display_hardware(on: bool) {
@@ -345,6 +523,7 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
     let telemetry_lines = [
         format!("Status:       ONLINE (Bare-Metal Headless)"),
         format!("Hostname:     {}", info.hostname),
+        format!("Kernel:       {} (ARMv7l)", info.kernel_version),
         format!("Tailscale IP: {} [Connected]", info.tailscale_ip),
         format!("LAN IP:       {} (wlan0/mlan0)", info.lan_ip),
         format!("Load Average: {}", info.load_avg),
@@ -354,13 +533,13 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
             info.ram_used_mb, info.ram_total_mb, free_pct
         ),
         format!(
-            "Battery:      {}% ({})",
-            info.battery_pct, info.battery_status
+            "Battery:      {}% ({}, {}, {})",
+            info.battery_pct, info.battery_status, info.battery_volts, info.battery_temp_c
         ),
         format!("SSH Server:   Dropbear (port 22, root pubkey)"),
     ];
 
-    let mut ty = 96;
+    let mut ty = 94;
     for line in &telemetry_lines {
         let (label, val) = if let Some(idx) = line.find(':') {
             (&line[..=idx], &line[idx + 1..])
@@ -369,35 +548,56 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
         };
         fb.draw_text(28, ty, label, TEXT_GRAY, 1);
         fb.draw_text(150, ty, val.trim_start(), TEXT_WHITE, 1);
-        ty += 21;
+        ty += 19;
     }
 
-    // Quick Stats & Homelab Card (Right)
+    // Dynamic Tailnet & Peers Card (Right)
     fb.draw_rect(512, 60, 496, 240, PANEL_BG);
     fb.draw_rect(512, 60, 496, 2, BORDER_COLOR);
-    fb.draw_text(524, 72, "CLUSTER CONNECTIVITY", TEXT_AMBER, 1);
 
-    let cluster_lines = [
-        format!("Tailnet:      mnemocine.ts.net"),
-        format!("DNS:          100.100.100.100 (MagicDNS)"),
-        format!("Peers:        psicopompo, ybytu, ybyra, kuaray"),
-        format!("Kernel:       3.4.5-kururu-headless-armv7l"),
-        format!("Architecture: ARMv7-a (Marvell PXA986 Dual Core)"),
-        format!("Display:      1024x600 60Hz (Panel 88PM822 Backlight)"),
-        format!("Power Key:    /dev/input/event2 (Hardware Wake/Sleep)"),
-        format!("Touch / GUI:  Disabled (Zero JVM / TouchWiz Overhead)"),
-    ];
+    let header_peers = format!(
+        "TAILNET PEERS ({}/{} Online)",
+        info.peers_online_count, info.peers_total_count
+    );
+    fb.draw_text(524, 72, &header_peers, TEXT_AMBER, 1);
 
-    let mut cy = 96;
-    for line in &cluster_lines {
-        let (label, val) = if let Some(idx) = line.find(':') {
-            (&line[..=idx], &line[idx + 1..])
+    fb.draw_text(524, 94, "Tailnet:", TEXT_GRAY, 1);
+    fb.draw_text(630, 94, &info.tailnet_suffix, TEXT_CYAN, 1);
+
+    fb.draw_text(524, 113, "Active Link:", TEXT_GRAY, 1);
+    fb.draw_text(630, 113, &info.active_link_str, TEXT_EMERALD, 1);
+
+    // List top 7 dynamic peers
+    let mut py = 135;
+    for peer in info.peers.iter().take(7) {
+        let (bullet, color) = if peer.active {
+            ("★", TEXT_EMERALD)
+        } else if peer.online {
+            ("●", TEXT_CYAN)
         } else {
-            (line.as_str(), "")
+            ("○", TEXT_DIM)
         };
-        fb.draw_text(524, cy, label, TEXT_GRAY, 1);
-        fb.draw_text(644, cy, val.trim_start(), TEXT_WHITE, 1);
-        cy += 21;
+
+        fb.draw_text(524, py, bullet, color, 1);
+        
+        let display_name = if peer.name.len() > 14 {
+            &peer.name[..14]
+        } else {
+            &peer.name
+        };
+        fb.draw_text(540, py, display_name, if peer.online { TEXT_WHITE } else { TEXT_DIM }, 1);
+        fb.draw_text(670, py, &peer.ip, TEXT_GRAY, 1);
+
+        let status_desc = if peer.active {
+            "direct"
+        } else if peer.online {
+            "online"
+        } else {
+            "offline"
+        };
+        fb.draw_text(810, py, status_desc, if peer.online { color } else { TEXT_DIM }, 1);
+
+        py += 21;
     }
 
     // Live Terminal Console Card (Bottom)
@@ -446,7 +646,7 @@ fn render_dashboard(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.0...");
+    println!("[Kururu Display Daemon] Starting v1.1 (Dynamic Live Telemetry)...");
 
     let screen_active = Arc::new(AtomicBool::new(true));
     let screen_active_clone = screen_active.clone();
