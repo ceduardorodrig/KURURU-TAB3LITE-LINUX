@@ -53,23 +53,23 @@ Millions of **Samsung Galaxy Tab 3 Lite 7.0 (`SM-T110`, codename `goyawifi`)** d
 ```mermaid
 graph TD
     subgraph Boot["Stage 1: Bootloader & Kernel"]
-        A[OEM Bootloader] -->|Loads| B[kururu_headless_boot.img]
-        B --> C[Samsung Marvell Kernel 3.4.5]
-        C --> D[Hardware RFKILL & PMIC Calibration]
+        A["OEM Bootloader"] -->|Loads| B["kururu_headless_boot.img"]
+        B --> C["Samsung Marvell Kernel 3.4.5"]
+        C --> D["Hardware RFKILL & PMIC Calibration"]
     end
 
     subgraph Init["Stage 2: Headless Init Hook"]
-        D -->|Executes| E[/system/etc/install-recovery.sh]
-        E -->|Bypasses| F[Disabled: Zygote, SurfaceFlinger, TouchWiz]
-        E -->|Powers On| G[Marvell WiFi: sd8xxx.ko + mlan.ko]
-        E -->|Syncs| H[NTP Time Sync for Valid SSL]
+        D -->|Executes| E["/system/etc/install-recovery.sh"]
+        E -->|Bypasses| F["Disabled: Zygote, SurfaceFlinger, TouchWiz"]
+        E -->|Powers On| G["Marvell WiFi: sd8xxx.ko + mlan.ko"]
+        E -->|Syncs| H["NTP Time Sync for Valid SSL"]
     end
 
     subgraph Userspace["Stage 3: Pure Alpine Linux v3.20"]
-        E -->|Mounts & Binds| I[/data/alpine Rootfs]
-        I --> J[Dropbear SSH Server :22]
-        I --> K[Tailscale Daemon & WireGuard VPN]
-        I --> L[kururu-display: Rust Power Button Daemon]
+        E -->|Mounts & Binds| I["/data/alpine Rootfs"]
+        I --> J["Dropbear SSH Server :22"]
+        I --> K["Tailscale Daemon & WireGuard VPN"]
+        I --> L["kururu-display: Rust Power Button Daemon"]
     end
 ```
 
