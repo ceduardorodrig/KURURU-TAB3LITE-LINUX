@@ -2,10 +2,6 @@
 
 <div align="center">
 
-> **Yes... This is a Vibe Coded project**
->
-> Governed by 🤖 **StenioSentinel** (our Rust-based AI Governance Sentinel) with **Carlos Eduardo Rodrigues** ([@ceduardorodrig](https://github.com/ceduardorodrig)).
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Alpine Linux](https://img.shields.io/badge/Distro-Alpine%20Linux%20v3.20-blue.svg)](https://alpinelinux.org/)
@@ -167,3 +163,13 @@ An event-driven hardware and graphics daemon written in native Rust (`edition = 
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
+
+---
+
+<div align="center">
+
+> **Yes... This is a Vibe Coded project**
+>
+> Governed by 🤖 **StenioSentinel** (our Rust-based AI Governance Sentinel) with **Carlos Eduardo Rodrigues** ([@ceduardorodrig](https://github.com/ceduardorodrig)).
+
+</div>
