@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BROADCAST_ADDRS: [&str; 2] = [
     "192.168.3.255:9",
@@ -17,12 +17,30 @@ const CONFIG_PATHS: [&str; 2] = [
 
 const LOG_FILE: &str = "/var/log/kururu-wol.log";
 
+/// Returns "[HH:MM:SS]" in Brasília time (UTC-3, fixed — Brazil abolished DST in 2019).
+/// Pure Rust, no libc / TZ database lookup required.
+fn timestamp_str() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // UTC-3 = subtract 3 hours (10800s)
+    let local = secs.saturating_sub(3 * 3600);
+    let h = (local / 3600) % 24;
+    let m = (local / 60) % 60;
+    let s = local % 60;
+    format!("[{:02}:{:02}:{:02}]", h, m, s)
+}
+
 fn log_action(msg: &str) {
-    println!("{}", msg);
+    let ts = timestamp_str();
+    let line = format!("{} {}", ts, msg);
+    println!("{}", line);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(LOG_FILE) {
-        let _ = writeln!(f, "{}", msg);
+        let _ = writeln!(f, "{}", line);
     }
 }
+
 
 fn parse_mac(input: &str) -> Option<[u8; 6]> {
     let cleaned: String = input.chars().filter(|c| c.is_ascii_hexdigit()).collect();

@@ -564,7 +564,7 @@ fn gather_system_info() -> SystemInfo {
             0
         };
         for line in &lines[start..] {
-            wol_logs.push(line.trim_end().to_string());
+            wol_logs.push(format!("{} {}", ts, line.trim_end()));
         }
     }
 
@@ -576,11 +576,7 @@ fn gather_system_info() -> SystemInfo {
         "September", "October", "November", "December",
     ];
 
-    // Force Brazil / America/Sao_Paulo timezone
-    std::env::set_var("TZ", "America/Sao_Paulo");
-    unsafe {
-        tzset();
-    }
+    // TZ is set once at process startup in main() via BRT3 — no re-set needed here.
 
     let (time_str, date_str, day_name, date_full_str) = unsafe {
         let t = libc::time(std::ptr::null_mut());
@@ -689,13 +685,14 @@ fn set_display_hardware(enable: bool) {
 }
 
 fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
+    // Header panel: 48px tall, 2px border at y=48
     fb.draw_rect(0, 0, FB_WIDTH, 48, PANEL_BG);
     fb.draw_rect(0, 48, FB_WIDTH, 2, BORDER_COLOR);
 
-    // Left Node Brand
-    fb.draw_text(16, 14, "KURURU", TEXT_EMERALD, 2);
+    // Brand: "KURURU" at scale-2 (32px tall). Vertically centered: (48-32)/2 = 8
+    fb.draw_text(16, 8, "KURURU", TEXT_EMERALD, 2);
 
-    // 3 Distinct Tabs
+    // 3 Tab buttons — each 150px wide, 8px from top/bottom (height 32px, y=8..40)
     let tabs = [
         "1. KURURU",
         "2. HOMELAB",
@@ -714,59 +711,41 @@ fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
         fb.draw_rect(tx, 8, tab_w, 2, border);
         fb.draw_rect(tx, 38, tab_w, 2, border);
 
+        // Tab text vertically centered: y = 8 + (32-16)/2 = 16
         let pad_x = tx + 14;
         fb.draw_text(pad_x, 16, name, text_color, 1);
 
         tx += tab_w + 12;
     }
 
-    fb.draw_text(
-        660,
-        18,
-        "StenioSentinel • Mnemocine Homelab",
-        TEXT_GRAY,
-        1,
-    );
+    // Right: brand/subtitle — align to same vertical center as tab text (y=16)
+    fb.draw_text(660, 16, "StenioSentinel • Mnemocine Homelab", TEXT_GRAY, 1);
 }
 
 fn draw_footer(fb: &mut Framebuffer) {
+    // Footer panel: y=568, height=32. Text vertically centered: y = 568 + (32-16)/2 = 576.
     fb.draw_rect(0, 568, FB_WIDTH, 32, PANEL_BG);
     fb.draw_rect(0, 568, FB_WIDTH, 1, BORDER_COLOR);
-    fb.draw_text(
-        16,
-        576,
-        "[VOL -] Next Tab (->)",
-        TEXT_CYAN,
-        1,
-    );
-    fb.draw_text(
-        180,
-        576,
-        "[VOL +] Prev Tab (<-)",
-        TEXT_AMBER,
-        1,
-    );
-    fb.draw_text(
-        360,
-        576,
-        "[POWER] Sleep / Wake Display",
-        TEXT_WHITE,
-        1,
-    );
-    fb.draw_text(
-        640,
-        576,
-        "Auto-sleep: 120s timer",
-        TEXT_DIM,
-        1,
-    );
-    fb.draw_text(
-        840,
-        576,
-        "UPS Battery: OK",
-        TEXT_EMERALD,
-        1,
-    );
+
+    // ── LEFT SECTION: Volume navigation ─────────────────────────────────────
+    // "[VOL+] <- Prev" = 14 chars × 8px = 112px → x=14..126
+    fb.draw_text(14, 576, "[VOL+] <- Prev", TEXT_AMBER, 1);
+    // Separator at x=130 (4px gap after end of text)
+    fb.draw_text(130, 576, "|", TEXT_DIM, 1);
+    // "[VOL-] -> Next" = 14 chars × 8px = 112px → x=142..254
+    fb.draw_text(142, 576, "[VOL-] -> Next", TEXT_CYAN, 1);
+
+    // ── CENTER: Power button hint (centered around x=512) ───────────────────
+    // "[POWER] Wake / Sleep" = 20 chars × 8px = 160px → center at 512 = x=432..592
+    fb.draw_text(432, 576, "[POWER] Wake / Sleep", TEXT_WHITE, 1);
+
+    // ── RIGHT SECTION: Status info ───────────────────────────────────────────
+    // "Auto-sleep: 120s" = 16 chars × 8px = 128px → x=640..768
+    fb.draw_text(640, 576, "Auto-sleep: 120s", TEXT_DIM, 1);
+    // Separator at x=776
+    fb.draw_text(776, 576, "|", TEXT_DIM, 1);
+    // "UPS: OK" = 7 chars × 8px = 56px → x=788..844
+    fb.draw_text(788, 576, "UPS: OK", TEXT_EMERALD, 1);
 }
 
 // -------------------------------------------------------------
@@ -1070,8 +1049,10 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 fn main() {
     println!("[Kururu Display Daemon] Starting v1.3 (Inverted Volume Navigation & Modular Dashboards)...");
 
-    // Force Brazil / America/Sao_Paulo timezone across entire process
-    std::env::set_var("TZ", "America/Sao_Paulo");
+    // Force Brazil / Brasília time (UTC-3, fixed — no DST since 2019).
+    // Use POSIX inline string "BRT3" instead of "America/Sao_Paulo" which
+    // requires /usr/share/zoneinfo/ not present on Alpine musl minimal rootfs.
+    std::env::set_var("TZ", "BRT3");
     unsafe {
         tzset();
     }
