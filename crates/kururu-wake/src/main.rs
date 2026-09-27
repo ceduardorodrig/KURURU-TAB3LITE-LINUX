@@ -137,21 +137,42 @@ fn handle_http_client(mut stream: TcpStream) {
         return;
     }
 
+    let is_head = parts[0] == "HEAD";
     let path = parts[1];
 
-    if path == "/" || path == "/health" {
+    if path == "/" || path == "/health" || path == "/health/" {
         let body = r#"{"status":"online","service":"kururu-wol-relay","node":"kururu"}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
+        let response = if is_head {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        };
         let _ = stream.write_all(response.as_bytes());
         return;
     }
 
-    if path.starts_with("/wake/") {
-        let target = &path[6..].trim_end_matches('/');
+    let target_opt = if path.starts_with("/wake/") {
+        Some(path[6..].trim_end_matches('/'))
+    } else if path == "/wake" || path == "/wake/" {
+        Some(
+            env::var("WOL_TARGET_HOST")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "kavure".to_string()),
+        )
+        .map(|s| Box::leak(s.into_boxed_str()) as &str)
+    } else {
+        None
+    };
+
+    if let Some(target) = target_opt {
         let mac = resolve_target_mac(target);
 
         if let Some(mac_bytes) = mac {
@@ -194,7 +215,15 @@ fn handle_http_client(mut stream: TcpStream) {
 }
 
 fn run_daemon(port: u16) {
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let host = env::var("WOL_LISTEN_ADDR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let effective_port = env::var("WOL_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(port);
+    let bind_addr = format!("{}:{}", host, effective_port);
     log_action(&format!(
         "[Kururu WOL Daemon] Starting HTTP listener on {}...",
         bind_addr

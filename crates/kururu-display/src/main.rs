@@ -23,6 +23,7 @@ const EV_KEY: u16 = 1;
 const KEY_POWER: u16 = 116;
 const KEY_VOLUMEUP: u16 = 115;
 const KEY_VOLUMEDOWN: u16 = 114;
+const KEY_HOMEPAGE: u16 = 102;
 
 #[derive(Copy, Clone)]
 struct Color {
@@ -651,9 +652,14 @@ fn set_display_hardware(enable: bool) {
     let val = if enable { "0\n" } else { "4\n" };
     let _ = fs::write(power_path, val);
 
-    let bl_path = "/sys/class/backlight/pwm-backlight/brightness";
-    let bl_val = if enable { "128\n" } else { "0\n" };
-    let _ = fs::write(bl_path, bl_val);
+    let bl_val = if enable { "180\n" } else { "0\n" };
+    let backlight_paths = [
+        "/sys/class/backlight/panel/brightness",
+        "/sys/class/backlight/pwm-backlight/brightness",
+    ];
+    for path in &backlight_paths {
+        let _ = fs::write(path, bl_val);
+    }
 }
 
 fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
@@ -1121,13 +1127,15 @@ fn main() {
 
             // Only respond on key down (value == 1)
             if event.type_ == EV_KEY && event.value == 1 {
-                if !screen_active_keys.load(Ordering::SeqCst) {
-                    // If asleep, pressing volume key wakes display up immediately
-                    println!("[Kururu Display] Volume key pressed -> Waking up display");
+                let was_asleep = !screen_active_keys.load(Ordering::SeqCst);
+                if was_asleep {
+                    println!("[Kururu Display] Key pressed while asleep -> Waking display up");
                     set_display_hardware(true);
                     screen_active_keys.store(true, Ordering::SeqCst);
                     wake_signal_keys.store(true, Ordering::SeqCst);
-                } else if event.code == KEY_VOLUMEUP {
+                }
+
+                if event.code == KEY_VOLUMEUP {
                     // Volume Up: right-to-left (previous tab: 2 -> 1 -> 0 -> 2)
                     let prev = (current_tab_keys.load(Ordering::SeqCst) + 3 - 1) % 3;
                     current_tab_keys.store(prev, Ordering::SeqCst);
@@ -1138,6 +1146,9 @@ fn main() {
                     let next = (current_tab_keys.load(Ordering::SeqCst) + 1) % 3;
                     current_tab_keys.store(next, Ordering::SeqCst);
                     println!("[Kururu Display] Volume DOWN -> Switched to Tab {} (->)", next + 1);
+                    wake_signal_keys.store(true, Ordering::SeqCst);
+                } else if event.code == KEY_HOMEPAGE {
+                    println!("[Kururu Display] Home key pressed -> Wake/Refreshed");
                     wake_signal_keys.store(true, Ordering::SeqCst);
                 }
             }
