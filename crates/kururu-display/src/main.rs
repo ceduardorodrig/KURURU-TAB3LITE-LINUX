@@ -54,8 +54,25 @@ struct Color {
 }
 
 // ── Themes (runtime-selectable palettes) ───────────────────────────────
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color { r, g, b, a: 255 }
+}
+
+/// Linear per-channel blend: `pct`% of `b` over `a` (0..=100).
+const fn mix(a: Color, b: Color, pct: i32) -> Color {
+    Color {
+        r: (a.r as i32 + (b.r as i32 - a.r as i32) * pct / 100) as u8,
+        g: (a.g as i32 + (b.g as i32 - a.g as i32) * pct / 100) as u8,
+        b: (a.b as i32 + (b.b as i32 - a.b as i32) * pct / 100) as u8,
+        a: 255,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Theme {
+    key: &'static str,
+    name: &'static str,
+    light: bool,
     bg: Color,
     panel: Color,
     panel_active: Color,
@@ -70,48 +87,81 @@ struct Theme {
     grid: Color,
 }
 
-impl Theme {
-    /// Original dark retro-HUD palette (emerald / cyan).
-    const GREEN: Theme = Theme {
-        bg: Color { r: 10, g: 14, b: 20, a: 255 },
-        panel: Color { r: 16, g: 22, b: 32, a: 255 },
-        panel_active: Color { r: 24, g: 36, b: 54, a: 255 },
-        border: Color { r: 35, g: 48, b: 68, a: 255 },
-        text: Color { r: 240, g: 244, b: 250, a: 255 },
-        text_muted: Color { r: 140, g: 155, b: 175, a: 255 },
-        text_dim: Color { r: 80, g: 95, b: 115, a: 255 },
-        accent: Color { r: 0, g: 230, b: 118, a: 255 },
-        info: Color { r: 0, g: 210, b: 255, a: 255 },
-        warn: Color { r: 255, g: 180, b: 0, a: 255 },
-        error: Color { r: 255, g: 82, b: 82, a: 255 },
-        grid: Color { r: 22, g: 30, b: 42, a: 255 },
-    };
+/// Derive a monochrome-phosphor theme from a (background, foreground) pair,
+/// mirroring cool-retro-term's bg/fontColor schemes.
+const fn pal(key: &'static str, name: &'static str, bg: Color, fg: Color, light: bool) -> Theme {
+    Theme {
+        key,
+        name,
+        light,
+        bg,
+        panel: mix(bg, fg, 10),
+        panel_active: mix(bg, fg, 22),
+        border: mix(bg, fg, 32),
+        text: fg,
+        text_muted: mix(bg, fg, 68),
+        text_dim: mix(bg, fg, 45),
+        accent: fg,
+        info: fg,
+        warn: rgb(255, 176, 0),
+        error: rgb(255, 77, 77),
+        grid: mix(bg, fg, 12),
+    }
+}
 
-    /// "Amber CRT" — adapted from cool-retro-term's Default Amber (#ff8100 on black).
-    const AMBER: Theme = Theme {
-        bg: Color { r: 5, g: 3, b: 0, a: 255 },
-        panel: Color { r: 16, g: 9, b: 0, a: 255 },
-        panel_active: Color { r: 40, g: 22, b: 2, a: 255 },
-        border: Color { r: 72, g: 40, b: 8, a: 255 },
-        text: Color { r: 255, g: 201, b: 130, a: 255 },
-        text_muted: Color { r: 190, g: 120, b: 45, a: 255 },
-        text_dim: Color { r: 110, g: 66, b: 22, a: 255 },
-        accent: Color { r: 255, g: 129, b: 0, a: 255 },
-        info: Color { r: 255, g: 176, b: 64, a: 255 },
-        warn: Color { r: 255, g: 200, b: 40, a: 255 },
-        error: Color { r: 255, g: 77, b: 46, a: 255 },
-        grid: Color { r: 42, g: 23, b: 4, a: 255 },
+impl Theme {
+    /// Original dark retro-HUD palette (emerald / cyan, multi-colour).
+    const GREEN: Theme = Theme {
+        key: "green",
+        name: "Green",
+        light: false,
+        bg: rgb(10, 14, 20),
+        panel: rgb(16, 22, 32),
+        panel_active: rgb(24, 36, 54),
+        border: rgb(35, 48, 68),
+        text: rgb(240, 244, 250),
+        text_muted: rgb(140, 155, 175),
+        text_dim: rgb(80, 95, 115),
+        accent: rgb(0, 230, 118),
+        info: rgb(0, 210, 255),
+        warn: rgb(255, 180, 0),
+        error: rgb(255, 82, 82),
+        grid: rgb(22, 30, 42),
     };
 }
 
-const THEME_GREEN: usize = 0;
-const THEME_AMBER: usize = 1;
-static THEMES: [Theme; 2] = [Theme::GREEN, Theme::AMBER];
-static THEME_IDX: AtomicUsize = AtomicUsize::new(THEME_GREEN);
+const THEME_COUNT: usize = 15;
+
+/// Green (multi-colour) + the 14 cool-retro-term schemes (monochrome phosphor).
+static THEMES: [Theme; THEME_COUNT] = [
+    Theme::GREEN,
+    pal("amber", "Default Amber", rgb(0, 0, 0), rgb(0xff, 0x81, 0x00), false),
+    pal("monochrome_green", "Monochrome Green", rgb(0, 0, 0), rgb(0x0c, 0xcc, 0x68), false),
+    pal("deep_blue", "Deep Blue", rgb(0, 0, 0), rgb(0x7f, 0xb4, 0xff), false),
+    pal("c64", "Commodore 64", rgb(0x3b, 0x3b, 0x8f), rgb(0xa9, 0xa7, 0xff), false),
+    pal("pet", "Commodore PET", rgb(0, 0, 0), rgb(0xff, 0xff, 0xff), false),
+    pal("apple2", "Apple ][", rgb(0x00, 0x11, 0x00), rgb(0x4d, 0xff, 0x6b), false),
+    pal("atari400", "Atari 400", rgb(0x0f, 0x1f, 0x5a), rgb(0x8e, 0xd6, 0xff), false),
+    pal("ibm_vga", "IBM VGA 8x16", rgb(0, 0, 0), rgb(0xc0, 0xc0, 0xc0), false),
+    pal("ibm3278", "IBM 3278 Reborn", rgb(0, 0, 0), rgb(0x3c, 0xff, 0x7a), false),
+    pal("neon_cyan", "Neon Cyan", rgb(0x00, 0x10, 0x18), rgb(0x52, 0xf7, 0xff), false),
+    pal("ghost", "Ghost Terminal", rgb(0x0b, 0x10, 0x14), rgb(0xa6, 0xb3, 0xc0), false),
+    pal("plasma", "Plasma", rgb(0x07, 0x00, 0x14), rgb(0xff, 0x9b, 0xd6), false),
+    pal("boring", "Boring", rgb(0, 0, 0), rgb(0xff, 0xff, 0xff), false),
+    pal("eink", "E-Ink", rgb(0xf2, 0xf2, 0xec), rgb(0x10, 0x10, 0x10), true),
+];
+
+// Start on Amber (index 1); overridden by config/env.
+static THEME_IDX: AtomicUsize = AtomicUsize::new(1);
 
 /// Current palette (selected via config/env or the Menu).
 fn theme() -> &'static Theme {
-    &THEMES[THEME_IDX.load(Ordering::Relaxed).min(THEMES.len() - 1)]
+    &THEMES[THEME_IDX.load(Ordering::Relaxed).min(THEME_COUNT - 1)]
+}
+
+/// Resolve a theme index by its short key (used by the config file).
+fn theme_index_by_key(key: &str) -> Option<usize> {
+    THEMES.iter().position(|t| t.key.eq_ignore_ascii_case(key))
 }
 
 //── CRT effect flags (toggleable post-process) ────────────────────────
@@ -172,7 +222,10 @@ const MENU_ITEM_H: usize = 40;
 const MENU_ITEM_GAP: usize = 8;
 const MENU_X: usize = 300;
 const MENU_W: usize = FB_WIDTH - 2 * MENU_X; // centered column (424)
-const MENU_Y0: usize = 96;
+const MENU_Y0: usize = 200;
+
+/// Dashboard header title (its width drives the tab start, see tab_rects()).
+const HEADER_TITLE: &str = "DASHBOARD";
 
 /// Rectangle of a menu row — shared by render_menu and the touch hit-test.
 fn menu_item_rect(i: usize) -> (usize, usize, usize, usize) {
@@ -1155,7 +1208,7 @@ fn draw_card(
 fn tab_rects() -> [(usize, usize, usize, usize); TAB_COUNT] {
     let n = TAB_COUNT.min(MAX_TABS);
     let gap = 8usize;
-    let tab_start = MARGIN + 22 + 10 + 6 * 16 + 24; // frog+brand (96px) + gap
+    let tab_start = MARGIN + 24 + HEADER_TITLE.len() * 16 + 24; // accent+title + gap
     let tab_end = FB_WIDTH - MARGIN;
     let available = tab_end.saturating_sub(tab_start);
     let tab_w = available.saturating_sub((n - 1) * gap) / n;
@@ -1223,14 +1276,9 @@ fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
     fb.draw_rect(0, 0, FB_WIDTH, 48, theme().panel);
     fb.draw_rect(0, 48, FB_WIDTH, 2, theme().border);
 
-    // Frog mascot: green body + dark pupils/mouth (header bg shows through).
-    // 14px tall, vertically centred in the 48px header: (48-14)/2 = 17.
-    fb.draw_sprite(MARGIN, 17, SP_FROG_BODY, theme().accent, 1);
-    fb.draw_sprite(MARGIN, 17, SP_FROG_DETAIL, theme().panel, 1);
-
-    // Brand — scale-2 (32px tall), vertically centred: (48-32)/2 = 8
-    let brand_x = MARGIN + 22 + 10; // frog is 22px wide + 10px gap
-    fb.draw_text(brand_x, 8, "KURURU", theme().accent, 2);
+    // Unified top bar: accent marker + screen title (matches Menu/Settings/...).
+    fb.draw_rect(MARGIN, 18, 12, 12, theme().accent);
+    fb.draw_text(MARGIN + 24, 8, HEADER_TITLE, theme().text, 2);
 
     // Dynamic tabs fill the remaining span, right-aligned to the margin.
     // Geometry comes from tab_rects() so touch hit-testing stays in sync.
@@ -1325,13 +1373,28 @@ fn draw_list_item(fb: &mut Framebuffer, x: usize, y: usize, w: usize, label: &st
 
 fn render_menu(fb: &mut Framebuffer, cursor: usize) {
     draw_topbar(fb, "MENU", "[HOME] Enter");
+
+    // ── Brand block: the frog + KURURU live here, prominent ──────────────
+    let frog_scale = 3;
+    let frog_w = 22 * frog_scale;
+    let frog_h = 14 * frog_scale;
+    let frog_x = (FB_WIDTH - frog_w) / 2;
+    let frog_y = 66;
+    fb.draw_sprite(frog_x, frog_y, SP_FROG_BODY, theme().accent, frog_scale);
+    fb.draw_sprite(frog_x, frog_y, SP_FROG_DETAIL, theme().bg, frog_scale);
+
+    let brand = "KURURU";
+    let brand_x = (FB_WIDTH.saturating_sub(brand.len() * 8 * 3)) / 2;
+    fb.draw_text(brand_x, frog_y + frog_h + 6, brand, theme().accent, 3);
+
+    let sub = "Mnemocine Homelab";
+    let sub_x = (FB_WIDTH.saturating_sub(sub.len() * 8)) / 2;
+    fb.draw_text(sub_x, frog_y + frog_h + 6 + 48 + 4, sub, theme().text_dim, 1);
+
     for (i, (label, action)) in MENU_ITEMS.iter().enumerate() {
         let (x, y, w, _) = menu_item_rect(i);
         let text = match action {
-            MenuAction::ToggleTheme => {
-                let on = THEME_IDX.load(Ordering::Relaxed) == THEME_AMBER;
-                format!("{}: {}", label, if on { "AMBER" } else { "GREEN" })
-            }
+            MenuAction::ToggleTheme => format!("{}: {}", label, theme().name),
             MenuAction::ToggleEffects => {
                 let on = EFFECTS.load(Ordering::Relaxed) != 0;
                 format!("{}: {}", label, if on { "ON" } else { "OFF" })
@@ -1374,7 +1437,7 @@ fn apply_menu_action(action: MenuAction) -> Option<usize> {
     match action {
         MenuAction::Screen(target) => Some(target),
         MenuAction::ToggleTheme => {
-            let next = if THEME_IDX.load(Ordering::Relaxed) == THEME_AMBER { THEME_GREEN } else { THEME_AMBER };
+            let next = (THEME_IDX.load(Ordering::Relaxed) + 1) % THEME_COUNT;
             THEME_IDX.store(next, Ordering::Relaxed);
             None
         }
@@ -1425,19 +1488,17 @@ fn set_effect(bit: u32, on: bool) {
 fn load_display_config() {
     let env_theme = std::env::var("KURURU_THEME").ok();
     if let Some(t) = &env_theme {
-        THEME_IDX.store(
-            if t.eq_ignore_ascii_case("amber") { THEME_AMBER } else { THEME_GREEN },
-            Ordering::Relaxed,
-        );
+        if let Some(i) = theme_index_by_key(t) {
+            THEME_IDX.store(i, Ordering::Relaxed);
+        }
     }
     for_each_conf_line("/etc/kururu-display.conf", |k, val| {
         match k.to_ascii_lowercase().as_str() {
             "theme" => {
                 if env_theme.is_none() {
-                    THEME_IDX.store(
-                        if val.eq_ignore_ascii_case("amber") { THEME_AMBER } else { THEME_GREEN },
-                        Ordering::Relaxed,
-                    );
+                    if let Some(i) = theme_index_by_key(val) {
+                        THEME_IDX.store(i, Ordering::Relaxed);
+                    }
                 }
             }
             "scanlines" => set_effect(EFFECT_SCANLINES, parse_flag(val)),
@@ -1448,7 +1509,7 @@ fn load_display_config() {
     });
     println!(
         "[Kururu Display] Theme: {}  Effects: {:?}",
-        if THEME_IDX.load(Ordering::Relaxed) == THEME_AMBER { "AMBER" } else { "GREEN" },
+        theme().name,
         EFFECTS.load(Ordering::Relaxed)
     );
 }
@@ -1477,7 +1538,7 @@ fn vignette_mask() -> &'static [u8] {
 /// a single pass. Runs once per rendered frame.
 fn apply_crt_effects(fb: &mut Framebuffer) {
     let effects = EFFECTS.load(Ordering::Relaxed);
-    if effects == 0 {
+    if effects == 0 || theme().light {
         return;
     }
     let scan = effects & EFFECT_SCANLINES != 0;
@@ -1813,7 +1874,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.9 (Amber CRT themes + effects, UI shell)...");
+    println!("[Kururu Display Daemon] Starting v2.0 (15 themes, unified UI shell, Amber CRT)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
