@@ -13,8 +13,10 @@ chmod 666 "$LOGFILE" 2>/dev/null
 
 echo "=== [Kururu] Native Headless Boot Hook Triggered ==="
 
-# Set valid timestamp immediately to prevent SSL certificate validation failures
-date -s "2026-09-26 22:30:00"
+# Provisional timestamp to avoid TLS "not yet valid" errors before the network
+# is up. This tablet's RTC is dead (reports 2014); NTP corrects the clock before
+# the logging daemons start (bounded pre-sync below).
+date -s "2026-01-01 00:00:00"
 
 # Hardware display management is delegated to kururu-display daemon
 
@@ -52,7 +54,7 @@ mkdir -p /data/alpine/dev/net
 mkdir -p /data/alpine/proc
 mkdir -p /data/alpine/sys
 mkdir -p /data/alpine/var/lib/tailscale
-mkdir -p /data/alpine/var/run/wpa_supplicant
+mkdir -p /data/alpine/run/wpa_supplicant
 mkdir -p /data/alpine/etc/firmware
 
 if [ -e /dev/tun ]; then
@@ -116,16 +118,34 @@ echo "[Kururu] Starting Dropbear SSH Server on port 22..."
 killall dropbear 2>/dev/null
 chroot /data/alpine /usr/sbin/dropbear -p 22 -R
 
-# Background service: NTP fine sync and Tailscale connection
+# ── Bounded clock sync BEFORE starting the logging daemons ────────────
+# The RTC on this tablet is dead (reports 2014); the provisional date above is
+# only a placeholder. Sync via NTP so the display/wake logs carry the correct
+# time from their first line. Bounded so a slow/absent network cannot stall boot.
+sync_clock() {
+    timeout 5 /system/xbin/busybox ntpd -q -n -p 200.160.7.186 2>/dev/null \
+        || timeout 5 /system/xbin/busybox rdate -s 216.239.35.0 2>/dev/null || true
+}
+
+i=0
+while [ "$i" -lt 8 ]; do
+    if ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 1 192.168.3.1 >/dev/null 2>&1; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+echo "[Kururu NTP] Syncing clock before daemons..." >> "$LOGFILE"
+sync_clock
+echo "[Kururu NTP] Clock now: $(date)" >> "$LOGFILE"
+
+# Background service: Tailscale connection (clock already synced above)
 (
-    for i in $(seq 1 30); do
-        if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 192.168.3.1 >/dev/null 2>&1; then
-            echo "[Kururu NTP] Network alive, fine-syncing NTP..." >> "$LOGFILE"
-            /system/xbin/busybox ntpd -q -n -p 200.160.7.186 2>/dev/null || /system/xbin/busybox rdate -s 216.239.35.0 2>/dev/null
-            echo "[Kururu NTP] Clock fine-tuned: $(date)" >> "$LOGFILE"
-            break
-        fi
-        sleep 1
+    # Self-heal if the pre-boot sync failed because the network was still down.
+    for _ in $(seq 1 30); do
+        [ "$(date +%Y)" -ge 2026 ] && break
+        ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1 && sync_clock
+        sleep 2
     done
 
     echo "[Kururu] Starting Tailscaled daemon..." >> "$LOGFILE"
