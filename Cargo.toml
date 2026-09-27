@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/kururu-su",
+    "crates/kururu-display",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

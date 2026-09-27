@@ -1,0 +1,16 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# StênioSentinel — Custom Rules
+# Language policy: /mnt/NVME_PCI/agentic-ai/governance/language-policy.md
+# Language Tier: A (Public OSS) — Log strings and CLI output must be in English.
+# ══════════════════════════════════════════════════════════════════════════════
+
+[[custom_rules]]
+id = "GOV-LOG-EN"
+tag = "gov"
+severity = "warning"
+name = "Logs and CLI Strings in English"
+description = "Log strings (println!, eprintln!, error!, warn!, info!, debug!) and CLI usage text contain Portuguese. Diagnostic output must be readable by anyone who clones this repository."
+pattern = "(println!|eprintln!|error!|warn!|info!|debug!|usage).*\\b(Falha|falha|Erro|Uso|Opç|Nenhum|Iniciando|iniciando|iniciado|Recebido|Recebeu|Encerrando|Encerrou|ajustado|restaurado|aguardando|aguardar|finalizado|Detectou|detectou|Reaplicando|Processo filho|ao iniciar|ao executar|ao aguardar|ao salvar|ao remover|Não |não foi|não encontrad|Usuário|usuário|Configuração|configuração|arquivo|Arquivo|salvar|Salvar|remover|Remover|criar|Criar|criado|Limpando|Diretório|diretório|Compilando|compilando|Gerando|Criando|Escrevendo|compilado|Desconhecido|desconhecido|requer|instruç|Exibe|padrão)\\b"
+extensions = ["rs", "sh", "py", "ts"]
+must_match = false
+suggestion = "Translate the log string to English. Tier A requires diagnostic output in English so any contributor can debug it."

@@ -1,0 +1,23 @@
+# Build artifacts
+target/
+build/
+*.img
+*.tar
+*.tar.gz
+*.tgz
+*.apk
+*.cpio
+*.cpio.gz
+
+# Device backups and private keys
+backups/
+*.key
+*.pem
+id_*
+known_hosts*
+
+# OS / Editor caches
+.DS_Store
+.vscode/
+.idea/
+*.swp
