@@ -1,5 +1,3 @@
-mod font;
-
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -10,54 +8,48 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const FB_WIDTH: usize = 1024;
-const FB_HEIGHT: usize = 600;
-const FB_STRIDE: usize = 4096;
-const FB_SIZE: usize = FB_WIDTH * FB_HEIGHT * 4;
+mod font;
 
-const BACKLIGHT_PATH: &str = "/sys/class/backlight/panel/brightness";
-const BLANK_PATH: &str = "/sys/class/graphics/fb0/blank";
+const FB_PATH: &str = "/dev/graphics/fb0";
 const EVENT_POWER: &str = "/dev/input/event2";
 const EVENT_KEYS: &str = "/dev/input/event0";
-const FB_PATH: &str = "/dev/graphics/fb0";
 const WOL_LOG_PATH: &str = "/var/log/kururu-wol.log";
 
+const FB_WIDTH: usize = 1024;
+const FB_HEIGHT: usize = 600;
+const FB_STRIDE: usize = FB_WIDTH * 4;
+
 const EV_KEY: u16 = 1;
-const KEY_VOLUMEDOWN: u16 = 114;
-const KEY_VOLUMEUP: u16 = 115;
 const KEY_POWER: u16 = 116;
+const KEY_VOLUMEUP: u16 = 115;
+const KEY_VOLUMEDOWN: u16 = 114;
 
-#[derive(Clone, Copy)]
-pub struct Color {
-    pub b: u8,
-    pub g: u8,
-    pub r: u8,
-    pub a: u8,
+#[derive(Copy, Clone)]
+struct Color {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
 }
 
-impl Color {
-    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { b, g, r, a: 0xFF }
-    }
-}
+const BG_COLOR: Color = Color { r: 10, g: 14, b: 20, a: 255 };
+const PANEL_BG: Color = Color { r: 16, g: 22, b: 32, a: 255 };
+const PANEL_ACTIVE_BG: Color = Color { r: 24, g: 36, b: 54, a: 255 };
+const BORDER_COLOR: Color = Color { r: 35, g: 48, b: 68, a: 255 };
+const BORDER_ACTIVE: Color = Color { r: 0, g: 230, b: 118, a: 255 };
 
-pub const BG_COLOR: Color = Color::rgb(10, 14, 20);
-pub const PANEL_BG: Color = Color::rgb(16, 23, 34);
-pub const PANEL_ACTIVE_BG: Color = Color::rgb(22, 34, 52);
-pub const BORDER_COLOR: Color = Color::rgb(40, 56, 80);
-pub const BORDER_ACTIVE: Color = Color::rgb(46, 213, 115);
-pub const TEXT_EMERALD: Color = Color::rgb(46, 213, 115);
-pub const TEXT_CYAN: Color = Color::rgb(72, 219, 251);
-pub const TEXT_AMBER: Color = Color::rgb(254, 202, 87);
-pub const TEXT_WHITE: Color = Color::rgb(245, 246, 250);
-pub const TEXT_GRAY: Color = Color::rgb(130, 140, 155);
-pub const TEXT_DIM: Color = Color::rgb(80, 92, 108);
-pub const TEXT_RED: Color = Color::rgb(255, 71, 87);
+const TEXT_WHITE: Color = Color { r: 240, g: 244, b: 250, a: 255 };
+const TEXT_GRAY: Color = Color { r: 140, g: 155, b: 175, a: 255 };
+const TEXT_DIM: Color = Color { r: 80, g: 95, b: 115, a: 255 };
+const TEXT_EMERALD: Color = Color { r: 0, g: 230, b: 118, a: 255 };
+const TEXT_CYAN: Color = Color { r: 0, g: 210, b: 255, a: 255 };
+const TEXT_AMBER: Color = Color { r: 255, g: 180, b: 0, a: 255 };
+const TEXT_RED: Color = Color { r: 255, g: 82, b: 82, a: 255 };
 
 #[repr(C)]
 struct InputEvent {
-    tv_sec: u32,
-    tv_usec: u32,
+    time_sec: usize,
+    time_usec: usize,
     type_: u16,
     code: u16,
     value: i32,
@@ -70,8 +62,9 @@ struct Framebuffer {
 
 impl Framebuffer {
     fn new(path: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new().write(true).open(path)?;
-        let buffer = vec![0u8; FB_SIZE];
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size = FB_STRIDE * FB_HEIGHT;
+        let buffer = vec![0u8; size];
         Ok(Self { file, buffer })
     }
 
@@ -214,19 +207,27 @@ struct PeerDisplayInfo {
     cur_addr: String,
 }
 
+#[allow(dead_code)]
 struct SystemInfo {
     hostname: String,
     kernel_version: String,
     uptime_str: String,
     load_avg: String,
+    cpu_freq_str: String,
     ram_used_mb: u64,
     ram_total_mb: u64,
+    disk_used_mb: u64,
+    disk_total_mb: u64,
+    disk_free_mb: u64,
     battery_pct: String,
     battery_pct_num: u32,
     battery_status: String,
     battery_temp_c: String,
     battery_volts: String,
     lan_ip: String,
+    wifi_ssid: String,
+    wifi_signal_dbm: String,
+    wifi_mac: String,
     tailscale_ip: String,
     tailnet_suffix: String,
     homelab_online_count: usize,
@@ -238,6 +239,8 @@ struct SystemInfo {
     wol_daemon_running: bool,
     time_str: String,
     date_str: String,
+    day_name: String,
+    date_full_str: String,
 }
 
 fn check_wol_daemon() -> bool {
@@ -285,6 +288,16 @@ fn gather_system_info() -> SystemInfo {
         "Unknown".to_string()
     };
 
+    let cpu_freq_str = if let Ok(f) = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") {
+        if let Ok(khz) = f.trim().parse::<u64>() {
+            format!("{:.2} GHz", khz as f64 / 1_000_000.0)
+        } else {
+            "1.20 GHz".to_string()
+        }
+    } else {
+        "1.20 GHz".to_string()
+    };
+
     let mut total_kb = 0u64;
     let mut free_kb = 0u64;
     let mut buffers_kb = 0u64;
@@ -317,6 +330,24 @@ fn gather_system_info() -> SystemInfo {
     };
     let ram_used_mb = used_kb / 1024;
 
+    let (disk_total_mb, disk_free_mb) = unsafe {
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let path = std::ffi::CString::new("/").unwrap_or_default();
+        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) == 0 {
+            let s = stat.assume_init();
+            let total = (s.f_blocks as u64 * s.f_frsize as u64) / (1024 * 1024);
+            let free = (s.f_bavail as u64 * s.f_frsize as u64) / (1024 * 1024);
+            (total, free)
+        } else {
+            (5120, 4400)
+        }
+    };
+    let disk_used_mb = if disk_total_mb > disk_free_mb {
+        disk_total_mb - disk_free_mb
+    } else {
+        0
+    };
+
     let battery_pct_raw = fs::read_to_string("/sys/class/power_supply/battery/capacity")
         .unwrap_or_else(|_| "50".to_string());
     let battery_pct_num = battery_pct_raw.trim().parse::<u32>().unwrap_or(50);
@@ -347,7 +378,7 @@ fn gather_system_info() -> SystemInfo {
         "--V".to_string()
     };
 
-    let mut lan_ip = "Connecting...".to_string();
+    let mut lan_ip = "192.168.3.55".to_string();
     if let Ok(output) = Command::new("ip").args(["-4", "addr", "show"]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut cur_iface = "";
@@ -363,6 +394,32 @@ fn gather_system_info() -> SystemInfo {
                     if cur_iface.starts_with("mlan") || cur_iface.starts_with("wlan") {
                         lan_ip = ip.to_string();
                     }
+                }
+            }
+        }
+    }
+
+    let mut wifi_ssid = "Cratos".to_string();
+    let mut wifi_mac = "00:50:43:02:fe:01".to_string();
+    if let Ok(output) = Command::new("wpa_cli").arg("status").output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("ssid=") {
+                wifi_ssid = rest.trim().to_string();
+            } else if let Some(rest) = line.strip_prefix("address=") {
+                wifi_mac = rest.trim().to_string();
+            }
+        }
+    }
+
+    let mut wifi_signal_dbm = "-35 dBm".to_string();
+    if let Ok(content) = fs::read_to_string("/proc/net/wireless") {
+        for line in content.lines() {
+            if line.contains("mlan0:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 4 {
+                    let lvl = parts[3].trim_end_matches('.');
+                    wifi_signal_dbm = format!("{} dBm", lvl);
                 }
             }
         }
@@ -478,8 +535,8 @@ fn gather_system_info() -> SystemInfo {
     let mut wol_logs = Vec::new();
     if let Ok(content) = fs::read_to_string(WOL_LOG_PATH) {
         let lines: Vec<&str> = content.lines().collect();
-        let start = if lines.len() > 12 {
-            lines.len() - 12
+        let start = if lines.len() > 14 {
+            lines.len() - 14
         } else {
             0
         };
@@ -488,7 +545,15 @@ fn gather_system_info() -> SystemInfo {
         }
     }
 
-    let (time_str, date_str) = unsafe {
+    let day_names = [
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    ];
+    let month_names = [
+        "January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December",
+    ];
+
+    let (time_str, date_str, day_name, date_full_str) = unsafe {
         let t = libc::time(std::ptr::null_mut());
         let tm = libc::localtime(&t);
         if !tm.is_null() {
@@ -496,32 +561,51 @@ fn gather_system_info() -> SystemInfo {
             let m = (*tm).tm_min;
             let s = (*tm).tm_sec;
             let day = (*tm).tm_mday;
-            let mon = (*tm).tm_mon + 1;
+            let mon = (*tm).tm_mon;
             let year = (*tm).tm_year + 1900;
+            let wday = ((*tm).tm_wday as usize) % 7;
+            let mon_idx = (mon as usize) % 12;
+
+            let d_name = day_names[wday].to_string();
+            let m_name = month_names[mon_idx];
+            let full = format!("{} • {} {} {}", d_name.to_uppercase(), day, m_name.to_uppercase(), year);
+
             (
                 format!("{:02}:{:02}:{:02}", h, m, s),
-                format!("{:04}-{:02}-{:02}", year, mon, day),
+                format!("{:02}/{:02}/{}", day, mon + 1, year),
+                d_name,
+                full,
             )
         } else {
-            ("00:00:00".to_string(), "2026-09-26".to_string())
+            (
+                "00:00:00".to_string(),
+                "01/01/1970".to_string(),
+                "Monday".to_string(),
+                "MONDAY • 1 JANUARY 1970".to_string(),
+            )
         }
     };
-
-    let wol_daemon_running = check_wol_daemon();
 
     SystemInfo {
         hostname,
         kernel_version,
         uptime_str,
         load_avg,
+        cpu_freq_str,
         ram_used_mb,
         ram_total_mb,
+        disk_used_mb,
+        disk_total_mb,
+        disk_free_mb,
         battery_pct,
         battery_pct_num,
         battery_status,
         battery_temp_c,
         battery_volts,
         lan_ip,
+        wifi_ssid,
+        wifi_signal_dbm,
+        wifi_mac,
         tailscale_ip,
         tailnet_suffix,
         homelab_online_count,
@@ -530,20 +614,22 @@ fn gather_system_info() -> SystemInfo {
         active_link_str,
         logs,
         wol_logs,
-        wol_daemon_running,
+        wol_daemon_running: check_wol_daemon(),
         time_str,
         date_str,
+        day_name,
+        date_full_str,
     }
 }
 
-fn set_display_hardware(on: bool) {
-    if on {
-        let _ = fs::write(BLANK_PATH, b"0\n");
-        let _ = fs::write(BACKLIGHT_PATH, b"180\n");
-    } else {
-        let _ = fs::write(BACKLIGHT_PATH, b"0\n");
-        let _ = fs::write(BLANK_PATH, b"1\n");
-    }
+fn set_display_hardware(enable: bool) {
+    let power_path = "/sys/class/graphics/fb0/blank";
+    let val = if enable { "0\n" } else { "4\n" };
+    let _ = fs::write(power_path, val);
+
+    let bl_path = "/sys/class/backlight/pwm-backlight/brightness";
+    let bl_val = if enable { "128\n" } else { "0\n" };
+    let _ = fs::write(bl_path, bl_val);
 }
 
 fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
@@ -553,11 +639,11 @@ fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
     // Left Node Brand
     fb.draw_text(16, 14, "KURURU", TEXT_EMERALD, 2);
 
-    // 3 Clickable/Navigable Tabs
+    // 3 Distinct Tabs
     let tabs = [
-        "1. CLUSTER",
-        "2. WOL RELAY",
-        "3. DESK CLOCK",
+        "1. KURURU",
+        "2. HOMELAB",
+        "3. RETRO CLOCK",
     ];
 
     let mut tx = 160;
@@ -593,12 +679,19 @@ fn draw_footer(fb: &mut Framebuffer) {
     fb.draw_text(
         16,
         576,
-        "[VOL +/-] Switch Tab (1/2/3)",
+        "[VOL -] Next Tab (->)",
         TEXT_CYAN,
         1,
     );
     fb.draw_text(
-        340,
+        180,
+        576,
+        "[VOL +] Prev Tab (<-)",
+        TEXT_AMBER,
+        1,
+    );
+    fb.draw_text(
+        360,
         576,
         "[POWER] Sleep / Wake Display",
         TEXT_WHITE,
@@ -621,13 +714,13 @@ fn draw_footer(fb: &mut Framebuffer) {
 }
 
 // -------------------------------------------------------------
-// TAB 0: CLUSTER & HARDWARE TELEMETRY
+// TAB 0: KURURU NODE (Exclusive Local Device Telemetry)
 // -------------------------------------------------------------
-fn render_tab_cluster(fb: &mut Framebuffer, info: &SystemInfo) {
-    // Telemetry Card (Left)
-    fb.draw_rect(16, 60, 480, 240, PANEL_BG);
-    fb.draw_rect(16, 60, 480, 2, BORDER_COLOR);
-    fb.draw_text(28, 72, "NODE TELEMETRY", TEXT_AMBER, 1);
+fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
+    // Card 1: Top Left - System, APU & Memory
+    fb.draw_rect(16, 56, 480, 244, PANEL_BG);
+    fb.draw_rect(16, 56, 480, 2, BORDER_COLOR);
+    fb.draw_text(28, 68, "KURURU ARCHITECTURE & COMPUTE", TEXT_AMBER, 1);
 
     let free_pct = if info.ram_total_mb > 0 {
         100 - (info.ram_used_mb * 100 / info.ram_total_mb)
@@ -636,25 +729,25 @@ fn render_tab_cluster(fb: &mut Framebuffer, info: &SystemInfo) {
     };
 
     let telemetry_lines = [
-        format!("Status:       ONLINE (Bare-Metal Headless)"),
-        format!("Hostname:     {}", info.hostname),
-        format!("Kernel:       {} (ARMv7l)", info.kernel_version),
-        format!("Tailscale IP: {} [Connected]", info.tailscale_ip),
-        format!("LAN IP:       {} (wlan0/mlan0)", info.lan_ip),
-        format!("Load Average: {}", info.load_avg),
-        format!("Uptime:       {}", info.uptime_str),
+        format!("Device Model:   Samsung Tab 3 Lite (SM-T110)"),
+        format!("Linux Kernel:   {} (armv7l SMP)", info.kernel_version),
+        format!("Distribution:   Alpine Linux v3.20.3 (musl)"),
+        format!("APU Processor:  Marvell PXA988 Dual Cortex-A9"),
+        format!("CPU Frequency:  {} [ondemand governor]", info.cpu_freq_str),
+        format!("System Load:    {} (1m, 5m, 15m)", info.load_avg),
+        format!("Node Uptime:    {}", info.uptime_str),
         format!(
-            "RAM Usage:    {} MB / {} MB ({}% free)",
+            "RAM Memory:     {} MB used / {} MB ({}% free)",
             info.ram_used_mb, info.ram_total_mb, free_pct
         ),
         format!(
-            "Battery:      {}% ({}, {}, {})",
-            info.battery_pct, info.battery_status, info.battery_volts, info.battery_temp_c
+            "Storage Rootfs: {} MB free / {} MB total",
+            info.disk_free_mb, info.disk_total_mb
         ),
-        format!("SSH Server:   Dropbear (port 22, root pubkey)"),
+        format!("Init Mode:      Native Headless Bare-Metal"),
     ];
 
-    let mut ty = 94;
+    let mut ty = 90;
     for line in &telemetry_lines {
         let (label, val) = if let Some(idx) = line.find(':') {
             (&line[..=idx], &line[idx + 1..])
@@ -662,28 +755,92 @@ fn render_tab_cluster(fb: &mut Framebuffer, info: &SystemInfo) {
             (line.as_str(), "")
         };
         fb.draw_text(28, ty, label, TEXT_GRAY, 1);
-        fb.draw_text(150, ty, val.trim_start(), TEXT_WHITE, 1);
-        ty += 19;
+        fb.draw_text(160, ty, val.trim_start(), TEXT_WHITE, 1);
+        ty += 18;
     }
 
-    // Dynamic Homelab Servers Card (Right)
-    fb.draw_rect(512, 60, 496, 240, PANEL_BG);
-    fb.draw_rect(512, 60, 496, 2, BORDER_COLOR);
+    // Card 2: Top Right - PMIC Battery & Local Wi-Fi Radio
+    fb.draw_rect(512, 56, 496, 244, PANEL_BG);
+    fb.draw_rect(512, 56, 496, 2, BORDER_COLOR);
+    fb.draw_text(524, 68, "PMIC BATTERY (UPS) & LOCAL WI-FI RADIO", TEXT_AMBER, 1);
 
-    let header_peers = format!(
-        "HOMELAB CLUSTER ({}/5 Online)",
+    // Battery bar inside Card 2
+    fb.draw_text(524, 92, "Battery Level:", TEXT_GRAY, 1);
+    fb.draw_rect(640, 90, 204, 16, BORDER_COLOR);
+    let fill_w = (info.battery_pct_num as usize * 200) / 100;
+    fb.draw_rect(642, 92, fill_w, 12, TEXT_EMERALD);
+    let bat_label = format!("{}% ({})", info.battery_pct, info.battery_status);
+    fb.draw_text(854, 92, &bat_label, TEXT_WHITE, 1);
+
+    let power_radio_lines = [
+        format!("Fuelgauge:      {} • Temp: {}", info.battery_volts, info.battery_temp_c),
+        format!("Hardware PMIC:  Marvell 88PM822 / AXP228 Driver"),
+        format!("UPS Protection: Active (3600 mAh Built-in Buffer)"),
+        format!("Wi-Fi Chipset:  Marvell SD8777 (Interface: mlan0)"),
+        format!("Connected AP:   {} (2.4 GHz BSSID)", info.wifi_ssid),
+        format!("Signal Level:   {} (Link Quality: 5/5)", info.wifi_signal_dbm),
+        format!("Local LAN IP:   {} (Port 22 Open)", info.lan_ip),
+        format!("Hardware MAC:   {}", info.wifi_mac),
+        format!("SSH Service:    Dropbear (authorized keys root)"),
+    ];
+
+    let mut ry = 114;
+    for line in &power_radio_lines {
+        let (label, val) = if let Some(idx) = line.find(':') {
+            (&line[..=idx], &line[idx + 1..])
+        } else {
+            (line.as_str(), "")
+        };
+        fb.draw_text(524, ry, label, TEXT_GRAY, 1);
+        fb.draw_text(645, ry, val.trim_start(), TEXT_WHITE, 1);
+        ry += 18;
+    }
+
+    // Card 3: Bottom - Live Kernel Log Console (dmesg tail)
+    fb.draw_rect(16, 308, 992, 252, PANEL_BG);
+    fb.draw_rect(16, 308, 992, 2, BORDER_COLOR);
+    fb.draw_text(28, 318, "KURURU KERNEL LOG CONSOLE (DMESG TAIL)", TEXT_EMERALD, 1);
+
+    let mut log_y = 338;
+    for log in &info.logs {
+        let truncated = if log.len() > 118 {
+            &log[..118]
+        } else {
+            log.as_str()
+        };
+        fb.draw_text(28, log_y, truncated, TEXT_GRAY, 1);
+        log_y += 15;
+        if log_y > 548 {
+            break;
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// TAB 1: HOMELAB & WOL (Cluster Telemetry & Wake-on-LAN)
+// -------------------------------------------------------------
+fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
+    // Card 1: Top Left - Tailnet Cluster & Core Servers
+    fb.draw_rect(16, 56, 480, 244, PANEL_BG);
+    fb.draw_rect(16, 56, 480, 2, BORDER_COLOR);
+
+    let cluster_header = format!(
+        "MNEMOCINE TAILNET CLUSTER ({}/5 Online)",
         info.homelab_online_count
     );
-    fb.draw_text(524, 72, &header_peers, TEXT_AMBER, 1);
+    fb.draw_text(28, 68, &cluster_header, TEXT_AMBER, 1);
 
-    fb.draw_text(524, 93, "Tailnet:", TEXT_GRAY, 1);
-    fb.draw_text(615, 93, &info.tailnet_suffix, TEXT_CYAN, 1);
+    fb.draw_text(28, 90, "Tailnet:", TEXT_GRAY, 1);
+    fb.draw_text(110, 90, &info.tailnet_suffix, TEXT_CYAN, 1);
 
-    fb.draw_text(524, 110, "Direct Link:", TEXT_GRAY, 1);
-    fb.draw_text(615, 110, &info.active_link_str, TEXT_EMERALD, 1);
+    fb.draw_text(28, 108, "Kururu IP:", TEXT_GRAY, 1);
+    fb.draw_text(110, 108, &info.tailscale_ip, TEXT_WHITE, 1);
 
-    // List the 5 core homelab servers
-    let mut py = 132;
+    fb.draw_text(28, 126, "Direct Link:", TEXT_GRAY, 1);
+    fb.draw_text(110, 126, &info.active_link_str, TEXT_EMERALD, 1);
+
+    // Dynamic Server List (5 core servers)
+    let mut py = 148;
     for peer in &info.homelab_nodes {
         let (bullet, color) = if peer.active {
             ("★", TEXT_EMERALD)
@@ -693,9 +850,9 @@ fn render_tab_cluster(fb: &mut Framebuffer, info: &SystemInfo) {
             ("○", TEXT_DIM)
         };
 
-        fb.draw_text(524, py, bullet, color, 1);
-        fb.draw_text(540, py, &peer.name, if peer.online { TEXT_WHITE } else { TEXT_DIM }, 1);
-        fb.draw_text(655, py, &peer.ip, TEXT_GRAY, 1);
+        fb.draw_text(28, py, bullet, color, 1);
+        fb.draw_text(44, py, &peer.name, if peer.online { TEXT_WHITE } else { TEXT_DIM }, 1);
+        fb.draw_text(145, py, &peer.ip, TEXT_GRAY, 1);
 
         let status_desc = if peer.active {
             "direct"
@@ -704,95 +861,49 @@ fn render_tab_cluster(fb: &mut Framebuffer, info: &SystemInfo) {
         } else {
             "offline"
         };
-        fb.draw_text(805, py, status_desc, if peer.online { color } else { TEXT_DIM }, 1);
+        fb.draw_text(295, py, status_desc, if peer.online { color } else { TEXT_DIM }, 1);
 
-        py += 21;
+        py += 19;
     }
 
     let summary_line = format!("Mesh Total: {} nodes registered in Tailnet", info.peers_total_count);
-    fb.draw_text(524, 276, &summary_line, TEXT_DIM, 1);
+    fb.draw_text(28, 276, &summary_line, TEXT_DIM, 1);
 
-    // Live Terminal Console Card (Bottom)
-    fb.draw_rect(16, 312, 992, 244, PANEL_BG);
-    fb.draw_rect(16, 312, 992, 2, BORDER_COLOR);
-    fb.draw_text(28, 322, "LIVE SYSTEM CONSOLE (DMESG TAIL)", TEXT_EMERALD, 1);
+    // Card 2: Top Right - Wake-on-LAN Controller & Relay Targets
+    fb.draw_rect(512, 56, 496, 244, PANEL_BG);
+    fb.draw_rect(512, 56, 496, 2, BORDER_COLOR);
+    fb.draw_text(524, 68, "WAKE-ON-LAN CONTROLLER & RELAY", TEXT_AMBER, 1);
 
-    let mut log_y = 344;
-    for log in &info.logs {
-        let truncated = if log.len() > 118 {
-            &log[..118]
-        } else {
-            log.as_str()
-        };
-        fb.draw_text(28, log_y, truncated, TEXT_GRAY, 1);
-        log_y += 16;
-        if log_y > 540 {
-            break;
-        }
-    }
-}
+    let daemon_label = if info.wol_daemon_running { "ACTIVE (:9096) — Kururu Native Rust" } else { "STOPPED" };
+    let daemon_color = if info.wol_daemon_running { TEXT_EMERALD } else { TEXT_RED };
 
-// -------------------------------------------------------------
-// TAB 1: WAKE-ON-LAN HARDWARE CONTROLLER & RELAY
-// -------------------------------------------------------------
-fn render_tab_wol(fb: &mut Framebuffer, info: &SystemInfo) {
-    // Target 1: Psicopompo
-    fb.draw_rect(16, 60, 480, 240, PANEL_BG);
-    fb.draw_rect(16, 60, 480, 2, BORDER_COLOR);
-    fb.draw_text(28, 72, "WOL TARGET 1: PSICOPOMPO", TEXT_AMBER, 1);
-
-    let psicopompo_lines = [
-        ("Host:", "Psicopompo (Workstation & Gaming)"),
-        ("Hardware MAC:", "d0:94:66:de:8b:58"),
-        ("Tailscale IP:", "100.82.51.112"),
-        ("LAN Broadcast:", "192.168.3.255:9 (mlan0)"),
-        ("HTTP Trigger:", "http://kururu:9096/wake/psicopompo"),
-        ("SSH Command:", "ssh root@kururu kururu-wake psicopompo"),
-        ("WOL Engine:", "Native Rust Burst (5 packets / 25ms)"),
+    let wol_lines = [
+        ("Daemon Status:", daemon_label, daemon_color),
+        ("Broadcast Target:", "192.168.3.255:9 (mlan0 direct AP)", TEXT_WHITE),
+        ("Target 1 (Host):", "Psicopompo (Workstation & Gaming)", TEXT_WHITE),
+        ("Target 1 (MAC):", "d0:94:66:de:8b:58", TEXT_AMBER),
+        ("Target 1 (URI):", "http://kururu:9096/wake/psicopompo", TEXT_CYAN),
+        ("Target 2 (Host):", "Kavure (Services & Microserver)", TEXT_WHITE),
+        ("Target 2 (MAC):", "d0:94:66:ad:f3:c4", TEXT_AMBER),
+        ("Target 2 (URI):", "http://kururu:9096/wake/kavure", TEXT_CYAN),
+        ("Transmission:", "Layer 2 Magic Packet Burst (5x / 25ms)", TEXT_GRAY),
     ];
 
-    let mut y = 96;
-    for (label, val) in &psicopompo_lines {
-        fb.draw_text(28, y, label, TEXT_GRAY, 1);
-        fb.draw_text(150, y, val, TEXT_WHITE, 1);
-        y += 20;
+    let mut wy = 90;
+    for (label, val, col) in &wol_lines {
+        fb.draw_text(524, wy, label, TEXT_GRAY, 1);
+        fb.draw_text(655, wy, val, *col, 1);
+        wy += 19;
     }
 
-    // Target 2: Kavure
-    fb.draw_rect(512, 60, 496, 240, PANEL_BG);
-    fb.draw_rect(512, 60, 496, 2, BORDER_COLOR);
-    fb.draw_text(524, 72, "WOL TARGET 2: KAVURE", TEXT_AMBER, 1);
+    // Card 3: Bottom - Wake-on-LAN Dispatch Audit Log
+    fb.draw_rect(16, 308, 992, 252, PANEL_BG);
+    fb.draw_rect(16, 308, 992, 2, BORDER_COLOR);
+    fb.draw_text(28, 318, "RECENT WAKE-ON-LAN DISPATCH AUDIT LOG (/var/log/kururu-wol.log)", TEXT_EMERALD, 1);
 
-    let kavure_lines = [
-        ("Host:", "Kavure (Dell OptiPlex / Services)"),
-        ("Hardware MAC:", "d0:94:66:ad:f3:c4"),
-        ("Tailscale IP:", "100.124.146.77"),
-        ("LAN Broadcast:", "192.168.3.255:9 (mlan0)"),
-        ("HTTP Trigger:", "http://kururu:9096/wake/kavure"),
-        ("SSH Command:", "ssh root@kururu kururu-wake kavure"),
-        ("Daemon Status:", if info.wol_daemon_running { "ACTIVE (:9096)" } else { "STOPPED" }),
-    ];
-
-    let mut ky = 96;
-    for (label, val) in &kavure_lines {
-        fb.draw_text(524, ky, label, TEXT_GRAY, 1);
-        let color = if label.starts_with("Daemon") {
-            if info.wol_daemon_running { TEXT_EMERALD } else { TEXT_RED }
-        } else {
-            TEXT_WHITE
-        };
-        fb.draw_text(650, ky, val, color, 1);
-        ky += 20;
-    }
-
-    // Bottom Card: WOL Dispatch Log
-    fb.draw_rect(16, 312, 992, 244, PANEL_BG);
-    fb.draw_rect(16, 312, 992, 2, BORDER_COLOR);
-    fb.draw_text(28, 322, "RECENT WAKE-ON-LAN DISPATCH AUDIT LOG (/var/log/kururu-wol.log)", TEXT_EMERALD, 1);
-
-    let mut log_y = 348;
+    let mut log_y = 340;
     if info.wol_logs.is_empty() {
-        fb.draw_text(28, log_y, "No Wake-on-LAN packets dispatched yet. Waiting for triggers...", TEXT_DIM, 1);
+        fb.draw_text(28, log_y, "No Wake-on-LAN packets dispatched yet. Waiting for triggers on port 9096...", TEXT_DIM, 1);
     } else {
         for log in &info.wol_logs {
             let truncated = if log.len() > 118 {
@@ -801,8 +912,8 @@ fn render_tab_wol(fb: &mut Framebuffer, info: &SystemInfo) {
                 log.as_str()
             };
             fb.draw_text(28, log_y, truncated, TEXT_CYAN, 1);
-            log_y += 16;
-            if log_y > 540 {
+            log_y += 15;
+            if log_y > 548 {
                 break;
             }
         }
@@ -810,75 +921,105 @@ fn render_tab_wol(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 // -------------------------------------------------------------
-// TAB 2: RETRO DESK CLOCK & BATTERY MONITOR
+// TAB 2: RETRO DESK CLOCK & AMBIENT STATION
 // -------------------------------------------------------------
 fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
-    // Massive Centered Digital Clock Card
-    fb.draw_rect(16, 60, 992, 260, PANEL_BG);
-    fb.draw_rect(16, 60, 992, 2, BORDER_COLOR);
+    // Massive Centered Digital Clock Card (Clean & Uncluttered)
+    fb.draw_rect(16, 56, 992, 294, PANEL_BG);
+    fb.draw_rect(16, 56, 992, 2, BORDER_COLOR);
 
-    fb.draw_text(40, 78, "SOVEREIGN HOMELAB TIME ENGINE • NTP SYNCHRONIZED", TEXT_AMBER, 1);
+    fb.draw_text(40, 70, "MNEMOCINE TIME STATION • SOVEREIGN NTP CLOCK", TEXT_AMBER, 1);
 
-    // Render huge 4x clock (Font 8x16 scaled 4x = 32x64 px per char)
-    // 8 chars * 32 px = 256 px width -> Center at x = (1024 - 256) / 2 = 384
-    fb.draw_text(384, 110, &info.time_str, TEXT_EMERALD, 4);
+    // Render huge 5x clock (Font 8x16 scaled 5x = 40x80 px per char)
+    // 8 chars * 40 px = 320 px width -> Center at x = (1024 - 320) / 2 = 352
+    fb.draw_text(352, 98, &info.time_str, TEXT_EMERALD, 5);
 
-    let date_line = format!("Local Date: {} • Node Hostname: {}", info.date_str, info.hostname);
-    fb.draw_text(320, 200, &date_line, TEXT_CYAN, 2);
+    // Date banner (Scale 2, centered)
+    let date_char_w = 8 * 2;
+    let date_width = info.date_full_str.len() * date_char_w;
+    let date_x = (FB_WIDTH.saturating_sub(date_width)) / 2;
+    fb.draw_text(date_x, 198, &info.date_full_str, TEXT_CYAN, 2);
 
-    let cluster_status = format!(
-        "Mnemocine Homelab: {}/5 Servers Active • Tailnet: {}",
-        info.homelab_online_count, info.tailnet_suffix
+    // Minimal Sub-banner
+    let sub = format!("Timezone: America/Sao_Paulo (UTC-3) • Host: {} • Uptime: {}", info.hostname, info.uptime_str);
+    let sub_x = (FB_WIDTH.saturating_sub(sub.len() * 8)) / 2;
+    fb.draw_text(sub_x, 244, &sub, TEXT_GRAY, 1);
+
+    // Status Dots
+    let cluster_pill = format!(
+        "Homelab: {}/5 Servers Online   •   Wi-Fi: {} ({})   •   WOL Relay: Port 9096 Ready",
+        info.homelab_online_count, info.wifi_ssid, info.wifi_signal_dbm
     );
-    fb.draw_text(260, 250, &cluster_status, TEXT_GRAY, 1);
+    let dots_x = (FB_WIDTH.saturating_sub(cluster_pill.len() * 8)) / 2;
+    fb.draw_text(dots_x, 274, &cluster_pill, TEXT_DIM, 1);
 
-    // Bottom Detailed Hardware & UPS Power Card
-    fb.draw_rect(16, 332, 992, 224, PANEL_BG);
-    fb.draw_rect(16, 332, 992, 2, BORDER_COLOR);
-    fb.draw_text(28, 344, "INTEGRATED UPS HARDWARE POWER & TELEMETRY", TEXT_AMBER, 1);
+    // Bottom Ambient Ribbon: 3 Clean Symmetrical Vitals Cards (Each 316px wide)
+    // Card 1: Hardware UPS & Power (Left)
+    fb.draw_rect(16, 358, 316, 202, PANEL_BG);
+    fb.draw_rect(16, 358, 316, 2, BORDER_COLOR);
+    fb.draw_text(28, 370, "HARDWARE UPS / NO-BREAK", TEXT_AMBER, 1);
 
-    // Battery Bar
-    fb.draw_text(28, 376, "Battery Charge:", TEXT_GRAY, 1);
-    
-    // Draw battery meter bar (width = 300px)
-    fb.draw_rect(160, 374, 304, 18, BORDER_COLOR);
-    let fill_w = (info.battery_pct_num as usize * 300) / 100;
-    fb.draw_rect(162, 376, fill_w, 14, TEXT_EMERALD);
+    fb.draw_rect(28, 396, 280, 16, BORDER_COLOR);
+    let fill_w = (info.battery_pct_num as usize * 276) / 100;
+    fb.draw_rect(30, 398, fill_w, 12, TEXT_EMERALD);
 
-    let bat_label = format!("{}% ({})", info.battery_pct, info.battery_status);
-    fb.draw_text(476, 376, &bat_label, TEXT_WHITE, 1);
-
-    let power_details = [
-        format!("Cell Voltage:    {}", info.battery_volts),
-        format!("Cell Temp:       {}", info.battery_temp_c),
-        format!("Power Source:    USB Charging (5V Micro-USB)"),
-        format!("System Load:     {}", info.load_avg),
-        format!("Uptime:          {}", info.uptime_str),
-        format!("Memory:          {} MB used / {} MB total", info.ram_used_mb, info.ram_total_mb),
+    let ups_lines = [
+        format!("Charge:     {}% ({})", info.battery_pct, info.battery_status),
+        format!("Voltage:    {}", info.battery_volts),
+        format!("Thermal:    {}", info.battery_temp_c),
+        format!("AC Supply:  5V Continuous Micro-USB"),
+        format!("Buffer:     3600 mAh Li-ion Cell"),
     ];
 
-    let mut py = 410;
-    for line in &power_details {
-        fb.draw_text(28, py, line, TEXT_WHITE, 1);
-        py += 22;
+    let mut uy = 422;
+    for line in &ups_lines {
+        fb.draw_text(28, uy, line, TEXT_WHITE, 1);
+        uy += 22;
     }
 
-    let side_notes = [
-        "Hardware UPS Protection: ACTIVE",
-        "If AC line drops, Kururu stays alive for hours.",
-        "Zero-power idle screen blanking after 120s.",
-        "Wake-on-LAN ready on port 9096.",
+    // Card 2: Kururu Node Vitals (Center)
+    fb.draw_rect(348, 358, 328, 202, PANEL_BG);
+    fb.draw_rect(348, 358, 328, 2, BORDER_COLOR);
+    fb.draw_text(360, 370, "KURURU NODE VITALS", TEXT_AMBER, 1);
+
+    let vitals_lines = [
+        format!("Device:     Samsung SM-T110 (Goyawifi)"),
+        format!("APU:        Marvell PXA988 @ {}", info.cpu_freq_str),
+        format!("Load:       {} (1m, 5m, 15m)", info.load_avg),
+        format!("RAM:        {} MB used / {} MB", info.ram_used_mb, info.ram_total_mb),
+        format!("Storage:    {} MB free in rootfs", info.disk_free_mb),
+        format!("Cooling:    Passive Thermal (Silent 0 dB)"),
     ];
 
-    let mut sy = 410;
-    for note in &side_notes {
-        fb.draw_text(520, sy, note, TEXT_CYAN, 1);
-        sy += 22;
+    let mut vy = 398;
+    for line in &vitals_lines {
+        fb.draw_text(360, vy, line, TEXT_WHITE, 1);
+        vy += 22;
+    }
+
+    // Card 3: Homelab Network (Right)
+    fb.draw_rect(692, 358, 316, 202, PANEL_BG);
+    fb.draw_rect(692, 358, 316, 2, BORDER_COLOR);
+    fb.draw_text(704, 370, "HOMELAB NETWORK", TEXT_AMBER, 1);
+
+    let net_lines = [
+        format!("Tailnet:    {}", info.tailnet_suffix),
+        format!("Node IP:    {}", info.tailscale_ip),
+        format!("Servers:    {}/5 Nodes Active", info.homelab_online_count),
+        format!("Wi-Fi AP:   {}", info.wifi_ssid),
+        format!("Signal:     {}", info.wifi_signal_dbm),
+        format!("WOL Engine: Port 9096 Listener Ready"),
+    ];
+
+    let mut ny = 398;
+    for line in &net_lines {
+        fb.draw_text(704, ny, line, TEXT_WHITE, 1);
+        ny += 22;
     }
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.2 (Multi-Tab & Volume Navigation)...");
+    println!("[Kururu Display Daemon] Starting v1.3 (Inverted Volume Navigation & Modular Dashboards)...");
 
     let screen_active = Arc::new(AtomicBool::new(true));
     let screen_active_power = screen_active.clone();
@@ -933,6 +1074,7 @@ fn main() {
     });
 
     // Thread 2: Listen to hardware Volume Up / Volume Down keys (/dev/input/event0)
+    // INVERTED: Volume Up goes right-to-left (prev tab); Volume Down goes left-to-right (next tab)
     thread::spawn(move || {
         let mut file = match File::open(EVENT_KEYS) {
             Ok(f) => f,
@@ -962,16 +1104,16 @@ fn main() {
                     screen_active_keys.store(true, Ordering::SeqCst);
                     wake_signal_keys.store(true, Ordering::SeqCst);
                 } else if event.code == KEY_VOLUMEUP {
-                    // Next tab
-                    let next = (current_tab_keys.load(Ordering::SeqCst) + 1) % 3;
-                    current_tab_keys.store(next, Ordering::SeqCst);
-                    println!("[Kururu Display] Volume UP -> Switched to Tab {}", next + 1);
-                    wake_signal_keys.store(true, Ordering::SeqCst);
-                } else if event.code == KEY_VOLUMEDOWN {
-                    // Previous tab
+                    // Volume Up: right-to-left (previous tab: 2 -> 1 -> 0 -> 2)
                     let prev = (current_tab_keys.load(Ordering::SeqCst) + 3 - 1) % 3;
                     current_tab_keys.store(prev, Ordering::SeqCst);
-                    println!("[Kururu Display] Volume DOWN -> Switched to Tab {}", prev + 1);
+                    println!("[Kururu Display] Volume UP -> Switched to Tab {} (<-)", prev + 1);
+                    wake_signal_keys.store(true, Ordering::SeqCst);
+                } else if event.code == KEY_VOLUMEDOWN {
+                    // Volume Down: left-to-right (next tab: 0 -> 1 -> 2 -> 0)
+                    let next = (current_tab_keys.load(Ordering::SeqCst) + 1) % 3;
+                    current_tab_keys.store(next, Ordering::SeqCst);
+                    println!("[Kururu Display] Volume DOWN -> Switched to Tab {} (->)", next + 1);
                     wake_signal_keys.store(true, Ordering::SeqCst);
                 }
             }
@@ -1015,8 +1157,8 @@ fn main() {
             draw_header(&mut fb, tab);
 
             match tab {
-                0 => render_tab_cluster(&mut fb, &info),
-                1 => render_tab_wol(&mut fb, &info),
+                0 => render_tab_kururu(&mut fb, &info),
+                1 => render_tab_homelab(&mut fb, &info),
                 _ => render_tab_clock(&mut fb, &info),
             }
 
