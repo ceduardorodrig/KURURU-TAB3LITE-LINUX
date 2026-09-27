@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 mod font;
 mod terminal;
+mod ui;
 
 extern "C" {
     fn tzset();
@@ -246,19 +247,9 @@ const MENU_ITEMS: [(&str, MenuAction); 6] = [
     ("About", MenuAction::Screen(SCREEN_ABOUT)),
 ];
 const MENU_COUNT: usize = MENU_ITEMS.len();
-const MENU_ITEM_H: usize = 40;
-const MENU_ITEM_GAP: usize = 8;
-const MENU_X: usize = 300;
-const MENU_W: usize = FB_WIDTH - 2 * MENU_X; // centered column (424)
-const MENU_Y0: usize = 200;
 
 /// Dashboard header title (its width drives the tab start, see tab_rects()).
 const HEADER_TITLE: &str = "DASHBOARD";
-
-/// Rectangle of a menu row — shared by render_menu and the touch hit-test.
-fn menu_item_rect(i: usize) -> (usize, usize, usize, usize) {
-    (MENU_X, MENU_Y0 + i * (MENU_ITEM_H + MENU_ITEM_GAP), MENU_W, MENU_ITEM_H)
-}
 
 // ── Pixel-art sprites ('#' = pixel). Data-driven masks rendered by
 //    Framebuffer::draw_sprite — adding art is just adding a mask. ──────
@@ -1176,6 +1167,23 @@ fn draw_background_grid(fb: &mut Framebuffer) {
     }
 }
 
+/// Frog mascot overlay (pixel-art) — drawn on top of the ratatui Menu.
+fn draw_frog(fb: &mut Framebuffer) {
+    let x = (FB_WIDTH - 22) / 2;
+    fb.draw_sprite(x, 60, SP_FROG_BODY, theme().accent, 1);
+    fb.draw_sprite(x, 60, SP_FROG_DETAIL, theme().bg, 1);
+}
+
+fn about_lines(info: &SystemInfo) -> Vec<String> {
+    vec![
+        "KURURU - Native Headless Linux Node".to_string(),
+        "Samsung Galaxy Tab 3 Lite (SM-T110 / goyawifi)".to_string(),
+        format!("Alpine Linux / musl  -  Kernel {}", info.kernel_version),
+        format!("Uptime: {}", info.uptime_str),
+        "github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX".to_string(),
+    ]
+}
+
 /// Retro-HUD card frame: panel, 1px border, accent corner brackets, left
 /// accent bar, optional pixel icon + title, and a divider under the title.
 fn draw_card(
@@ -1273,15 +1281,11 @@ fn handle_tap(
             }
         }
         SCREEN_MENU => {
-            for i in 0..MENU_COUNT {
-                let (x, y, w, h) = menu_item_rect(i);
-                if sx >= x && sx < x + w && sy >= y && sy < y + h {
-                    menu_cursor.store(i, Ordering::SeqCst);
-                    println!("[Kururu Display] Touch -> Menu '{}'", MENU_ITEMS[i].0);
-                    if let Some(target) = apply_menu_action(MENU_ITEMS[i].1) {
-                        screen.store(target, Ordering::SeqCst);
-                    }
-                    break;
+            if let Some(i) = ui::menu_hit(sx, sy) {
+                menu_cursor.store(i, Ordering::SeqCst);
+                println!("[Kururu Display] Touch -> Menu '{}'", MENU_ITEMS[i].0);
+                if let Some(target) = apply_menu_action(MENU_ITEMS[i].1) {
+                    screen.store(target, Ordering::SeqCst);
                 }
             }
         }
@@ -1367,96 +1371,6 @@ fn draw_footer(fb: &mut Framebuffer, info: &SystemInfo) {
 // -------------------------------------------------------------
 // Unified UI shell — design-system widgets + non-dashboard screens
 // -------------------------------------------------------------
-/// Top bar for non-dashboard screens (consistent with the dashboard header).
-fn draw_topbar(fb: &mut Framebuffer, title: &str, hint: &str) {
-    fb.draw_rect(0, 0, FB_WIDTH, 48, theme().panel);
-    fb.draw_rect(0, 48, FB_WIDTH, 2, theme().border);
-    fb.draw_rect(MARGIN, 18, 12, 12, theme().accent); // accent marker
-    fb.draw_text(MARGIN + 24, 8, title, theme().text, 2);
-    if !hint.is_empty() {
-        let hx = FB_WIDTH - MARGIN - hint.len() * 8;
-        fb.draw_text(hx, 16, hint, theme().text_muted, 1);
-    }
-}
-
-/// Bottom hint bar for non-dashboard screens.
-fn draw_hint_footer(fb: &mut Framebuffer, hint: &str) {
-    fb.draw_rect(0, 568, FB_WIDTH, 32, theme().panel);
-    fb.draw_rect(0, 568, FB_WIDTH, 1, theme().border);
-    let x = (FB_WIDTH.saturating_sub(hint.len() * 8)) / 2;
-    fb.draw_text(x, 576, hint, theme().text_dim, 1);
-}
-
-/// Reusable list row (menu / settings). `selected` draws the active style.
-fn draw_list_item(fb: &mut Framebuffer, x: usize, y: usize, w: usize, label: &str, selected: bool) {
-    let h = MENU_ITEM_H;
-    let bg = if selected { theme().panel_active } else { theme().panel };
-    let border = if selected { theme().accent } else { theme().border };
-    let fg = if selected { theme().accent } else { theme().text };
-    fb.draw_rect(x, y, w, h, bg);
-    fb.draw_rect(x, y, w, 1, border);
-    fb.draw_rect(x, y + h - 1, w, 1, border);
-    if selected {
-        fb.draw_rect(x, y, 3, h, theme().accent);
-    }
-    fb.draw_rect(x + 16, y + (h - 8) / 2, 8, 8, fg); // bullet
-    fb.draw_text(x + 36, y + (h - 16) / 2, label, fg, 1);
-}
-
-fn render_menu(fb: &mut Framebuffer, cursor: usize) {
-    draw_topbar(fb, "MENU", "[HOME] Enter");
-
-    // ── Brand block: the frog + KURURU live here, prominent ──────────────
-    let frog_scale = 3;
-    let frog_w = 22 * frog_scale;
-    let frog_h = 14 * frog_scale;
-    let frog_x = (FB_WIDTH - frog_w) / 2;
-    let frog_y = 66;
-    fb.draw_sprite(frog_x, frog_y, SP_FROG_BODY, theme().accent, frog_scale);
-    fb.draw_sprite(frog_x, frog_y, SP_FROG_DETAIL, theme().bg, frog_scale);
-
-    let brand = "KURURU";
-    let brand_x = (FB_WIDTH.saturating_sub(brand.len() * 8 * 3)) / 2;
-    fb.draw_text(brand_x, frog_y + frog_h + 6, brand, theme().accent, 3);
-
-    let sub = "Mnemocine Homelab";
-    let sub_x = (FB_WIDTH.saturating_sub(sub.len() * 8)) / 2;
-    fb.draw_text(sub_x, frog_y + frog_h + 6 + 48 + 4, sub, theme().text_dim, 1);
-
-    for (i, (label, action)) in MENU_ITEMS.iter().enumerate() {
-        let (x, y, w, _) = menu_item_rect(i);
-        let text = match action {
-            MenuAction::ToggleTheme => format!("{}: {}", label, theme().name),
-            MenuAction::ToggleEffects => {
-                let on = EFFECTS.load(Ordering::Relaxed) != 0;
-                format!("{}: {}", label, if on { "ON" } else { "OFF" })
-            }
-            MenuAction::Screen(_) => (*label).to_string(),
-        };
-        draw_list_item(fb, x, y, w, &text, i == cursor);
-    }
-    draw_hint_footer(fb, "[VOL+] Up   [VOL-] Down   [HOME] Select   [POWER] Sleep");
-}
-
-fn render_about(fb: &mut Framebuffer, info: &SystemInfo) {
-    draw_topbar(fb, "ABOUT", "[HOME] Back");
-    let lines = [
-        "KURURU - Native Headless Linux Node".to_string(),
-        "Samsung Galaxy Tab 3 Lite (SM-T110 / goyawifi)".to_string(),
-        format!("Alpine Linux / musl  ·  Kernel {}", info.kernel_version),
-        "Display: kururu-display v1.8".to_string(),
-        format!("Uptime: {}", info.uptime_str),
-        "github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX".to_string(),
-    ];
-    let mut y = 150;
-    for line in &lines {
-        let x = (FB_WIDTH.saturating_sub(line.len() * 8)) / 2;
-        fb.draw_text(x, y, line, theme().text_muted, 1);
-        y += 28;
-    }
-    draw_hint_footer(fb, "[HOME] Back");
-}
-
 // -------------------------------------------------------------
 // On-screen keyboard (QWERTY + modifiers/arrows) — reusable
 // -------------------------------------------------------------
@@ -1521,34 +1435,12 @@ const KB_ROWS: &[&[KKey]] = &[
     ],
 ];
 
-const KB_UNITS: usize = 16; // every row totals 16 units (fills the width)
-const KB_U: usize = (FB_WIDTH - (KB_UNITS - 1) * KB_GAP) / KB_UNITS;
-const KB_GAP: usize = 6;
-const KB_H: usize = 44;
-const KB_TOP: usize = 300;
 
 // Terminal grid geometry (the area above the keyboard).
 const TERM_X: usize = MARGIN;
 const TERM_Y: usize = 56;
 const TERM_COLS: usize = (FB_WIDTH - 2 * MARGIN) / 8;
-const TERM_ROWS: usize = (KB_TOP - TERM_Y) / 16;
-const KB_ROW_GAP: usize = 8;
-
-/// Bounding box (x, y, w, h) of the key at (row, col).
-fn kb_key_rect(row: usize, col: usize) -> (usize, usize, usize, usize) {
-    let keys = KB_ROWS[row];
-    let total: usize = keys.iter().map(|k| k.w).sum();
-    let row_w = total * KB_U + keys.len().saturating_sub(1) * KB_GAP;
-    let mut x = (FB_WIDTH.saturating_sub(row_w)) / 2;
-    for (i, key) in keys.iter().enumerate() {
-        let w = key.w * KB_U + key.w.saturating_sub(1) * KB_GAP;
-        if i == col {
-            return (x, KB_TOP + row * (KB_H + KB_ROW_GAP), w, KB_H);
-        }
-        x += w + KB_GAP;
-    }
-    (0, 0, 0, 0)
-}
+const TERM_ROWS: usize = (ui::KB_CELL_Y0 as usize * 16 - TERM_Y) / 16;
 
 static KB_SHIFT: AtomicBool = AtomicBool::new(false);
 static KB_CTRL: AtomicBool = AtomicBool::new(false);
@@ -1561,33 +1453,6 @@ fn shift_char(c: char) -> char {
         '-' => '_', '=' => '+', '[' => '{', ']' => '}', ';' => ':',
         '\'' => '"', ',' => '<', '.' => '>', '/' => '?',
         c => c.to_ascii_uppercase(),
-    }
-}
-
-fn draw_keyboard(fb: &mut Framebuffer) {
-    fb.draw_rect(0, KB_TOP - 6, FB_WIDTH, FB_HEIGHT - (KB_TOP - 6), theme().bg);
-
-    for (r, keys) in KB_ROWS.iter().enumerate() {
-        for (c, key) in keys.iter().enumerate() {
-            let (x, y, w, h) = kb_key_rect(r, c);
-            let active = match key.key {
-                Key::Shift => KB_SHIFT.load(Ordering::Relaxed),
-                Key::Ctrl => KB_CTRL.load(Ordering::Relaxed),
-                Key::Alt => KB_ALT.load(Ordering::Relaxed),
-                _ => false,
-            };
-            let bg = if active { theme().panel_active } else { theme().panel };
-            let border = if active { theme().accent } else { theme().border };
-            fb.draw_rect(x, y, w, h, bg);
-            fb.draw_rect(x, y, w, 1, border);
-            fb.draw_rect(x, y + h - 1, w, 1, border);
-            let scale = if key.label.len() == 1 { 2 } else { 1 };
-            let tw = key.label.len() * 8 * scale;
-            let tx = x + w.saturating_sub(tw) / 2;
-            let ty = y + (h.saturating_sub(16 * scale)) / 2;
-            let fg = if active { theme().accent } else { theme().text };
-            fb.draw_text(tx, ty, key.label, fg, scale);
-        }
     }
 }
 
@@ -1665,152 +1530,24 @@ fn wifi_form() -> &'static Mutex<WifiForm> {
     WIFI_FORM.get_or_init(|| Mutex::new(WifiForm::default()))
 }
 
-const SET_X: usize = 200;
-const SET_FIELD_BX: usize = SET_X + 130;
-const SET_FIELD_BW: usize = FB_WIDTH - SET_FIELD_BX - MARGIN;
-const SET_BTN_W: usize = 36;
-const SET_BTN_H: usize = 24;
-const SET_MINUS_X: usize = SET_X + 140;
-const SET_BAR_X: usize = SET_MINUS_X + SET_BTN_W + 8;
-const SET_BAR_W: usize = 300;
-const SET_PLUS_X: usize = SET_BAR_X + SET_BAR_W + 8;
-const SET_Y_BRIGHT: usize = 66;
-const SET_Y_SLEEP: usize = 90;
-const SET_Y_VOLUME: usize = 128;
-const SET_LIST_Y0: usize = 168;
-const SET_LIST_STEP: usize = 18;
-const SET_LIST_N: usize = 3;
-const SET_Y_REDE: usize = 222;
-const SET_Y_PSK: usize = 240;
-const SET_Y_CONNECT: usize = 266;
-const SET_CONNECT_W: usize = 160;
-const SET_CONNECT_H: usize = 26;
-
-/// First visible network index for the scrolling list window.
-fn wifi_start(nets_len: usize, sel: usize) -> usize {
-    let n = SET_LIST_N.min(nets_len);
-    if n == 0 {
-        0
-    } else {
-        sel.saturating_sub(1).min(nets_len - n)
-    }
+// Small accessors used by the ratatui UI module.
+fn wifi_editing() -> bool { wifi_form().lock().map(|f| f.editing).unwrap_or(false) }
+fn wifi_nets() -> Vec<(String, i32, String)> { wifi_form().lock().map(|f| f.nets.clone()).unwrap_or_default() }
+fn wifi_sel() -> usize { wifi_form().lock().map(|f| f.sel).unwrap_or(0) }
+fn wifi_connected() -> String { wifi_form().lock().map(|f| f.connected.clone()).unwrap_or_default() }
+fn wifi_selected_ssid() -> String { wifi_form().lock().map(|f| f.ssid.clone()).unwrap_or_default() }
+fn wifi_psk_mask() -> String { wifi_form().lock().map(|f| "*".repeat(f.psk.chars().count())).unwrap_or_default() }
+fn wifi_status() -> String { wifi_form().lock().map(|f| f.status.clone()).unwrap_or_default() }
+fn brightness_pct() -> f64 { BRIGHTNESS.load(Ordering::Relaxed) as f64 / 255.0 }
+fn volume_pct() -> f64 { VOLUME.load(Ordering::Relaxed) as f64 / 100.0 }
+fn sleep_label() -> String {
+    let s = SLEEP_SECS.load(Ordering::Relaxed);
+    if s == 0 { "Off".to_string() } else { format!("{}s", s) }
 }
+fn kb_shift() -> bool { KB_SHIFT.load(Ordering::Relaxed) }
+fn kb_ctrl() -> bool { KB_CTRL.load(Ordering::Relaxed) }
+fn kb_alt() -> bool { KB_ALT.load(Ordering::Relaxed) }
 
-fn draw_field(fb: &mut Framebuffer, y: usize, label: &str, value: &str, focused: bool, editing: bool) {
-    fb.draw_text(SET_X, y, label, theme().text_muted, 1);
-    let bg = if focused { theme().panel_active } else { theme().panel };
-    let border = if focused { theme().accent } else { theme().border };
-    fb.draw_rect(SET_FIELD_BX, y - 4, SET_FIELD_BW, 24, bg);
-    fb.draw_rect(SET_FIELD_BX, y - 4, SET_FIELD_BW, 1, border);
-    fb.draw_rect(SET_FIELD_BX, y + 19, SET_FIELD_BW, 1, border);
-    let shown = if value.is_empty() { "<vazio>" } else { value };
-    fb.draw_text(SET_FIELD_BX + 8, y, shown, theme().text, 1);
-    if focused && editing {
-        let cx = SET_FIELD_BX + 8 + value.len() * 8;
-        fb.draw_rect(cx, y, 8, 16, theme().accent); // cursor
-    }
-}
-
-fn draw_button(fb: &mut Framebuffer, x: usize, y: usize, w: usize, h: usize, label: &str, focused: bool) {
-    let bg = if focused { theme().panel_active } else { theme().panel };
-    let border = if focused { theme().accent } else { theme().border };
-    let fg = if focused { theme().accent } else { theme().text };
-    fb.draw_rect(x, y, w, h, bg);
-    fb.draw_rect(x, y, w, 1, border);
-    fb.draw_rect(x, y + h - 1, w, 1, border);
-    fb.draw_text(x + w.saturating_sub(label.len() * 8) / 2, y + h.saturating_sub(16) / 2, label, fg, 1);
-}
-
-fn draw_slider(fb: &mut Framebuffer, y: usize, label: &str, value: usize, max: usize) {
-    fb.draw_text(SET_X, y, label, theme().text_muted, 1);
-    draw_button(fb, SET_MINUS_X, y - 4, SET_BTN_W, SET_BTN_H, "-", false);
-    fb.draw_rect(SET_BAR_X, y, SET_BAR_W, 16, theme().border);
-    let fill = (value.min(max) * (SET_BAR_W - 4)) / max.max(1);
-    fb.draw_rect(SET_BAR_X + 2, y + 2, fill, 12, theme().accent);
-    draw_button(fb, SET_PLUS_X, y - 4, SET_BTN_W, SET_BTN_H, "+", false);
-}
-
-fn draw_stepper(fb: &mut Framebuffer, y: usize, label: &str, value: &str) {
-    fb.draw_text(SET_X, y, label, theme().text_muted, 1);
-    draw_button(fb, SET_MINUS_X, y - 4, SET_BTN_W, SET_BTN_H, "-", false);
-    fb.draw_text(SET_BAR_X, y, value, theme().text, 1);
-    draw_button(fb, SET_PLUS_X, y - 4, SET_BTN_W, SET_BTN_H, "+", false);
-}
-
-fn render_settings(fb: &mut Framebuffer) {
-    let (focus, editing, status, nets, sel, connected, psk_mask, ssid) = match wifi_form().lock() {
-        Ok(f) => (
-            f.focus,
-            f.editing,
-            f.status.clone(),
-            f.nets.clone(),
-            f.sel,
-            f.connected.clone(),
-            "*".repeat(f.psk.chars().count()),
-            f.ssid.clone(),
-        ),
-        Err(_) => (0, false, String::new(), Vec::new(), 0, String::new(), String::new(), String::new()),
-    };
-
-    let hint = if editing { "[BACK] Done" } else { "[HOME] Edit" };
-    draw_topbar(fb, "SETTINGS", hint);
-
-    fb.draw_text(SET_X, 48, "DISPLAY", theme().warn, 1);
-    draw_slider(fb, SET_Y_BRIGHT, "Brightness", BRIGHTNESS.load(Ordering::Relaxed), 255);
-    let sleep = SLEEP_SECS.load(Ordering::Relaxed);
-    let sleep_str = if sleep == 0 { "Off".to_string() } else { format!("{}s", sleep) };
-    draw_stepper(fb, SET_Y_SLEEP, "Auto-sleep", &sleep_str);
-
-    fb.draw_text(SET_X, 110, "AUDIO", theme().warn, 1);
-    draw_slider(fb, SET_Y_VOLUME, "Volume", VOLUME.load(Ordering::Relaxed), 100);
-
-    fb.draw_text(SET_X, 150, "WI-FI", theme().warn, 1);
-    if nets.is_empty() {
-        fb.draw_text(SET_X, SET_LIST_Y0, "(procurando redes...)", theme().text_dim, 1);
-    } else {
-        let start = wifi_start(nets.len(), sel);
-        for (i, (s, sig, _)) in nets.iter().skip(start).take(SET_LIST_N).enumerate() {
-            let idx = start + i;
-            let y = SET_LIST_Y0 + i * SET_LIST_STEP;
-            let selected = idx == sel;
-            let conn = s == &connected;
-            let prefix = if conn { '*' } else if selected { '>' } else { ' ' };
-            let color = if selected {
-                theme().accent
-            } else if conn {
-                theme().info
-            } else {
-                theme().text_muted
-            };
-            fb.draw_text(SET_X, y, &format!("{} {}  {} dBm", prefix, s, sig), color, 1);
-        }
-    }
-
-    let ssid_label = if ssid.is_empty() { "(selecione uma rede)".to_string() } else { ssid.clone() };
-    fb.draw_text(SET_X, SET_Y_REDE, "Rede:", theme().text_muted, 1);
-    fb.draw_text(SET_X + 60, SET_Y_REDE, &ssid_label, theme().text, 1);
-    draw_field(fb, SET_Y_PSK, "Password", &psk_mask, focus == 0, editing && focus == 0);
-    draw_button(fb, SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H, "Connect", focus == 1);
-
-    if editing {
-        draw_keyboard(fb);
-    } else {
-        if !status.is_empty() {
-            fb.draw_text(SET_X, 300, &status, theme().info, 1);
-        }
-        draw_hint_footer(fb, "[VOL+] Net   [VOL-] Net   [HOME] Edit   [MENU] Menu   [BACK] Back");
-    }
-}
-
-fn render_terminal(fb: &mut Framebuffer) {
-    draw_topbar(fb, "TERMINAL", "[BACK] Menu");
-    if terminal::is_ready() {
-        terminal::render(fb, TERM_X, TERM_Y);
-    } else {
-        fb.draw_text(TERM_X, TERM_Y + 8, "Terminal indisponivel (PTY falhou).", theme().text_dim, 1);
-    }
-    draw_keyboard(fb);
-}
 
 /// Connect wpa_supplicant to an SSID (PSK if provided). Returns a status line.
 fn wifi_connect(ssid: &str, psk: &str) -> String {
@@ -1932,16 +1669,12 @@ fn term_key(key: Key) {
 
 /// Touch hit-test over the on-screen keyboard. Returns true if a key was hit.
 fn keyboard_tap(sx: usize, sy: usize, terminal_mode: bool) -> bool {
-    for (r, keys) in KB_ROWS.iter().enumerate() {
-        for c in 0..keys.len() {
-            let (x, y, w, h) = kb_key_rect(r, c);
-            if sx >= x && sx < x + w && sy >= y && sy < y + h {
-                kb_press(keys[c].key, terminal_mode);
-                return true;
-            }
-        }
+    if let Some(key) = ui::keyboard_key_at(sx, sy) {
+        kb_press(key, terminal_mode);
+        true
+    } else {
+        false
     }
-    false
 }
 
 /// Cycle the auto-sleep timeout through a fixed set of values.
@@ -1955,61 +1688,52 @@ fn cycle_sleep(dir: i32) {
 }
 
 fn settings_tap(sx: usize, sy: usize) {
-    let in_rect = |x: usize, y: usize, w: usize, h: usize| sx >= x && sx < x + w && sy >= y && sy < y + h;
-
-    if in_rect(SET_MINUS_X, SET_Y_BRIGHT - 4, SET_BTN_W, SET_BTN_H) {
-        let v = BRIGHTNESS.load(Ordering::Relaxed).saturating_sub(16).max(8);
-        BRIGHTNESS.store(v, Ordering::Relaxed);
-        write_backlight(v);
-        save_display_config();
-    } else if in_rect(SET_PLUS_X, SET_Y_BRIGHT - 4, SET_BTN_W, SET_BTN_H) {
-        let v = (BRIGHTNESS.load(Ordering::Relaxed) + 16).min(255);
-        BRIGHTNESS.store(v, Ordering::Relaxed);
-        write_backlight(v);
-        save_display_config();
-    } else if in_rect(SET_MINUS_X, SET_Y_SLEEP - 4, SET_BTN_W, SET_BTN_H) {
-        cycle_sleep(-1);
-    } else if in_rect(SET_PLUS_X, SET_Y_SLEEP - 4, SET_BTN_W, SET_BTN_H) {
-        cycle_sleep(1);
-    } else if in_rect(SET_MINUS_X, SET_Y_VOLUME - 4, SET_BTN_W, SET_BTN_H) {
-        set_volume(VOLUME.load(Ordering::Relaxed).saturating_sub(10));
-        save_display_config();
-    } else if in_rect(SET_PLUS_X, SET_Y_VOLUME - 4, SET_BTN_W, SET_BTN_H) {
-        set_volume((VOLUME.load(Ordering::Relaxed) + 10).min(100));
-        save_display_config();
-    } else {
-        // network list rows
-        let mut hit = false;
-        for i in 0..SET_LIST_N {
-            let y = SET_LIST_Y0 + i * SET_LIST_STEP;
-            if in_rect(SET_X, y.saturating_sub(2), SET_FIELD_BW + 130, SET_LIST_STEP) {
-                if let Ok(mut f) = wifi_form().lock() {
-                    let total = f.nets.len();
-                    if total > 0 {
-                        let start = wifi_start(total, f.sel);
-                        let idx = (start + i).min(total - 1);
-                        let name = f.nets[idx].0.clone();
-                        f.sel = idx;
-                        f.ssid = name;
-                        f.psk.clear();
-                        f.focus = 0;
-                        f.editing = true;
-                    }
-                }
-                hit = true;
-                break;
-            }
+    match ui::settings_hit(sx, sy) {
+        Some(ui::SettingsHit::BrightDown) => {
+            let v = BRIGHTNESS.load(Ordering::Relaxed).saturating_sub(16).max(8);
+            BRIGHTNESS.store(v, Ordering::Relaxed);
+            write_backlight(v);
+            save_display_config();
         }
-        if !hit {
-            if in_rect(SET_FIELD_BX, SET_Y_PSK - 4, SET_FIELD_BW, 24) {
-                if let Ok(mut f) = wifi_form().lock() {
+        Some(ui::SettingsHit::BrightUp) => {
+            let v = (BRIGHTNESS.load(Ordering::Relaxed) + 16).min(255);
+            BRIGHTNESS.store(v, Ordering::Relaxed);
+            write_backlight(v);
+            save_display_config();
+        }
+        Some(ui::SettingsHit::VolDown) => {
+            set_volume(VOLUME.load(Ordering::Relaxed).saturating_sub(10));
+            save_display_config();
+        }
+        Some(ui::SettingsHit::VolUp) => {
+            set_volume((VOLUME.load(Ordering::Relaxed) + 10).min(100));
+            save_display_config();
+        }
+        Some(ui::SettingsHit::SleepPrev) => cycle_sleep(-1),
+        Some(ui::SettingsHit::SleepNext) => cycle_sleep(1),
+        Some(ui::SettingsHit::Network(i)) => {
+            if let Ok(mut f) = wifi_form().lock() {
+                let total = f.nets.len();
+                if total > 0 {
+                    let start = ui::wifi_start(total, f.sel);
+                    let idx = (start + i).min(total - 1);
+                    let name = f.nets[idx].0.clone();
+                    f.sel = idx;
+                    f.ssid = name;
+                    f.psk.clear();
                     f.focus = 0;
                     f.editing = true;
                 }
-            } else if in_rect(SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H) {
-                wifi_submit();
             }
         }
+        Some(ui::SettingsHit::Password) => {
+            if let Ok(mut f) = wifi_form().lock() {
+                f.focus = 0;
+                f.editing = true;
+            }
+        }
+        Some(ui::SettingsHit::Connect) => wifi_submit(),
+        None => {}
     }
 }
 
@@ -2478,7 +2202,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.5 (UX: consistent buttons, full-width keyboard, Wi-Fi scan)...");
+    println!("[Kururu Display Daemon] Starting v2.7 (ratatui app shell, touch-sized controls)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -2793,14 +2517,34 @@ fn main() {
                     }
 
                     fb.clear(theme().bg);
-                    draw_background_grid(&mut fb);
 
                     match screen {
-                        SCREEN_MENU => render_menu(&mut fb, menu_cursor.load(Ordering::SeqCst)),
-                        SCREEN_ABOUT => render_about(&mut fb, info),
-                        SCREEN_SETTINGS => render_settings(&mut fb),
-                        SCREEN_TERMINAL => render_terminal(&mut fb),
+                        SCREEN_MENU => {
+                            let cursor = menu_cursor.load(Ordering::SeqCst);
+                            ui::render(&mut fb, |f| ui::menu(f, cursor));
+                            draw_frog(&mut fb);
+                        }
+                        SCREEN_ABOUT => {
+                            let lines = about_lines(info);
+                            ui::render(&mut fb, |f| ui::about(f, &lines));
+                        }
+                        SCREEN_SETTINGS => {
+                            let editing = wifi_editing();
+                            ui::render(&mut fb, |f| {
+                                ui::settings(f);
+                                if editing {
+                                    ui::keyboard(f);
+                                }
+                            });
+                        }
+                        SCREEN_TERMINAL => {
+                            ui::render(&mut fb, |f| ui::terminal(f));
+                            if terminal::is_ready() {
+                                terminal::render(&mut fb, TERM_X, TERM_Y);
+                            }
+                        }
                         _ => {
+                            draw_background_grid(&mut fb);
                             let tab = current_tab.load(Ordering::SeqCst);
                             draw_header(&mut fb, tab);
                             match tab {
