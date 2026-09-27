@@ -110,10 +110,10 @@ const fn pal(key: &'static str, name: &'static str, bg: Color, fg: Color, light:
 }
 
 impl Theme {
-    /// Original dark retro-HUD palette (emerald / cyan, multi-colour).
-    const GREEN: Theme = Theme {
-        key: "green",
-        name: "Green",
+    /// Default palette of the project (emerald / cyan, multi-colour).
+    const KURURU: Theme = Theme {
+        key: "kururu",
+        name: "Kururu",
         light: false,
         bg: rgb(10, 14, 20),
         panel: rgb(16, 22, 32),
@@ -130,11 +130,11 @@ impl Theme {
     };
 }
 
-const THEME_COUNT: usize = 15;
+const THEME_COUNT: usize = 16;
 
-/// Green (multi-colour) + the 14 cool-retro-term schemes (monochrome phosphor).
+/// Kururu (multi-colour, default) + the cool-retro-term schemes (monochrome phosphor).
 static THEMES: [Theme; THEME_COUNT] = [
-    Theme::GREEN,
+    Theme::KURURU,
     pal("amber", "Default Amber", rgb(0, 0, 0), rgb(0xff, 0x81, 0x00), false),
     pal("monochrome_green", "Monochrome Green", rgb(0, 0, 0), rgb(0x0c, 0xcc, 0x68), false),
     pal("deep_blue", "Deep Blue", rgb(0, 0, 0), rgb(0x7f, 0xb4, 0xff), false),
@@ -149,10 +149,11 @@ static THEMES: [Theme; THEME_COUNT] = [
     pal("plasma", "Plasma", rgb(0x07, 0x00, 0x14), rgb(0xff, 0x9b, 0xd6), false),
     pal("boring", "Boring", rgb(0, 0, 0), rgb(0xff, 0xff, 0xff), false),
     pal("eink", "E-Ink", rgb(0xf2, 0xf2, 0xec), rgb(0x10, 0x10, 0x10), true),
+    pal("eink_dark", "E-Ink Dark", rgb(0x10, 0x10, 0x10), rgb(0xf2, 0xf2, 0xec), false),
 ];
 
-// Start on Amber (index 1); overridden by config/env.
-static THEME_IDX: AtomicUsize = AtomicUsize::new(1);
+// Start on Kururu (default); overridden by config/env.
+static THEME_IDX: AtomicUsize = AtomicUsize::new(0);
 
 /// Current palette (selected via config/env or the Menu).
 fn theme() -> &'static Theme {
@@ -1397,7 +1398,14 @@ fn render_menu(fb: &mut Framebuffer, cursor: usize) {
             MenuAction::ToggleTheme => format!("{}: {}", label, theme().name),
             MenuAction::ToggleEffects => {
                 let on = EFFECTS.load(Ordering::Relaxed) != 0;
-                format!("{}: {}", label, if on { "ON" } else { "OFF" })
+                let state = if on && theme().light {
+                    "OFF (light)"
+                } else if on {
+                    "ON"
+                } else {
+                    "OFF"
+                };
+                format!("{}: {}", label, state)
             }
             MenuAction::Screen(_) => (*label).to_string(),
         };
@@ -1874,7 +1882,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.0 (15 themes, unified UI shell, Amber CRT)...");
+    println!("[Kururu Display Daemon] Starting v2.1 (16 themes, default Kururu, unified UI shell)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
