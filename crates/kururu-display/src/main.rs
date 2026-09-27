@@ -164,8 +164,25 @@ fn theme_index_by_key(key: &str) -> Option<usize> {
 //── CRT effect flags (toggleable post-process) ────────────────────────
 const EFFECT_SCANLINES: u32 = 1 << 0;
 const EFFECT_VIGNETTE: u32 = 1 << 1;
-const EFFECT_FLICKER: u32 = 1 << 2;
-static EFFECTS: AtomicU32 = AtomicU32::new(EFFECT_SCANLINES | EFFECT_VIGNETTE | EFFECT_FLICKER);
+const EFFECT_ALL: u32 = EFFECT_SCANLINES | EFFECT_VIGNETTE;
+static EFFECTS: AtomicU32 = AtomicU32::new(EFFECT_ALL);
+
+/// Backlight level (8..=255) applied when the screen is on.
+static BRIGHTNESS: AtomicUsize = AtomicUsize::new(180);
+/// Auto-sleep timeout in seconds (0 = never).
+static SLEEP_SECS: AtomicUsize = AtomicUsize::new(120);
+
+const BACKLIGHT_PATHS: [&str; 2] = [
+    "/sys/class/backlight/panel/brightness",
+    "/sys/class/backlight/pwm-backlight/brightness",
+];
+
+fn write_backlight(v: usize) {
+    let val = format!("{}\n", v.min(255));
+    for p in BACKLIGHT_PATHS {
+        let _ = fs::write(p, val.as_bytes());
+    }
+}
 
 // ── Layout design system (dark retro-HUD) ──────────────────────────────
 const MARGIN: usize = 16;        // outer screen margin
@@ -1118,14 +1135,7 @@ fn set_display_hardware(enable: bool) {
     let val = if enable { "0\n" } else { "4\n" };
     let _ = fs::write(power_path, val);
 
-    let bl_val = if enable { "180\n" } else { "0\n" };
-    let backlight_paths = [
-        "/sys/class/backlight/panel/brightness",
-        "/sys/class/backlight/pwm-backlight/brightness",
-    ];
-    for path in &backlight_paths {
-        let _ = fs::write(path, bl_val);
-    }
+    write_backlight(if enable { BRIGHTNESS.load(Ordering::Relaxed) } else { 0 });
 }
 
 /// Traffic-light accent colour for charge/health values.
@@ -1504,7 +1514,7 @@ const KB_ROWS: &[&[KKey]] = &[
 const KB_U: usize = 56;      // key unit width
 const KB_GAP: usize = 6;
 const KB_H: usize = 44;
-const KB_TOP: usize = 276;
+const KB_TOP: usize = 300;
 const KB_ROW_GAP: usize = 8;
 
 /// Bounding box (x, y, w, h) of the key at (row, col).
@@ -1537,9 +1547,8 @@ fn shift_char(c: char) -> char {
     }
 }
 
-fn draw_keyboard(fb: &mut Framebuffer, editing_label: &str) {
-    fb.draw_rect(0, KB_TOP - 28, FB_WIDTH, FB_HEIGHT - (KB_TOP - 28), theme().bg);
-    fb.draw_text(MARGIN, KB_TOP - 22, &format!("Editing: {}", editing_label), theme().text_muted, 1);
+fn draw_keyboard(fb: &mut Framebuffer) {
+    fb.draw_rect(0, KB_TOP - 6, FB_WIDTH, FB_HEIGHT - (KB_TOP - 6), theme().bg);
 
     for (r, keys) in KB_ROWS.iter().enumerate() {
         for (c, key) in keys.iter().enumerate() {
@@ -1585,11 +1594,20 @@ fn wifi_form() -> &'static Mutex<WifiForm> {
 const SET_X: usize = 200;
 const SET_FIELD_BX: usize = SET_X + 130;
 const SET_FIELD_BW: usize = FB_WIDTH - SET_FIELD_BX - MARGIN;
-const SET_SSID_Y: usize = 96;
-const SET_PSK_Y: usize = 150;
-const SET_BTN_Y: usize = 210;
-const SET_BTN_W: usize = 200;
-const SET_BTN_H: usize = 32;
+const SET_BTN_W: usize = 36;
+const SET_BTN_H: usize = 24;
+const SET_MINUS_X: usize = SET_X + 140;
+const SET_BAR_X: usize = SET_MINUS_X + SET_BTN_W + 8;
+const SET_BAR_W: usize = 300;
+const SET_PLUS_X: usize = SET_BAR_X + SET_BAR_W + 8;
+const SET_Y_BRIGHT: usize = 78;
+const SET_Y_SLEEP: usize = 108;
+const SET_Y_VOLUME: usize = 156;
+const SET_Y_SSID: usize = 204;
+const SET_Y_PSK: usize = 234;
+const SET_Y_CONNECT: usize = 264;
+const SET_CONNECT_W: usize = 160;
+const SET_CONNECT_H: usize = 28;
 
 fn draw_field(fb: &mut Framebuffer, y: usize, label: &str, value: &str, focused: bool, editing: bool) {
     fb.draw_text(SET_X, y, label, theme().text_muted, 1);
@@ -1616,6 +1634,22 @@ fn draw_button(fb: &mut Framebuffer, x: usize, y: usize, w: usize, h: usize, lab
     fb.draw_text(x + w.saturating_sub(label.len() * 8) / 2, y + h.saturating_sub(16) / 2, label, fg, 1);
 }
 
+fn draw_slider(fb: &mut Framebuffer, y: usize, label: &str, value: usize, max: usize) {
+    fb.draw_text(SET_X, y, label, theme().text_muted, 1);
+    draw_button(fb, SET_MINUS_X, y - 4, SET_BTN_W, SET_BTN_H, "-", false);
+    fb.draw_rect(SET_BAR_X, y, SET_BAR_W, 16, theme().border);
+    let fill = (value.min(max) * (SET_BAR_W - 4)) / max.max(1);
+    fb.draw_rect(SET_BAR_X + 2, y + 2, fill, 12, theme().accent);
+    draw_button(fb, SET_PLUS_X, y - 4, SET_BTN_W, SET_BTN_H, "+", false);
+}
+
+fn draw_stepper(fb: &mut Framebuffer, y: usize, label: &str, value: &str) {
+    fb.draw_text(SET_X, y, label, theme().text_muted, 1);
+    draw_button(fb, SET_MINUS_X, y - 4, SET_BTN_W, SET_BTN_H, "-", false);
+    fb.draw_text(SET_BAR_X, y, value, theme().text, 1);
+    draw_button(fb, SET_PLUS_X, y - 4, SET_BTN_W, SET_BTN_H, "+", false);
+}
+
 fn render_settings(fb: &mut Framebuffer) {
     let (ssid, psk_mask, focus, editing, status) = match wifi_form().lock() {
         Ok(f) => (f.ssid.clone(), "*".repeat(f.psk.chars().count()), f.focus, f.editing, f.status.clone()),
@@ -1625,19 +1659,27 @@ fn render_settings(fb: &mut Framebuffer) {
     let hint = if editing { "[BACK] Done" } else { "[HOME] Edit" };
     draw_topbar(fb, "SETTINGS", hint);
 
-    fb.draw_text(SET_X, 66, "WI-FI NETWORK", theme().warn, 1);
-    draw_field(fb, SET_SSID_Y, "SSID", &ssid, focus == 0, editing && focus == 0);
-    draw_field(fb, SET_PSK_Y, "Password", &psk_mask, focus == 1, editing && focus == 1);
-    draw_button(fb, SET_FIELD_BX, SET_BTN_Y, SET_BTN_W, SET_BTN_H, "Connect", focus == 2);
+    fb.draw_text(SET_X, 56, "DISPLAY", theme().warn, 1);
+    draw_slider(fb, SET_Y_BRIGHT, "Brightness", BRIGHTNESS.load(Ordering::Relaxed), 255);
+    let sleep = SLEEP_SECS.load(Ordering::Relaxed);
+    let sleep_str = if sleep == 0 { "Off".to_string() } else { format!("{}s", sleep) };
+    draw_stepper(fb, SET_Y_SLEEP, "Auto-sleep", &sleep_str);
 
-    if !status.is_empty() {
-        fb.draw_text(SET_X, 262, &status, theme().info, 1);
-    }
+    fb.draw_text(SET_X, 128, "AUDIO", theme().warn, 1);
+    fb.draw_text(SET_X, SET_Y_VOLUME, "Volume", theme().text_muted, 1);
+    fb.draw_text(SET_FIELD_BX, SET_Y_VOLUME, "n/d (codec sem mixer)", theme().text_dim, 1);
+
+    fb.draw_text(SET_X, 180, "WI-FI", theme().warn, 1);
+    draw_field(fb, SET_Y_SSID, "SSID", &ssid, focus == 0, editing && focus == 0);
+    draw_field(fb, SET_Y_PSK, "Password", &psk_mask, focus == 1, editing && focus == 1);
+    draw_button(fb, SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H, "Connect", focus == 2);
 
     if editing {
-        let label = if focus == 0 { "SSID" } else { "Password" };
-        draw_keyboard(fb, label);
+        draw_keyboard(fb);
     } else {
+        if !status.is_empty() {
+            fb.draw_text(SET_X, 308, &status, theme().info, 1);
+        }
         draw_hint_footer(fb, "[VOL+] Field   [VOL-] Field   [HOME] Edit/Connect   [BACK] Menu");
     }
 }
@@ -1738,13 +1780,38 @@ fn keyboard_tap(sx: usize, sy: usize) -> bool {
     false
 }
 
+/// Cycle the auto-sleep timeout through a fixed set of values.
+fn cycle_sleep(dir: i32) {
+    const VALUES: [usize; 5] = [0, 30, 60, 120, 300];
+    let cur = SLEEP_SECS.load(Ordering::Relaxed);
+    let idx = VALUES.iter().position(|&v| v == cur).unwrap_or(3);
+    let next = ((idx as i32 + dir).rem_euclid(VALUES.len() as i32)) as usize;
+    SLEEP_SECS.store(VALUES[next], Ordering::Relaxed);
+    save_display_config();
+}
+
 fn settings_tap(sx: usize, sy: usize) {
     let in_rect = |x: usize, y: usize, w: usize, h: usize| sx >= x && sx < x + w && sy >= y && sy < y + h;
-    if in_rect(SET_FIELD_BX, SET_SSID_Y - 4, SET_FIELD_BW, 24) {
+
+    if in_rect(SET_MINUS_X, SET_Y_BRIGHT - 4, SET_BTN_W, SET_BTN_H) {
+        let v = BRIGHTNESS.load(Ordering::Relaxed).saturating_sub(16).max(8);
+        BRIGHTNESS.store(v, Ordering::Relaxed);
+        write_backlight(v);
+        save_display_config();
+    } else if in_rect(SET_PLUS_X, SET_Y_BRIGHT - 4, SET_BTN_W, SET_BTN_H) {
+        let v = (BRIGHTNESS.load(Ordering::Relaxed) + 16).min(255);
+        BRIGHTNESS.store(v, Ordering::Relaxed);
+        write_backlight(v);
+        save_display_config();
+    } else if in_rect(SET_MINUS_X, SET_Y_SLEEP - 4, SET_BTN_W, SET_BTN_H) {
+        cycle_sleep(-1);
+    } else if in_rect(SET_PLUS_X, SET_Y_SLEEP - 4, SET_BTN_W, SET_BTN_H) {
+        cycle_sleep(1);
+    } else if in_rect(SET_FIELD_BX, SET_Y_SSID - 4, SET_FIELD_BW, 24) {
         if let Ok(mut f) = wifi_form().lock() { f.focus = 0; f.editing = true; }
-    } else if in_rect(SET_FIELD_BX, SET_PSK_Y - 4, SET_FIELD_BW, 24) {
+    } else if in_rect(SET_FIELD_BX, SET_Y_PSK - 4, SET_FIELD_BW, 24) {
         if let Ok(mut f) = wifi_form().lock() { f.focus = 1; f.editing = true; }
-    } else if in_rect(SET_FIELD_BX, SET_BTN_Y, SET_BTN_W, SET_BTN_H) {
+    } else if in_rect(SET_FIELD_BX, SET_Y_CONNECT, SET_CONNECT_W, SET_CONNECT_H) {
         if let Ok(mut f) = wifi_form().lock() { f.focus = 2; }
         wifi_submit();
     }
@@ -1757,12 +1824,13 @@ fn apply_menu_action(action: MenuAction) -> Option<usize> {
         MenuAction::ToggleTheme => {
             let next = (THEME_IDX.load(Ordering::Relaxed) + 1) % THEME_COUNT;
             THEME_IDX.store(next, Ordering::Relaxed);
+            save_display_config();
             None
         }
         MenuAction::ToggleEffects => {
-            let all = EFFECT_SCANLINES | EFFECT_VIGNETTE | EFFECT_FLICKER;
-            let next = if EFFECTS.load(Ordering::Relaxed) != 0 { 0 } else { all };
+            let next = if EFFECTS.load(Ordering::Relaxed) != 0 { 0 } else { EFFECT_ALL };
             EFFECTS.store(next, Ordering::Relaxed);
+            save_display_config();
             None
         }
     }
@@ -1821,7 +1889,8 @@ fn load_display_config() {
             }
             "scanlines" => set_effect(EFFECT_SCANLINES, parse_flag(val)),
             "vignette" => set_effect(EFFECT_VIGNETTE, parse_flag(val)),
-            "flicker" => set_effect(EFFECT_FLICKER, parse_flag(val)),
+            "brightness" => if let Ok(n) = val.parse() { BRIGHTNESS.store(n, Ordering::Relaxed); },
+            "sleep" => if let Ok(n) = val.parse() { SLEEP_SECS.store(n, Ordering::Relaxed); },
             _ => {}
         }
     });
@@ -1837,6 +1906,20 @@ fn load_display_config() {
             f.editing = true;
         }
     }
+}
+
+/// Persist the current theme/effects/brightness/sleep to the config file.
+fn save_display_config() {
+    let e = EFFECTS.load(Ordering::Relaxed);
+    let content = format!(
+        "# Kururu display config (managed; env KURURU_THEME overrides theme)\ntheme={}\nscanlines={}\nvignette={}\nbrightness={}\nsleep={}\n",
+        theme().key,
+        e & EFFECT_SCANLINES != 0,
+        e & EFFECT_VIGNETTE != 0,
+        BRIGHTNESS.load(Ordering::Relaxed),
+        SLEEP_SECS.load(Ordering::Relaxed),
+    );
+    let _ = fs::write("/etc/kururu-display.conf", content);
 }
 
 /// Vignette brightness mask (0..=255), computed once.
@@ -1859,8 +1942,8 @@ fn vignette_mask() -> &'static [u8] {
     })
 }
 
-/// Cheap CRT post-process on the BGRA buffer: scanlines + vignette + flicker in
-/// a single pass. Runs once per rendered frame.
+/// Cheap CRT post-process on the BGRA buffer: scanlines + vignette in a single
+/// pass. Runs once per rendered frame.
 fn apply_crt_effects(fb: &mut Framebuffer) {
     let effects = EFFECTS.load(Ordering::Relaxed);
     if effects == 0 {
@@ -1868,13 +1951,10 @@ fn apply_crt_effects(fb: &mut Framebuffer) {
     }
     let scan = effects & EFFECT_SCANLINES != 0;
     let vign = effects & EFFECT_VIGNETTE != 0;
-    let flick = effects & EFFECT_FLICKER != 0;
-    let flick_f = if flick { 95 + flicker_phase() } else { 100 };
     let mask = if vign { vignette_mask() } else { &[] };
 
     for y in 0..FB_HEIGHT {
-        let row_f = if scan && (y & 1) == 1 { 72 } else { 100 };
-        let f_base = row_f * flick_f / 100;
+        let f_base = if scan && (y & 1) == 1 { 72 } else { 100 };
         let row_off = y * FB_STRIDE;
         let mrow = y * FB_WIDTH;
         for x in 0..FB_WIDTH {
@@ -1891,15 +1971,6 @@ fn apply_crt_effects(fb: &mut Framebuffer) {
             fb.buffer[off + 2] = (fb.buffer[off + 2] as u32 * f / 100) as u8;
         }
     }
-}
-
-/// Slow flicker phase (0..=5) from the wall clock.
-fn flicker_phase() -> u32 {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    ((ms / 130) % 6) as u32
 }
 
 // -------------------------------------------------------------
@@ -2199,7 +2270,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.2 (on-screen keyboard + Settings/Wi-Fi)...");
+    println!("[Kururu Display Daemon] Starting v2.3 (Settings: brightness/sleep, keyboard, themes)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -2460,9 +2531,10 @@ fn main() {
                 last_awake_time = Instant::now();
             }
 
-            // Check auto-sleep timeout (120 seconds of inactivity)
-            if last_awake_time.elapsed() > Duration::from_secs(120) {
-                println!("[Kururu Display] Inactivity timeout (120s) -> Sleeping display");
+            // Check auto-sleep timeout (0 = never)
+            let sleep_secs = SLEEP_SECS.load(Ordering::Relaxed) as u64;
+            if sleep_secs > 0 && last_awake_time.elapsed() > Duration::from_secs(sleep_secs) {
+                println!("[Kururu Display] Inactivity timeout ({}s) -> Sleeping display", sleep_secs);
                 set_display_hardware(false);
                 screen_active.store(false, Ordering::SeqCst);
                 was_active = false;
