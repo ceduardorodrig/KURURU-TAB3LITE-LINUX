@@ -237,6 +237,8 @@ struct SystemInfo {
     logs: Vec<String>,
     wol_logs: Vec<String>,
     wol_daemon_running: bool,
+    wol_target1_mac: String,
+    wol_target2_mac: String,
     time_str: String,
     date_str: String,
     day_name: String,
@@ -400,7 +402,7 @@ fn gather_system_info() -> SystemInfo {
     }
 
     let mut wifi_ssid = "Cratos".to_string();
-    let mut wifi_mac = "00:50:43:02:fe:01".to_string();
+    let mut wifi_mac = "00:50:43:XX:XX:XX".to_string();
     if let Ok(output) = Command::new("wpa_cli").arg("status").output() {
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
@@ -586,6 +588,26 @@ fn gather_system_info() -> SystemInfo {
         }
     };
 
+    let (wol_target1_mac, wol_target2_mac) = {
+        let mut psi = "d0:94:66:••:••:58".to_string();
+        let mut kav = "d0:94:66:••:••:c4".to_string();
+        if let Ok(content) = fs::read_to_string("/etc/kururu-wake.conf") {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    let k_clean = k.trim().to_lowercase();
+                    let v_clean = v.trim().trim_matches('"').trim_matches('\'');
+                    if k_clean == "psicopompo" {
+                        psi = v_clean.to_string();
+                    } else if k_clean == "kavure" {
+                        kav = v_clean.to_string();
+                    }
+                }
+            }
+        }
+        (psi, kav)
+    };
+
     SystemInfo {
         hostname,
         kernel_version,
@@ -615,6 +637,8 @@ fn gather_system_info() -> SystemInfo {
         logs,
         wol_logs,
         wol_daemon_running: check_wol_daemon(),
+        wol_target1_mac,
+        wol_target2_mac,
         time_str,
         date_str,
         day_name,
@@ -881,10 +905,10 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
         ("Daemon Status:", daemon_label, daemon_color),
         ("Broadcast Target:", "192.168.3.255:9 (mlan0 direct AP)", TEXT_WHITE),
         ("Target 1 (Host):", "Psicopompo (Workstation & Gaming)", TEXT_WHITE),
-        ("Target 1 (MAC):", "d0:94:66:de:8b:58", TEXT_AMBER),
+        ("Target 1 (MAC):", info.wol_target1_mac.as_str(), TEXT_AMBER),
         ("Target 1 (URI):", "http://kururu:9096/wake/psicopompo", TEXT_CYAN),
         ("Target 2 (Host):", "Kavure (Services & Microserver)", TEXT_WHITE),
-        ("Target 2 (MAC):", "d0:94:66:ad:f3:c4", TEXT_AMBER),
+        ("Target 2 (MAC):", info.wol_target2_mac.as_str(), TEXT_AMBER),
         ("Target 2 (URI):", "http://kururu:9096/wake/kavure", TEXT_CYAN),
         ("Transmission:", "Layer 2 Magic Packet Burst (5x / 25ms)", TEXT_GRAY),
     ];

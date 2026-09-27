@@ -1,16 +1,18 @@
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
-const PSICOPOMPO_MAC: [u8; 6] = [0xd0, 0x94, 0x66, 0xde, 0x8b, 0x58];
-const KAVURE_MAC: [u8; 6] = [0xd0, 0x94, 0x66, 0xad, 0xf3, 0xc4];
-
 const BROADCAST_ADDRS: [&str; 2] = [
     "192.168.3.255:9",
     "255.255.255.255:9",
+];
+
+const CONFIG_PATHS: [&str; 2] = [
+    "/etc/kururu-wake.conf",
+    "/etc/wol-relay.env",
 ];
 
 const LOG_FILE: &str = "/var/log/kururu-wol.log";
@@ -40,6 +42,49 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+fn resolve_target_mac(target: &str) -> Option<[u8; 6]> {
+    let lower = target.to_lowercase();
+
+    // 1. Check environment variable (e.g. WOL_PSICOPOMPO_MAC)
+    let env_var = format!("WOL_{}_MAC", lower.to_uppercase());
+    if let Ok(val) = env::var(&env_var) {
+        if let Some(mac) = parse_mac(&val) {
+            return Some(mac);
+        }
+    }
+
+    // 2. Check configuration files (/etc/kururu-wake.conf or /etc/wol-relay.env)
+    for path in &CONFIG_PATHS {
+        if let Ok(content) = fs::read_to_string(path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') || trimmed.is_empty() {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    let k_clean = k.trim().to_lowercase();
+                    let v_clean = v.trim().trim_matches('"').trim_matches('\'');
+                    if k_clean == lower
+                        || k_clean == format!("wol_{}_mac", lower)
+                        || k_clean == format!("{}_mac", lower)
+                    {
+                        if let Some(mac) = parse_mac(v_clean) {
+                            return Some(mac);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: Parse target directly if it is a raw MAC address
+    if let Some(mac) = parse_mac(target) {
+        return Some(mac);
+    }
+
+    None
 }
 
 fn send_magic_packet(mac: [u8; 6], target_name: &str) -> Result<(), String> {
@@ -107,20 +152,16 @@ fn handle_http_client(mut stream: TcpStream) {
 
     if path.starts_with("/wake/") {
         let target = &path[6..].trim_end_matches('/');
-        let (mac, name) = match target.to_lowercase().as_str() {
-            "psicopompo" => (Some(PSICOPOMPO_MAC), "psicopompo"),
-            "kavure" => (Some(KAVURE_MAC), "kavure"),
-            other => (parse_mac(other), "custom_target"),
-        };
+        let mac = resolve_target_mac(target);
 
         if let Some(mac_bytes) = mac {
-            let res = send_magic_packet(mac_bytes, name);
+            let res = send_magic_packet(mac_bytes, target);
             let (status_code, body) = match res {
                 Ok(_) => (
                     "200 OK",
                     format!(
                         r#"{{"status":"ok","target":"{}","mac":"{}","emitted":true}}"#,
-                        name,
+                        target,
                         format_mac(mac_bytes)
                     ),
                 ),
@@ -138,30 +179,24 @@ fn handle_http_client(mut stream: TcpStream) {
             );
             let _ = stream.write_all(response.as_bytes());
         } else {
-            let body = r#"{"status":"error","message":"Invalid target or MAC address"}"#;
+            let body = format!(
+                r#"{{"status":"error","message":"Target '{}' not found in /etc/kururu-wake.conf and is not a valid MAC"}}"#,
+                target
+            );
             let response = format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             let _ = stream.write_all(response.as_bytes());
         }
-        return;
     }
-
-    let body = r#"{"status":"error","message":"Not found"}"#;
-    let response = format!(
-        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes());
 }
 
 fn run_daemon(port: u16) {
     let bind_addr = format!("0.0.0.0:{}", port);
     log_action(&format!(
-        "[Kururu WOL Daemon] Starting HTTP Relay listening on http://{}...",
+        "[Kururu WOL Daemon] Starting HTTP listener on {}...",
         bind_addr
     ));
 
@@ -183,12 +218,12 @@ fn run_daemon(port: u16) {
 }
 
 fn print_usage() {
-    println!("Kururu Wake-on-LAN (WOL) Tool v1.0");
+    println!("Kururu Wake-on-LAN (WOL) Tool v1.1");
     println!("Usage:");
-    println!("  kururu-wake psicopompo            Send Magic Packet to Psicopompo");
-    println!("  kururu-wake kavure                Send Magic Packet to Kavure");
-    println!("  kururu-wake <MAC_ADDRESS>         Send Magic Packet to arbitrary MAC");
-    println!("  kururu-wake --daemon [PORT]       Run HTTP WOL Relay daemon (default: 9096)");
+    println!("  kururu-wake <HOSTNAME|MAC>         Send Magic Packet to configured target or MAC");
+    println!("  kururu-wake --daemon [PORT]        Run HTTP WOL Relay daemon (default: 9096)");
+    println!("\nConfiguration:");
+    println!("  Targets are mapped in /etc/kururu-wake.conf (e.g. host=aa:bb:cc:dd:ee:ff)");
 }
 
 fn main() {
@@ -210,26 +245,17 @@ fn main() {
                 .unwrap_or(9096);
             run_daemon(port);
         }
-        "psicopompo" => {
-            if let Err(e) = send_magic_packet(PSICOPOMPO_MAC, "psicopompo") {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        "kavure" => {
-            if let Err(e) = send_magic_packet(KAVURE_MAC, "kavure") {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        custom => {
-            if let Some(mac) = parse_mac(custom) {
-                if let Err(e) = send_magic_packet(mac, custom) {
+        target => {
+            if let Some(mac) = resolve_target_mac(target) {
+                if let Err(e) = send_magic_packet(mac, target) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             } else {
-                eprintln!("Error: Unknown target or invalid MAC address '{}'", custom);
+                eprintln!(
+                    "Error: Target '{}' not resolved in /etc/kururu-wake.conf and not a valid MAC",
+                    target
+                );
                 eprintln!("Run 'kururu-wake --help' for usage.");
                 std::process::exit(1);
             }

@@ -165,8 +165,7 @@ A native, sovereign Wake-on-LAN (WoL) burst relay and HTTP daemon written in Rus
 * **CLI & HTTP Endpoints:**
   - CLI: `kururu-wake psicopompo`, `kururu-wake kavure`, or custom MAC.
   - HTTP Daemon (port `9096`):
-    - `GET /wake/psicopompo` → Emits burst of 5 magic packets to `d0:94:66:de:8b:58`.
-    - `GET /wake/kavure` → Emits burst of 5 magic packets to `d0:94:66:ad:f3:c4`.
+    - `GET /wake/<target_host>` → Emits burst of 5 magic packets to the configured target MAC (e.g. `d0:94:66:XX:XX:XX`).
     - `GET /health` → Real-time status probe.
 
 ---
