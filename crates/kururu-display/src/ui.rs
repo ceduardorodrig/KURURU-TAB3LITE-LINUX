@@ -1,430 +1,320 @@
-//! ratatui integration for the app shell.
+//! App shell screens (Menu / About / Settings / Wi-Fi form / Terminal).
 //!
-//! The backend renders ratatui cells at **scale 2** (16×32 px) so text and
-//! touch targets are large (Material recommends ≥48×48 dp with ≥8 dp gaps;
-//! here each cell is 16×32 and key targets are 64×64). Dashboards and the
-//! terminal grid remain pixel-rendered.
+//! Rendered entirely with the shared pixel design system in [`crate::kit`],
+//! so the shell and the dashboards share one visual identity. Every screen
+//! exposes the rectangles it draws through the same constants used by the
+//! hit-tests below.
 
-use std::io;
-use std::sync::{Mutex, OnceLock};
+use crate::kit::{self, CONTENT_W, MARGIN};
+use crate::{theme, Framebuffer, MenuAction, EFFECTS, MENU_ITEMS};
 
-use ratatui::backend::{Backend, ClearType, WindowSize};
-use ratatui::buffer::Cell;
-use ratatui::layout::{Alignment, Position, Rect, Size};
-use ratatui::style::{Color as RColor, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph};
-use ratatui::{Frame, Terminal};
+// ── Menu ───────────────────────────────────────────────────────────────
+const MENU_CARD_Y: usize = 132;
+const MENU_LIST_Y: usize = 172;
+const MENU_PITCH: usize = 64;
+const MENU_ROW_H: usize = 56;
+const MENU_ROW_X: usize = 28;
+const MENU_ROW_W: usize = CONTENT_W - 2 * kit::PAD;
 
-use crate::font::{FONT_DATA, FONT_HEIGHT, FONT_WIDTH};
-use crate::{theme, Color, Framebuffer, Key, MenuAction, EFFECTS, MENU_ITEMS, FB_HEIGHT, FB_WIDTH};
-
-/// Cell size in pixels (scale 2 of the 8×16 font).
-const CELL_W: usize = FONT_WIDTH * 2;
-const CELL_H: usize = FONT_HEIGHT * 2;
-pub const COLS: u16 = (FB_WIDTH / CELL_W) as u16;
-pub const ROWS: u16 = (FB_HEIGHT / CELL_H) as u16;
-
-/// First ratatui cell row of the on-screen keyboard (keys are 2 cells = 64px).
-pub const KB_CELL_Y0: u16 = 8;
-/// Pixel Y where the keyboard starts (exported for the terminal grid geometry).
-pub const KB_TOP_PX: usize = KB_CELL_Y0 as usize * CELL_H;
-const KB_KEY_H: usize = 2;
-/// One keyboard width "unit" is this many cells (each row totals 16 units = 64 cells).
-const KB_CELL_UNIT: u16 = 4;
-const KB_ROWS_N: u16 = 5;
-
-// -------------------------------------------------------------
-// Backend
-// -------------------------------------------------------------
-pub struct FbBackend {
-    buf: Vec<u8>,
-}
-
-impl FbBackend {
-    fn new() -> Self {
-        Self { buf: vec![0; FB_WIDTH * FB_HEIGHT * 4] }
-    }
-    pub fn pixels(&self) -> &[u8] {
-        &self.buf
-    }
-    fn put(&mut self, x: usize, y: usize, c: Color) {
-        if x >= FB_WIDTH || y >= FB_HEIGHT {
-            return;
-        }
-        let o = y * FB_WIDTH * 4 + x * 4;
-        self.buf[o] = c.b;
-        self.buf[o + 1] = c.g;
-        self.buf[o + 2] = c.r;
-        self.buf[o + 3] = 255;
-    }
-    fn fill(&mut self, x0: usize, y0: usize, w: usize, h: usize, c: Color) {
-        for y in y0..(y0 + h).min(FB_HEIGHT) {
-            for x in x0..(x0 + w).min(FB_WIDTH) {
-                self.put(x, y, c);
-            }
-        }
-    }
-    /// Draw a glyph at scale 2 (each font pixel becomes a 2×2 block).
-    fn glyph(&mut self, x0: usize, y0: usize, ch: char, fg: Color) {
-        let code = (ch as usize).min(127);
-        let bitmap = &FONT_DATA[code];
-        for row in 0..FONT_HEIGHT {
-            let byte = bitmap[row];
-            for col in 0..FONT_WIDTH {
-                if (byte & (1 << (7 - col))) != 0 {
-                    let px = x0 + col * 2;
-                    let py = y0 + row * 2;
-                    self.put(px, py, fg);
-                    self.put(px + 1, py, fg);
-                    self.put(px, py + 1, fg);
-                    self.put(px + 1, py + 1, fg);
-                }
-            }
-        }
-    }
-    fn put_cell(&mut self, x: u16, y: u16, cell: &Cell) {
-        let t = theme();
-        let reversed = cell.modifier.contains(Modifier::REVERSED);
-        let mut fg = if matches!(cell.fg, RColor::Reset) { t.text } else { map_color(cell.fg) };
-        let mut bg = if matches!(cell.bg, RColor::Reset | RColor::Black) { t.bg } else { map_color(cell.bg) };
-        if reversed {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        let px = x as usize * CELL_W;
-        let py = y as usize * CELL_H;
-        self.fill(px, py, CELL_W, CELL_H, bg);
-
-        let sym = cell.symbol();
-        match sym.chars().next() {
-            Some('█') | Some('▉') | Some('▊') | Some('▋') | Some('▌') | Some('▍') | Some('▎') | Some('▏') => {
-                self.fill(px, py, CELL_W, CELL_H, fg);
-            }
-            Some(ch) => {
-                if ch != ' ' {
-                    self.glyph(px, py, map_glyph(ch), fg);
-                }
-            }
-            None => {}
-        }
-    }
-}
-
-impl Backend for FbBackend {
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
-    where
-        I: Iterator<Item = (u16, u16, &'a Cell)>,
-    {
-        for (x, y, cell) in content {
-            self.put_cell(x, y, cell);
-        }
-        Ok(())
-    }
-    fn hide_cursor(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-    fn show_cursor(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Ok(Position::new(0, 0))
-    }
-    fn set_cursor_position<P: Into<Position>>(&mut self, _p: P) -> io::Result<()> {
-        Ok(())
-    }
-    fn clear(&mut self) -> io::Result<()> {
-        let bg = theme().bg;
-        self.fill(0, 0, FB_WIDTH, FB_HEIGHT, bg);
-        Ok(())
-    }
-    fn clear_region(&mut self, _c: ClearType) -> io::Result<()> {
-        self.clear()
-    }
-    fn size(&self) -> io::Result<Size> {
-        Ok(Size::new(COLS, ROWS))
-    }
-    fn window_size(&mut self) -> io::Result<WindowSize> {
-        Ok(WindowSize {
-            columns_rows: Size::new(COLS, ROWS),
-            pixels: Size::new(FB_WIDTH as u16, FB_HEIGHT as u16),
-        })
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-pub fn rc(c: Color) -> RColor {
-    RColor::Rgb(c.r, c.g, c.b)
-}
-
-fn map_color(c: RColor) -> Color {
+pub fn menu(fb: &mut Framebuffer, cursor: usize) {
     let t = theme();
-    match c {
-        RColor::Rgb(r, g, b) => Color { r, g, b, a: 255 },
-        RColor::Black => t.bg,
-        RColor::Red => t.error,
-        RColor::Green => t.accent,
-        RColor::Yellow => t.warn,
-        RColor::Cyan | RColor::LightCyan => t.info,
-        RColor::Reset | RColor::Gray | RColor::DarkGray | RColor::White => t.text,
-        _ => t.text,
-    }
-}
-
-fn map_glyph(ch: char) -> char {
-    match ch {
-        '─' | '━' | '═' | '╌' | '┄' | '┈' => '-',
-        '│' | '┃' | '║' | '╎' | '┆' | '┊' => '|',
-        '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼' | '╭' | '╮' | '╰' | '╯' | '╔'
-        | '╗' | '╚' | '╝' | '╠' | '╣' | '╦' | '╩' | '╬' => '+',
-        '▶' | '►' | '»' | '›' => '>',
-        '◀' | '◄' | '«' | '‹' => '<',
-        '▲' => '^',
-        '▼' => 'v',
-        '•' | '●' | '·' => '*',
-        '✓' | '✔' => '+',
-        '✗' | '✘' => 'x',
-        c if c.is_ascii() => c,
-        _ => '?',
-    }
-}
-
-// -------------------------------------------------------------
-// Terminal (ratatui)
-// -------------------------------------------------------------
-static UI: OnceLock<Mutex<Option<Terminal<FbBackend>>>> = OnceLock::new();
-
-pub fn render(fb: &mut Framebuffer, draw: impl FnOnce(&mut Frame)) {
-    let m = UI.get_or_init(|| match Terminal::new(FbBackend::new()) {
-        Ok(t) => Mutex::new(Some(t)),
-        Err(_) => Mutex::new(None),
-    });
-    if let Ok(mut guard) = m.lock() {
-        if let Some(t) = guard.as_mut() {
-            let _ = t.draw(|f| {
-                let full = f.area();
-                f.buffer_mut().set_style(full, Style::new().bg(rc(theme().bg)));
-                draw(f);
-            });
-            let px = t.backend().pixels();
-            fb.buffer.copy_from_slice(px);
-        }
-    }
-}
-
-// -------------------------------------------------------------
-// Widgets
-// -------------------------------------------------------------
-/// Two-row header: accent marker + title, right-aligned hint, bottom divider.
-fn topbar(f: &mut Frame, title: &str, hint: &str) {
-    let t = theme();
-    f.render_widget(Paragraph::new("").style(Style::new().bg(rc(t.panel))), Rect::new(0, 0, COLS, 2));
-    f.buffer_mut().set_string(0, 0, "##", Style::new().fg(rc(t.accent)).bg(rc(t.panel)));
-    f.buffer_mut().set_string(3, 0, title, Style::new().fg(rc(t.text)).bg(rc(t.panel)));
-    if !hint.is_empty() {
-        let w = hint.chars().count() as u16;
-        if w + 1 < COLS {
-            f.buffer_mut().set_string(COLS - w - 1, 1, hint, Style::new().fg(rc(t.text_muted)).bg(rc(t.panel)));
-        }
-    }
-    f.buffer_mut().set_style(Rect::new(0, 2, COLS, 1), Style::new().bg(rc(t.border)));
-}
-
-/// Section header line.
-fn section(f: &mut Frame, x: u16, y: u16, text: &str) {
-    f.buffer_mut().set_string(x, y, text, Style::new().fg(rc(theme().warn)));
-}
-
-pub fn menu(f: &mut Frame, cursor: usize) {
-    let t = theme();
-    topbar(f, "MENU", "[HOME] Select");
-
-    let brand = Paragraph::new(Line::from(vec![
-        Span::styled("KURURU", Style::new().fg(rc(t.accent)).add_modifier(Modifier::BOLD)),
-        Span::styled("   -   Mnemocine Homelab", Style::new().fg(rc(t.text_dim))),
-    ]))
-    .alignment(Alignment::Center);
-    f.render_widget(brand, Rect::new(0, 5, COLS, 1));
-
-    let items: Vec<ListItem> = MENU_ITEMS
-        .iter()
-        .map(|(label, action)| {
-            let text = match action {
-                MenuAction::ToggleTheme => format!("{}: {}", label, theme().name),
-                MenuAction::ToggleEffects => {
-                    let on = EFFECTS.load(std::sync::atomic::Ordering::Relaxed) != 0;
-                    format!("{}: {}", label, if on { "ON" } else { "OFF" })
-                }
-                MenuAction::Screen(_) => (*label).to_string(),
-            };
-            // Two cell rows per item → 64px touch target.
-            ListItem::new(Text::from(vec![Line::from(text), Line::from("")]))
-        })
-        .collect();
-
-    let mut state = ListState::default();
-    state.select(Some(cursor.min(MENU_ITEMS.len() - 1)));
-    let list = List::new(items)
-        .block(Block::new().title(" Navigation "))
-        .highlight_style(Style::new().fg(rc(t.accent)).bg(rc(t.panel_active)).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, Rect::new(2, 6, COLS - 4, (MENU_ITEMS.len() * 2) as u16), &mut state);
-}
-
-pub fn about(f: &mut Frame, lines: &[String]) {
-    let t = theme();
-    topbar(f, "ABOUT", "[BACK] Back");
-    let text: Vec<Line> = lines
-        .iter()
-        .flat_map(|l| vec![Line::from(Span::styled(l.clone(), Style::new().fg(rc(t.text_muted)))), Line::from("")])
-        .collect();
-    f.render_widget(Paragraph::new(text).alignment(Alignment::Center), Rect::new(0, 3, COLS, (lines.len() * 2 + 1) as u16));
-}
-
-/// Settings: two columns (display/audio | wi-fi) with large touch targets.
-pub fn settings(f: &mut Frame) {
-    let t = theme();
-    let editing = crate::wifi_editing();
-    topbar(f, "SETTINGS", if editing { "[BACK] Done" } else { "[HOME] Edit" });
-
-    // Left column (x 1..31), right column (x 33..63).
-    let lx = 1u16;
-    let lw = 30u16;
-    let rx = 33u16;
-    let rw = 30u16;
-
-    // ── Left: DISPLAY + AUDIO ──────────────────────────────────────────
-    section(f, lx, 3, "DISPLAY");
-    let br = crate::brightness_pct();
-    f.buffer_mut().set_string(lx, 4, &format!("Brightness {}%", (br * 100.0) as u32), Style::new().fg(rc(t.text)));
-    f.render_widget(
-        Gauge::default().ratio(br).label("").gauge_style(Style::new().fg(rc(t.accent)).bg(rc(t.border))),
-        Rect::new(lx, 5, lw, 1),
-    );
-    let sleep = crate::sleep_label();
-    f.render_widget(Paragraph::new(format!("Auto-sleep: {sleep}")), Rect::new(lx, 7, lw, 1));
-    f.buffer_mut().set_string(lx + lw - 7, 7, "[-] [+]", Style::new().fg(rc(t.accent)));
-    section(f, lx, 9, "AUDIO");
-    let vol = crate::volume_pct();
-    f.buffer_mut().set_string(lx, 10, &format!("Volume {}%", (vol * 100.0) as u32), Style::new().fg(rc(t.text)));
-    f.render_widget(
-        Gauge::default().ratio(vol).label("").gauge_style(Style::new().fg(rc(t.accent)).bg(rc(t.border))),
-        Rect::new(lx, 11, lw, 1),
+    kit::topbar(fb, "MENU", "[HOME] Select");
+    kit::footer(
+        fb,
+        &[("[HOME] Select", t.accent), ("[VOL] Navigate", t.info), ("[BACK] Back", t.text_muted)],
+        &[],
     );
 
-    // ── Right: WI-FI ───────────────────────────────────────────────────
-    let ssid = crate::wifi_selected_ssid();
-    let hdr = if ssid.is_empty() { "WI-FI".to_string() } else { format!("WI-FI > {ssid}") };
-    section(f, rx, 3, &hdr);
-    let nets = crate::wifi_nets();
-    let sel = crate::wifi_sel();
-    if nets.is_empty() {
-        f.render_widget(Paragraph::new("(procurando redes...)"), Rect::new(rx, 4, rw, 1));
-    } else if !editing {
-        let start = wifi_start(nets.len(), sel);
-        let items: Vec<ListItem> = nets
-            .iter()
-            .skip(start)
-            .take(SET_LIST_ROWS as usize)
-            .map(|(name, sig, _)| {
-                let conn = name == &crate::wifi_connected();
-                let mark = if conn { "*" } else { " " };
-                ListItem::new(Text::from(vec![
-                    Line::from(format!("{mark} {name}")),
-                    Line::from(format!("   {sig} dBm")),
-                ]))
-            })
-            .collect();
-        let mut state = ListState::default();
-        state.select(Some(sel.saturating_sub(start) as usize));
-        let list = List::new(items)
-            .highlight_style(Style::new().fg(rc(t.accent)).add_modifier(Modifier::BOLD))
-            .highlight_symbol("> ");
-        f.render_stateful_widget(list, Rect::new(rx, 4, rw, SET_LIST_ROWS * 2), &mut state);
-    }
-    let mask = crate::wifi_psk_mask();
-    f.render_widget(
-        Paragraph::new(format!("Password: {mask}")).style(Style::new().fg(rc(t.text)).bg(rc(t.panel_active))),
-        Rect::new(rx, 12, rw, 1),
-    );
-    f.render_widget(
-        Paragraph::new("[ CONNECT ]").style(Style::new().fg(rc(t.accent)).bg(rc(t.border)).add_modifier(Modifier::BOLD)),
-        Rect::new(rx, 14, rw, 1),
-    );
-    if !editing {
-        let status = crate::wifi_status();
-        if !status.is_empty() {
-            f.render_widget(Paragraph::new(status).style(Style::new().fg(rc(t.info))), Rect::new(rx, 16, rw, 1));
+    // Brand: big pixel frog beside the wordmark.
+    let scale = 4;
+    let (fw, _fh) = kit::frog_size(scale);
+    let word = "KURURU";
+    let word_w = word.len() * 24;
+    let total = fw + 16 + word_w;
+    let x0 = (crate::FB_WIDTH - total) / 2;
+    kit::frog(fb, x0, 68, scale);
+    fb.draw_text(x0 + fw + 16, 72, word, t.accent, 3);
+
+    kit::card(fb, MARGIN, MENU_CARD_Y, CONTENT_W, kit::CONTENT_BOTTOM - MENU_CARD_Y, None, "NAVIGATION", t.accent);
+
+    for (i, (label, action)) in MENU_ITEMS.iter().enumerate() {
+        let y = MENU_LIST_Y + i * MENU_PITCH;
+        let selected = i == cursor;
+        kit::row_bg(fb, MENU_ROW_X, y, MENU_ROW_W, MENU_ROW_H, selected);
+        if selected {
+            fb.draw_text(MENU_ROW_X + 10, y + 12, ">", t.accent, 2);
+        }
+        fb.draw_text(MENU_ROW_X + 40, y + 12, label, if selected { t.accent } else { t.text }, 2);
+        if let Some(value) = menu_value(*action) {
+            let vw = value.len() * 16;
+            fb.draw_text(MENU_ROW_X + MENU_ROW_W - 24 - vw, y + 12, &value, t.text_muted, 2);
         }
     }
 }
 
-/// Terminal screen chrome: topbar + keyboard (grid drawn pixel on top).
-pub fn terminal(f: &mut Frame) {
-    topbar(f, "TERMINAL", "[BACK] Back");
-    keyboard(f);
-}
-
-// Settings layout (in cells).
-const SET_LIST_ROWS: u16 = 3;
-
-pub fn wifi_start(nets_len: usize, sel: usize) -> usize {
-    let n = (SET_LIST_ROWS as usize).min(nets_len);
-    if n == 0 {
-        0
-    } else {
-        sel.saturating_sub(1).min(nets_len - n)
+fn menu_value(action: MenuAction) -> Option<String> {
+    match action {
+        MenuAction::ToggleTheme => Some(theme().name.to_string()),
+        MenuAction::ToggleEffects => {
+            let on = EFFECTS.load(std::sync::atomic::Ordering::Relaxed) != 0;
+            Some(if on { "ON".to_string() } else { "OFF".to_string() })
+        }
+        MenuAction::Screen(_) => None,
     }
 }
 
-/// Map a pixel position to a Menu item index (2-row items).
+/// Map a touch position to a Menu item index (same rows the renderer draws).
 pub fn menu_hit(px: usize, py: usize) -> Option<usize> {
-    let col = (px / CELL_W) as u16;
-    let row = (py / CELL_H) as u16;
-    let h = (MENU_ITEMS.len() * 2) as u16;
-    if col >= 2 && col < COLS - 2 && row >= 6 && row < 6 + h {
-        Some(((row - 6) / 2) as usize)
+    if px < MENU_ROW_X || px >= MENU_ROW_X + MENU_ROW_W || py < MENU_LIST_Y {
+        return None;
+    }
+    let idx = (py - MENU_LIST_Y) / MENU_PITCH;
+    if (py - MENU_LIST_Y) % MENU_PITCH < MENU_ROW_H && idx < MENU_ITEMS.len() {
+        Some(idx)
     } else {
         None
     }
 }
 
-pub fn settings_hit(sx: usize, sy: usize) -> Option<SettingsHit> {
-    let inside = |cx: u16, cy: u16, cw: u16, ch: u16, p: (usize, usize)| {
-        let r = (cx as usize * CELL_W, cy as usize * CELL_H, cw as usize * CELL_W, ch as usize * CELL_H);
-        p.0 >= r.0 && p.0 < r.0 + r.2 && p.1 >= r.1 && p.1 < r.1 + r.3
-    };
-    let p = (sx, sy);
-    let lx = 1u16;
-    let lw = 30u16;
-    let rx = 33u16;
-    let rw = 30u16;
+// ── About ──────────────────────────────────────────────────────────────
+pub fn about(fb: &mut Framebuffer, lines: &[String]) {
+    let t = theme();
+    kit::topbar(fb, "ABOUT", "[BACK] Back");
+    kit::footer(fb, &[("[BACK] Back", t.accent), ("[HOME] Menu", t.text_muted)], &[("v3.0", t.text_dim)]);
+    kit::card(fb, MARGIN, kit::CONTENT_Y, CONTENT_W, kit::CONTENT_H, None, "KURURU NODE", t.accent);
 
-    if inside(lx, 5, lw, 1, p) {
-        return Some(if sx < (lx as usize + lw as usize / 2) * CELL_W { SettingsHit::BrightDown } else { SettingsHit::BrightUp });
+    let scale = 4;
+    let (fw, fh) = kit::frog_size(scale);
+    kit::frog(fb, (crate::FB_WIDTH - fw) / 2, 116, scale);
+    let mut y = 116 + fh + 28;
+    for line in lines {
+        let w = line.len() * 16;
+        fb.draw_text((crate::FB_WIDTH - w) / 2, y, line, t.text_muted, 2);
+        y += 40;
     }
-    if inside(lx, 7, lw, 1, p) {
-        return Some(if sx < (lx as usize + lw as usize / 2) * CELL_W { SettingsHit::SleepPrev } else { SettingsHit::SleepNext });
+}
+
+// ── Settings ───────────────────────────────────────────────────────────
+// Left column: DISPLAY & AUDIO. Right column: WI-FI.
+const SET_LEFT_Y: usize = kit::CONTENT_Y;
+const SET_LEFT_H: usize = kit::CONTENT_H;
+const SET_WIFI_X: usize = kit::COL_B_X;
+const SET_INNER_X: usize = MARGIN + kit::PAD; // 28
+const SET_INNER_W: usize = kit::HALF_W - 2 * kit::PAD; // 464
+const SET_BRIGHT_ZONE: (usize, usize, usize, usize) = (28, 102, 464, 80);
+const SET_SLEEP_DOWN: (usize, usize, usize, usize) = (344, 190, 64, 48);
+const SET_SLEEP_UP: (usize, usize, usize, usize) = (416, 190, 64, 48);
+const SET_VOL_ZONE: (usize, usize, usize, usize) = (28, 250, 464, 80);
+const SET_EFFECTS_BTN: (usize, usize, usize, usize) = (200, 338, 160, 48);
+const SET_LIST_X: usize = 532;
+const SET_LIST_Y: usize = 150;
+const SET_LIST_W: usize = 464;
+const SET_LIST_PITCH: usize = 60;
+const SET_LIST_H: usize = 56;
+const SET_LIST_ROWS: usize = 5;
+
+fn effects_on() -> bool {
+    EFFECTS.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+pub fn settings(fb: &mut Framebuffer) {
+    let t = theme();
+    kit::topbar(fb, "SETTINGS", "[HOME] Rescan");
+    kit::footer(
+        fb,
+        &[("[HOME] Rescan", t.accent), ("[VOL] Navigate", t.info), ("[BACK] Back", t.text_muted)],
+        &[],
+    );
+
+    // ── DISPLAY & AUDIO (left column) ──────────────────────────────────
+    kit::card(fb, MARGIN, SET_LEFT_Y, kit::HALF_W, SET_LEFT_H, None, "DISPLAY & AUDIO", t.accent);
+
+    let br = crate::brightness_pct();
+    label_value(fb, SET_INNER_X, 106, SET_INNER_W, "Brightness", &format!("{}%", (br * 100.0) as u32), t);
+    kit::bar(fb, SET_INNER_X, 146, SET_INNER_W, 28, br, t.accent);
+
+    fb.draw_text(SET_INNER_X, 196, "Auto-sleep", t.text, 2);
+    fb.draw_text(260, 196, &crate::sleep_label(), t.text_muted, 2);
+    button(fb, SET_SLEEP_DOWN.0, SET_SLEEP_DOWN.1, SET_SLEEP_DOWN.2, SET_SLEEP_DOWN.3, "[-]", false);
+    button(fb, SET_SLEEP_UP.0, SET_SLEEP_UP.1, SET_SLEEP_UP.2, SET_SLEEP_UP.3, "[+]", false);
+
+    let vol = crate::volume_pct();
+    label_value(fb, SET_INNER_X, 254, SET_INNER_W, "Volume", &format!("{}%", (vol * 100.0) as u32), t);
+    kit::bar(fb, SET_INNER_X, 294, SET_INNER_W, 28, vol, t.accent);
+
+    fb.draw_text(SET_INNER_X, 344, "Effects", t.text, 2);
+    button(fb, SET_EFFECTS_BTN.0, SET_EFFECTS_BTN.1, SET_EFFECTS_BTN.2, SET_EFFECTS_BTN.3,
+           if effects_on() { "[ ON ]" } else { "[ OFF ]" }, effects_on());
+
+    // ── WI-FI (right column) ───────────────────────────────────────────
+    kit::card(fb, SET_WIFI_X, kit::CONTENT_Y, kit::HALF_W, kit::CONTENT_H, None, "WI-FI", t.accent);
+    let conn = crate::wifi_connected();
+    if !conn.is_empty() {
+        let sig = crate::wifi_signal();
+        let txt = if sig.is_empty() { format!("Connected: {conn}") } else { format!("Connected: {conn} ({sig})") };
+        fb.draw_text(SET_LIST_X, 106, &txt, t.accent, 1);
     }
-    if inside(lx, 11, lw, 1, p) {
-        return Some(if sx < (lx as usize + lw as usize / 2) * CELL_W { SettingsHit::VolDown } else { SettingsHit::VolUp });
+
+    let nets = crate::wifi_nets();
+    let sel = crate::wifi_sel();
+    if nets.is_empty() {
+        fb.draw_text(SET_LIST_X, 150, "(scanning networks...)", t.text_dim, 2);
+    } else {
+        let start = wifi_start(nets.len(), sel);
+        for (row, (name, signal, _)) in nets.iter().skip(start).take(SET_LIST_ROWS).enumerate() {
+            let y = SET_LIST_Y + row * SET_LIST_PITCH;
+            let selected = start + row == sel;
+            wifi_row(fb, y, name, *signal, name == &conn, selected);
+        }
+    }
+    let status = crate::wifi_status();
+    if !status.is_empty() {
+        fb.draw_text(SET_LIST_X, 476, &status, t.info, 1);
+    }
+}
+
+fn wifi_row(fb: &mut Framebuffer, y: usize, name: &str, signal: i32, connected: bool, selected: bool) {
+    let t = theme();
+    kit::row_bg(fb, SET_LIST_X, y, SET_LIST_W, SET_LIST_H, selected);
+    let mut nx = SET_LIST_X + 12;
+    if connected {
+        fb.draw_rect(SET_LIST_X + 12, y + 24, 8, 8, t.accent);
+    }
+    nx += 16;
+    if selected {
+        fb.draw_text(nx, y + 12, ">", t.accent, 2);
+        nx += 20;
+    }
+    fb.draw_text(nx, y + 12, name, if selected { t.accent } else { t.text }, 2);
+    let sig = format!("{signal} dBm");
+    let sw = sig.len() * 8;
+    fb.draw_text(SET_LIST_X + SET_LIST_W - 12 - sw, y + 20, &sig, t.text_muted, 1);
+}
+
+/// Left/right split touch zones for a two-direction control.
+fn split_hit(rect: (usize, usize, usize, usize), px: usize) -> bool {
+    px < rect.0 + rect.2 / 2
+}
+
+pub fn settings_hit(px: usize, py: usize) -> Option<SettingsHit> {
+    if inside(SET_BRIGHT_ZONE, px, py) {
+        return Some(if split_hit(SET_BRIGHT_ZONE, px) { SettingsHit::BrightDown } else { SettingsHit::BrightUp });
+    }
+    if inside(SET_SLEEP_DOWN, px, py) {
+        return Some(SettingsHit::SleepPrev);
+    }
+    if inside(SET_SLEEP_UP, px, py) {
+        return Some(SettingsHit::SleepNext);
+    }
+    if inside(SET_VOL_ZONE, px, py) {
+        return Some(if split_hit(SET_VOL_ZONE, px) { SettingsHit::VolDown } else { SettingsHit::VolUp });
+    }
+    if inside(SET_EFFECTS_BTN, px, py) {
+        return Some(SettingsHit::Effects);
     }
     let nets = crate::wifi_nets();
-    if !nets.is_empty() && !crate::wifi_editing() {
-        for i in 0..SET_LIST_ROWS {
-            if inside(rx, 4 + i * 2, rw, 2, p) {
-                return Some(SettingsHit::Network(i as usize));
+    if !nets.is_empty() {
+        for row in 0..SET_LIST_ROWS {
+            let r = (SET_LIST_X, SET_LIST_Y + row * SET_LIST_PITCH, SET_LIST_W, SET_LIST_H);
+            if inside(r, px, py) {
+                return Some(SettingsHit::Network(row));
             }
         }
     }
-    if inside(rx, 12, rw, 1, p) {
-        return Some(SettingsHit::Password);
+    None
+}
+
+// ── Wi-Fi connect form (shown while editing) ───────────────────────────
+const FORM_Y: usize = kit::CONTENT_Y;
+const FORM_H: usize = 166; // 66..232, keyboard starts at 240
+const FORM_FIELD: (usize, usize, usize, usize) = (28, 140, 508, 48);
+const FORM_REVEAL: (usize, usize, usize, usize) = (544, 140, 120, 48);
+const FORM_CONNECT: (usize, usize, usize, usize) = (672, 140, 304, 48);
+
+pub fn settings_form(fb: &mut Framebuffer) {
+    let t = theme();
+    kit::topbar(fb, "WI-FI", "[BACK] Cancel");
+    kit::footer(fb, &[("[HOME] Connect", t.accent), ("[BACK] Cancel", t.text_muted)], &[]);
+    kit::card(fb, MARGIN, FORM_Y, CONTENT_W, FORM_H, None, "CONNECT TO NETWORK", t.accent);
+
+    let ssid = crate::wifi_selected_ssid();
+    let connected = !ssid.is_empty() && ssid == crate::wifi_connected();
+    let txt = if connected { format!("Network: {ssid}  (connected)") } else { format!("Network: {ssid}") };
+    fb.draw_text(SET_INNER_X + 4, 100, &txt, t.text, 2);
+
+    // Password field (always visible above the keyboard).
+    let (fx, fy, fw, fh) = FORM_FIELD;
+    fb.draw_rect(fx, fy, fw, fh, t.bg);
+    fb.draw_rect(fx, fy, fw, 1, t.border);
+    fb.draw_rect(fx, fy + fh - 1, fw, 1, t.border);
+    fb.draw_rect(fx, fy, 1, fh, t.border);
+    fb.draw_rect(fx + fw - 1, fy, 1, fh, t.border);
+    fb.draw_text(fx + 12, fy + 16, "Password:", t.text_muted, 1);
+    let value = crate::wifi_psk_display();
+    let vx = fx + 110;
+    fb.draw_text(vx, fy + 8, &value, t.text, 2);
+    if crate::wifi_reveal() {
+        fb.draw_text(vx + value.len() * 16 + 4, fy + 8, "_", t.accent, 2);
+    } else {
+        fb.draw_rect(vx + value.len() * 16 + 4, fy + 36, 12, 3, t.accent);
     }
-    if inside(rx, 14, rw, 1, p) {
+
+    button(fb, FORM_REVEAL.0, FORM_REVEAL.1, FORM_REVEAL.2, FORM_REVEAL.3,
+           if crate::wifi_reveal() { "[ hide ]" } else { "[ show ]" }, false);
+    button(fb, FORM_CONNECT.0, FORM_CONNECT.1, FORM_CONNECT.2, FORM_CONNECT.3, "[ CONNECT ]", true);
+
+    let status = crate::wifi_status();
+    if !status.is_empty() {
+        fb.draw_text(SET_INNER_X + 4, 196, &status, t.info, 1);
+    }
+}
+
+pub fn settings_form_hit(px: usize, py: usize) -> Option<SettingsHit> {
+    if inside(FORM_REVEAL, px, py) {
+        return Some(SettingsHit::Reveal);
+    }
+    if inside(FORM_CONNECT, px, py) {
         return Some(SettingsHit::Connect);
     }
+    if inside(FORM_FIELD, px, py) {
+        return Some(SettingsHit::Password);
+    }
     None
+}
+
+// ── Terminal ───────────────────────────────────────────────────────────
+pub fn terminal(fb: &mut Framebuffer) {
+    let t = theme();
+    kit::topbar(fb, "TERMINAL", "[VOL] Scroll");
+    kit::footer(fb, &[("[BACK] Back", t.accent), ("[HOME] Enter", t.info)], &[]);
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────
+fn label_value(fb: &mut Framebuffer, x: usize, y: usize, w: usize, label: &str, value: &str, t: &'static crate::Theme) {
+    fb.draw_text(x, y, label, t.text, 2);
+    let vw = value.len() * 16;
+    fb.draw_text(x + w - vw, y, value, t.text_muted, 2);
+}
+
+fn button(fb: &mut Framebuffer, x: usize, y: usize, w: usize, h: usize, label: &str, primary: bool) {
+    let t = theme();
+    let (bg, fg) = if primary { (t.accent, t.bg) } else { (t.panel_active, t.text) };
+    fb.draw_rect(x, y, w, h, bg);
+    let lw = label.len() * 16;
+    fb.draw_text(x + w.saturating_sub(lw) / 2, y + (h.saturating_sub(32)) / 2, label, fg, 2);
+}
+
+fn inside(r: (usize, usize, usize, usize), px: usize, py: usize) -> bool {
+    px >= r.0 && px < r.0 + r.2 && py >= r.1 && py < r.1 + r.3
+}
+
+pub fn wifi_start(nets_len: usize, sel: usize) -> usize {
+    let n = SET_LIST_ROWS.min(nets_len);
+    if n == 0 {
+        0
+    } else {
+        sel.saturating_sub(1).min(nets_len - n)
+    }
 }
 
 pub enum SettingsHit {
@@ -434,66 +324,9 @@ pub enum SettingsHit {
     VolDown,
     SleepPrev,
     SleepNext,
+    Effects,
     Network(usize),
     Password,
+    Reveal,
     Connect,
-}
-
-// -------------------------------------------------------------
-// On-screen keyboard (large keys: 4 cells wide × 2 tall = 64×64)
-// -------------------------------------------------------------
-pub fn keyboard(f: &mut Frame) {
-    let t = theme();
-    let buf = f.buffer_mut();
-    for (r, keys) in crate::KB_ROWS.iter().enumerate() {
-        let y = KB_CELL_Y0 + r as u16 * KB_KEY_H as u16;
-        let mut x = 0u16;
-        for key in keys.iter() {
-            let w = key.w as u16 * KB_CELL_UNIT;
-            let active = match key.key {
-                Key::Shift => crate::kb_shift(),
-                Key::Ctrl => crate::kb_ctrl(),
-                Key::Alt => crate::kb_alt(),
-                _ => false,
-            };
-            let bg = if active { rc(t.accent) } else { rc(t.panel_active) };
-            let fg = if active { rc(t.bg) } else { rc(t.text) };
-            let kw = w.saturating_sub(1).max(1);
-            for cx in x..(x + kw).min(COLS) {
-                for cy in y..(y + KB_KEY_H as u16).min(ROWS) {
-                    if let Some(cell) = buf.cell_mut((cx, cy)) {
-                        cell.set_symbol(" ").set_style(Style::new().bg(bg));
-                    }
-                }
-            }
-            let lw = key.label.chars().count() as u16;
-            let lx = x + kw.saturating_sub(lw) / 2;
-            let ly = y + (KB_KEY_H as u16 - 1) / 2;
-            if lx + lw <= COLS && ly < ROWS {
-                buf.set_string(lx, ly, key.label, Style::new().fg(fg).bg(bg));
-            }
-            x += w;
-        }
-    }
-}
-
-pub fn keyboard_key_at(px: usize, py: usize) -> Option<Key> {
-    let cy = py / CELL_H;
-    if cy < KB_CELL_Y0 as usize {
-        return None;
-    }
-    let row = (cy - KB_CELL_Y0 as usize) / KB_KEY_H;
-    if row >= crate::KB_ROWS.len() || row >= KB_ROWS_N as usize {
-        return None;
-    }
-    let cx = px / CELL_W;
-    let mut x = 0usize;
-    for key in crate::KB_ROWS[row].iter() {
-        let w = key.w * KB_CELL_UNIT as usize;
-        if cx >= x && cx < x + w {
-            return Some(key.key);
-        }
-        x += w;
-    }
-    None
 }

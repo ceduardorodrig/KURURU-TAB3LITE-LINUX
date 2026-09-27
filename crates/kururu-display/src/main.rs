@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod font;
+mod kit;
 mod terminal;
 mod ui;
 
@@ -102,9 +103,11 @@ const fn pal(key: &'static str, name: &'static str, bg: Color, fg: Color) -> The
         text_muted: mix(bg, fg, 68),
         text_dim: mix(bg, fg, 45),
         accent: fg,
-        info: fg,
-        warn: rgb(255, 176, 0),
-        error: rgb(255, 77, 77),
+        // Monochrome themes derive every semantic slot from the foreground so
+        // the whole UI follows the palette (no leftover orange/red).
+        info: mix(bg, fg, 78),
+        warn: mix(bg, fg, 92),
+        error: mix(bg, fg, 58),
         grid: mix(bg, fg, 12),
     }
 }
@@ -200,21 +203,11 @@ fn write_backlight(v: usize) {
 }
 
 // ── Layout design system (dark retro-HUD) ──────────────────────────────
-const MARGIN: usize = 16;        // outer screen margin
-const GUTTER: usize = 16;        // gap between adjacent cards
-const PAD: usize = 12;           // inner card padding
-const TITLE_H: usize = 28;       // card title band height
+// Shared tokens and card geometry live in `kit`; only dashboard-specific
+// pitches stay here.
 const ROW_H: usize = 19;         // telemetry row pitch
 const LOG_ROW_H: usize = 17;     // log console row pitch
 const GRID_DOT: usize = 32;      // background dot-grid spacing
-
-// Derived geometry — single source of truth for card placement.
-const CONTENT_W: usize = FB_WIDTH - 2 * MARGIN;             // 992
-const HALF_W: usize = (CONTENT_W - GUTTER) / 2;             // 488
-const COL_B_X: usize = MARGIN + HALF_W + GUTTER;            // 520
-const RIBBON_W: usize = (CONTENT_W - 2 * GUTTER) / 3;       // 320
-const RIBBON_2_X: usize = MARGIN + RIBBON_W + GUTTER;       // 352
-const RIBBON_3_X: usize = MARGIN + 2 * (RIBBON_W + GUTTER); // 688
 
 // ── Tab registry: single source of truth for header AND input handler ──
 const TABS: [&str; 3] = ["KURURU", "HOMELAB", "RETRO CLOCK"];
@@ -1156,23 +1149,15 @@ fn battery_color(pct: u32) -> Color {
 
 /// Sparse dot-grid drawn on the raw background (visible only in the gutters).
 fn draw_background_grid(fb: &mut Framebuffer) {
-    let mut y = 56;
-    while y < 568 {
-        let mut x = MARGIN;
-        while x < FB_WIDTH - MARGIN {
+    let mut y = kit::CONTENT_Y;
+    while y < kit::CONTENT_BOTTOM {
+        let mut x = kit::MARGIN;
+        while x < FB_WIDTH - kit::MARGIN {
             fb.draw_rect(x, y, 2, 2, theme().grid);
             x += GRID_DOT;
         }
         y += GRID_DOT;
     }
-}
-
-/// Frog mascot overlay (pixel-art) — drawn on top of the ratatui Menu.
-fn draw_frog(fb: &mut Framebuffer) {
-    let scale = 3;
-    let x = (FB_WIDTH - 22 * scale) / 2;
-    fb.draw_sprite(x, 100, SP_FROG_BODY, theme().accent, scale);
-    fb.draw_sprite(x, 100, SP_FROG_DETAIL, theme().bg, scale);
 }
 
 fn about_lines(info: &SystemInfo) -> Vec<String> {
@@ -1181,56 +1166,9 @@ fn about_lines(info: &SystemInfo) -> Vec<String> {
         "Samsung Galaxy Tab 3 Lite (SM-T110 / goyawifi)".to_string(),
         format!("Alpine Linux / musl  -  Kernel {}", info.kernel_version),
         format!("Uptime: {}", info.uptime_str),
+        format!("Theme: {}", theme().name),
         "github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX".to_string(),
     ]
-}
-
-/// Retro-HUD card frame: panel, 1px border, accent corner brackets, left
-/// accent bar, optional pixel icon + title, and a divider under the title.
-fn draw_card(
-    fb: &mut Framebuffer,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    icon: Option<&[&str]>,
-    title: &str,
-    accent: Color,
-) {
-    let right = x + w;
-    let bottom = y + h;
-
-    fb.draw_rect(x, y, w, h, theme().panel);
-    fb.draw_rect(x, y, w, 1, theme().border);
-    fb.draw_rect(x, bottom - 1, w, 1, theme().border);
-    fb.draw_rect(x, y, 1, h, theme().border);
-    fb.draw_rect(right - 1, y, 1, h, theme().border);
-
-    // Left accent bar across the title band
-    fb.draw_rect(x, y, 3, TITLE_H, accent);
-
-    // HUD corner brackets
-    let b = 9;
-    let t = 2;
-    fb.draw_rect(x, y, b, t, accent);
-    fb.draw_rect(x, y, t, b, accent);
-    fb.draw_rect(right - b, y, b, t, accent);
-    fb.draw_rect(right - t, y, t, b, accent);
-    fb.draw_rect(x, bottom - t, b, t, accent);
-    fb.draw_rect(x, bottom - b, t, b, accent);
-    fb.draw_rect(right - b, bottom - t, b, t, accent);
-    fb.draw_rect(right - t, bottom - b, t, b, accent);
-
-    // Title row: icon + label, vertically centred in the title band
-    let mut tx = x + PAD + 6;
-    if let Some(ic) = icon {
-        fb.draw_sprite(tx, y + (TITLE_H - 8) / 2, ic, accent, 1);
-        tx += 12;
-    }
-    fb.draw_text(tx, y + (TITLE_H - 16) / 2, title, theme().text, 1);
-
-    // Divider under the title band
-    fb.draw_rect(x + PAD, y + TITLE_H, w - 2 * PAD, 1, theme().border);
 }
 
 /// Header tab rectangles (x, y, w, h) — single source of truth shared by the
@@ -1238,14 +1176,14 @@ fn draw_card(
 fn tab_rects() -> [(usize, usize, usize, usize); TAB_COUNT] {
     let n = TAB_COUNT.min(MAX_TABS);
     let gap = 8usize;
-    let tab_start = MARGIN + 24 + HEADER_TITLE.len() * 16 + 24; // accent+title + gap
-    let tab_end = FB_WIDTH - MARGIN;
+    let tab_start = kit::MARGIN + 24 + HEADER_TITLE.len() * 16 + 24; // accent+title + gap
+    let tab_end = FB_WIDTH - kit::MARGIN;
     let available = tab_end.saturating_sub(tab_start);
     let tab_w = available.saturating_sub((n - 1) * gap) / n;
 
     let mut rects = [(0usize, 0usize, 0usize, 0usize); TAB_COUNT];
     for (i, r) in rects.iter_mut().enumerate() {
-        *r = (tab_start + i * (tab_w + gap), 6, tab_w, 36);
+        *r = (tab_start + i * (tab_w + gap), 2, tab_w, 44);
     }
     rects
 }
@@ -1293,7 +1231,9 @@ fn handle_tap(
         SCREEN_SETTINGS => {
             let editing = wifi_form().lock().map(|f| f.editing).unwrap_or(false);
             if editing {
-                keyboard_tap(sx, sy, false);
+                if !keyboard_tap(sx, sy, false) {
+                    settings_form_tap(sx, sy);
+                }
             } else {
                 settings_tap(sx, sy);
             }
@@ -1309,13 +1249,8 @@ fn handle_tap(
 }
 
 fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
-    // Header panel: 48px tall + 2px border at y=48
-    fb.draw_rect(0, 0, FB_WIDTH, 48, theme().panel);
-    fb.draw_rect(0, 48, FB_WIDTH, 2, theme().border);
-
-    // Unified top bar: accent marker + screen title (matches Menu/Settings/...).
-    fb.draw_rect(MARGIN, 18, 12, 12, theme().accent);
-    fb.draw_text(MARGIN + 24, 8, HEADER_TITLE, theme().text, 2);
+    // Shared top bar (same geometry/identity as the app shell).
+    kit::topbar(fb, HEADER_TITLE, "");
 
     // Dynamic tabs fill the remaining span, right-aligned to the margin.
     // Geometry comes from tab_rects() so touch hit-testing stays in sync.
@@ -1347,26 +1282,14 @@ fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
 }
 
 fn draw_footer(fb: &mut Framebuffer, info: &SystemInfo) {
-    // Footer panel: y=568, height=32. Text vertically centered: y = 576.
-    fb.draw_rect(0, 568, FB_WIDTH, 32, theme().panel);
-    fb.draw_rect(0, 568, FB_WIDTH, 1, theme().border);
-
-    // LEFT: volume navigation
-    fb.draw_text(MARGIN - 2, 576, "[VOL+] <- Prev", theme().warn, 1);
-    fb.draw_text(130, 576, "|", theme().text_dim, 1);
-    fb.draw_text(142, 576, "[VOL-] -> Next", theme().info, 1);
-
-    // CENTER: power button hint (centered on 512)
-    fb.draw_text(432, 576, "[POWER] Wake / Sleep", theme().text, 1);
-
-    // RIGHT: auto-sleep + live UPS (on-board battery) status, right-aligned
+    let t = theme();
+    let sleep = format!("Auto-sleep: {}", sleep_label());
     let ups = format!("UPS: {}% ({})", info.battery_pct, info.battery_health);
-    let ups_x = FB_WIDTH - MARGIN - ups.len() * 8;
-    let sep_x = ups_x - 12;
-    let sleep = "Auto-sleep: 120s";
-    fb.draw_text(sep_x - 8 - sleep.len() * 8, 576, sleep, theme().text_dim, 1);
-    fb.draw_text(sep_x, 576, "|", theme().text_dim, 1);
-    fb.draw_text(ups_x, 576, &ups, battery_color(info.battery_pct_num), 1);
+    kit::footer(
+        fb,
+        &[("[VOL] Prev / Next", t.warn), ("[POWER] Wake / Sleep", t.text)],
+        &[(sleep.as_str(), t.text_dim), (ups.as_str(), battery_color(info.battery_pct_num))],
+    );
 }
 
 // -------------------------------------------------------------
@@ -1381,6 +1304,7 @@ enum Key {
     Backspace,
     Enter,
     Space,
+    Hide,
     Tab,
     Esc,
     Shift,
@@ -1431,17 +1355,18 @@ const KB_ROWS: &[&[KKey]] = &[
         k(".", Key::Ch('.'), 1), k("/", Key::Ch('/'), 1), k("Shift", Key::Shift, 3),
     ],
     &[
-        k("Alt", Key::Alt, 2), k("Esc", Key::Esc, 2), k("Space", Key::Space, 8),
+        k("Alt", Key::Alt, 2), k("Esc", Key::Esc, 2), k("Space", Key::Space, 6),
+        k("Hide", Key::Hide, 2),
         k("<", Key::Left, 1), k("^", Key::Up, 1), k("v", Key::Down, 1), k(">", Key::Right, 1),
     ],
 ];
 
 
 // Terminal grid geometry (the area above the keyboard).
-const TERM_X: usize = MARGIN;
-const TERM_Y: usize = 56;
-const TERM_COLS: usize = (FB_WIDTH - 2 * MARGIN) / 8;
-const TERM_ROWS: usize = (ui::KB_TOP_PX - TERM_Y) / 16;
+const TERM_X: usize = kit::MARGIN;
+const TERM_Y: usize = kit::CONTENT_Y;
+const TERM_COLS: usize = (FB_WIDTH - 2 * kit::MARGIN) / 8;
+const TERM_ROWS: usize = (kit::KB_TOP - 8 - TERM_Y) / 16;
 
 static KB_SHIFT: AtomicBool = AtomicBool::new(false);
 static KB_CTRL: AtomicBool = AtomicBool::new(false);
@@ -1464,8 +1389,8 @@ fn shift_char(c: char) -> char {
 struct WifiForm {
     ssid: String,
     psk: String,
-    focus: usize, // 0 = password, 1 = connect
     editing: bool,
+    reveal: bool,
     status: String,
     nets: Vec<(String, i32, String)>, // (ssid, signal dBm, flags)
     sel: usize,
@@ -1537,7 +1462,21 @@ fn wifi_nets() -> Vec<(String, i32, String)> { wifi_form().lock().map(|f| f.nets
 fn wifi_sel() -> usize { wifi_form().lock().map(|f| f.sel).unwrap_or(0) }
 fn wifi_connected() -> String { wifi_form().lock().map(|f| f.connected.clone()).unwrap_or_default() }
 fn wifi_selected_ssid() -> String { wifi_form().lock().map(|f| f.ssid.clone()).unwrap_or_default() }
-fn wifi_psk_mask() -> String { wifi_form().lock().map(|f| "*".repeat(f.psk.chars().count())).unwrap_or_default() }
+fn wifi_reveal() -> bool { wifi_form().lock().map(|f| f.reveal).unwrap_or(false) }
+fn wifi_psk_display() -> String {
+    wifi_form()
+        .lock()
+        .map(|f| if f.reveal { f.psk.clone() } else { "*".repeat(f.psk.chars().count()) })
+        .unwrap_or_default()
+}
+/// Signal (dBm) of the currently connected AP, from the scan list.
+fn wifi_signal() -> String {
+    wifi_form()
+        .lock()
+        .ok()
+        .and_then(|f| f.nets.iter().find(|(n, _, _)| n == &f.connected).map(|(_, s, _)| format!("{s} dBm")))
+        .unwrap_or_default()
+}
 fn wifi_status() -> String { wifi_form().lock().map(|f| f.status.clone()).unwrap_or_default() }
 fn brightness_pct() -> f64 { BRIGHTNESS.load(Ordering::Relaxed) as f64 / 255.0 }
 fn volume_pct() -> f64 { VOLUME.load(Ordering::Relaxed) as f64 / 100.0 }
@@ -1580,21 +1519,13 @@ fn wifi_connect(ssid: &str, psk: &str) -> String {
 
 fn kb_type_char(ch: char) {
     if let Ok(mut f) = wifi_form().lock() {
-        match f.focus {
-            0 => f.ssid.push(ch),
-            1 => f.psk.push(ch),
-            _ => {}
-        }
+        f.psk.push(ch);
     }
 }
 
 fn kb_backspace() {
     if let Ok(mut f) = wifi_form().lock() {
-        match f.focus {
-            0 => { f.ssid.pop(); }
-            1 => { f.psk.pop(); }
-            _ => {}
-        }
+        f.psk.pop();
     }
 }
 
@@ -1617,6 +1548,7 @@ fn wifi_submit() {
 /// Apply a keyboard key press. `terminal_mode` routes characters/keys to the
 /// PTY; otherwise they edit the Wi-Fi form.
 fn kb_press(key: Key, terminal_mode: bool) {
+    kit::flash(key);
     match key {
         Key::Shift => KB_SHIFT.store(!KB_SHIFT.load(Ordering::Relaxed), Ordering::Relaxed),
         Key::Ctrl => KB_CTRL.store(!KB_CTRL.load(Ordering::Relaxed), Ordering::Relaxed),
@@ -1625,6 +1557,11 @@ fn kb_press(key: Key, terminal_mode: bool) {
         Key::Backspace => kb_backspace(),
         Key::Space => kb_type_char(' '),
         Key::Enter => wifi_submit(),
+        Key::Hide => {
+            if let Ok(mut f) = wifi_form().lock() {
+                f.editing = false;
+            }
+        }
         Key::Ch(c) => {
             let ch = if KB_SHIFT.load(Ordering::Relaxed) { shift_char(c) } else { c };
             kb_type_char(ch);
@@ -1670,7 +1607,7 @@ fn term_key(key: Key) {
 
 /// Touch hit-test over the on-screen keyboard. Returns true if a key was hit.
 fn keyboard_tap(sx: usize, sy: usize, terminal_mode: bool) -> bool {
-    if let Some(key) = ui::keyboard_key_at(sx, sy) {
+    if let Some(key) = kit::keyboard_key_at(sx, sy) {
         kb_press(key, terminal_mode);
         true
     } else {
@@ -1712,6 +1649,11 @@ fn settings_tap(sx: usize, sy: usize) {
         }
         Some(ui::SettingsHit::SleepPrev) => cycle_sleep(-1),
         Some(ui::SettingsHit::SleepNext) => cycle_sleep(1),
+        Some(ui::SettingsHit::Effects) => {
+            let next = if EFFECTS.load(Ordering::Relaxed) != 0 { 0 } else { EFFECT_ALL };
+            EFFECTS.store(next, Ordering::Relaxed);
+            save_display_config();
+        }
         Some(ui::SettingsHit::Network(i)) => {
             if let Ok(mut f) = wifi_form().lock() {
                 let total = f.nets.len();
@@ -1722,19 +1664,37 @@ fn settings_tap(sx: usize, sy: usize) {
                     f.sel = idx;
                     f.ssid = name;
                     f.psk.clear();
-                    f.focus = 0;
+                    f.reveal = false;
                     f.editing = true;
                 }
             }
         }
         Some(ui::SettingsHit::Password) => {
             if let Ok(mut f) = wifi_form().lock() {
-                f.focus = 0;
                 f.editing = true;
             }
         }
         Some(ui::SettingsHit::Connect) => wifi_submit(),
+        Some(ui::SettingsHit::Reveal) => {}
         None => {}
+    }
+}
+
+/// Touch handling for the Wi-Fi connect form (reveal / connect / focus).
+fn settings_form_tap(sx: usize, sy: usize) {
+    match ui::settings_form_hit(sx, sy) {
+        Some(ui::SettingsHit::Reveal) => {
+            if let Ok(mut f) = wifi_form().lock() {
+                f.reveal = !f.reveal;
+            }
+        }
+        Some(ui::SettingsHit::Connect) => wifi_submit(),
+        Some(ui::SettingsHit::Password) => {
+            if let Ok(mut f) = wifi_form().lock() {
+                f.editing = true;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1925,12 +1885,12 @@ fn draw_log_console(
     text_color: Color,
     empty_msg: &str,
 ) {
-    draw_card(fb, x, y, w, h, Some(icon), title, accent);
+    kit::card(fb, x, y, w, h, Some(icon), title, accent);
 
-    let content_x = x + PAD;
-    let content_y = y + TITLE_H + PAD;
-    let max_rows = (y + h - PAD).saturating_sub(content_y) / LOG_ROW_H;
-    let max_chars = (w - 2 * PAD - 4) / 8;
+    let content_x = x + kit::PAD;
+    let content_y = y + kit::TITLE_H + kit::PAD;
+    let max_rows = (y + h - kit::PAD).saturating_sub(content_y) / LOG_ROW_H;
+    let max_chars = (w - 2 * kit::PAD - 4) / 8;
 
     let shown: Vec<&String> = lines.iter().rev().take(max_rows).collect::<Vec<_>>()
         .into_iter().rev().collect();
@@ -1957,7 +1917,7 @@ fn draw_log_console(
 
 fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Card A: System, APU & Memory ────────────────────────────────────────
-    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_CHIP), "KURURU ARCHITECTURE & COMPUTE", theme().warn);
+    kit::card(fb, kit::MARGIN, kit::CONTENT_Y, kit::HALF_W, kit::CARD_H, Some(ICON_CHIP), "KURURU ARCHITECTURE & COMPUTE", theme().warn);
 
     let free_pct = if info.ram_total_mb > 0 {
         100 - (info.ram_used_mb * 100 / info.ram_total_mb)
@@ -1984,7 +1944,7 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
         ("Init Mode:", "Native Headless Bare-Metal"),
     ];
 
-    let mut ty = 96;
+    let mut ty = 106;
     for (label, val) in &telemetry_lines {
         fb.draw_text(28, ty, label, theme().text_muted, 1);
         fb.draw_text(165, ty, val, theme().text, 1);
@@ -1992,14 +1952,14 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
     }
 
     // ── Card B: On-board battery (UPS) & Wi-Fi radio ────────────────────────
-    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_WIFI), "BATTERY (UPS) & WI-FI RADIO", theme().warn);
+    kit::card(fb, kit::COL_B_X, kit::CONTENT_Y, kit::HALF_W, kit::CARD_H, Some(ICON_WIFI), "BATTERY (UPS) & WI-FI RADIO", theme().warn);
 
-    fb.draw_text(532, 92, "Battery:", theme().text_muted, 1);
-    fb.draw_rect(628, 90, 200, 16, theme().border);
+    fb.draw_text(532, 102, "Battery:", theme().text_muted, 1);
+    fb.draw_rect(628, 100, 200, 16, theme().border);
     let fill_w = (info.battery_pct_num as usize * 196) / 100;
-    fb.draw_rect(630, 92, fill_w, 12, battery_color(info.battery_pct_num));
+    fb.draw_rect(630, 102, fill_w, 12, battery_color(info.battery_pct_num));
     let bat_label = format!("{}% ({})", info.battery_pct, info.battery_status);
-    fb.draw_text(840, 92, &bat_label, theme().text, 1);
+    fb.draw_text(840, 102, &bat_label, theme().text, 1);
 
     let power_radio_lines = [
         ("Fuelgauge:", format!("{} | Temp: {} | Health: {}", info.battery_volts, info.battery_temp_c, info.battery_health)),
@@ -2013,7 +1973,7 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
         ("SSH Service:", "Dropbear (authorized keys root)".to_string()),
     ];
 
-    let mut ry = 118;
+    let mut ry = 128;
     for (label, val) in &power_radio_lines {
         fb.draw_text(532, ry, label, theme().text_muted, 1);
         fb.draw_text(676, ry, val, theme().text, 1);
@@ -2023,7 +1983,7 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Card C: Live kernel log console ─────────────────────────────────────
     draw_log_console(
         fb, &info.logs, &info.time_str,
-        MARGIN, 308, CONTENT_W, 252,
+        kit::MARGIN, kit::ROW2_Y, kit::CONTENT_W, kit::CARD_H,
         "KERNEL LOG CONSOLE (DMESG TAIL)", ICON_TERMINAL,
         theme().accent, theme().text_muted,
         "Waiting for kernel messages...",
@@ -2036,19 +1996,19 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
 fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Card A: Tailnet cluster & core servers ──────────────────────────────
     let cluster_title = format!("MNEMOCINE TAILNET ({}/5 ONLINE)", info.homelab_online_count);
-    draw_card(fb, MARGIN, 56, HALF_W, 244, Some(ICON_SERVER), &cluster_title, theme().warn);
+    kit::card(fb, kit::MARGIN, kit::CONTENT_Y, kit::HALF_W, kit::CARD_H, Some(ICON_SERVER), &cluster_title, theme().warn);
 
-    fb.draw_text(28, 96, "Tailnet:", theme().text_muted, 1);
-    fb.draw_text(130, 96, &info.tailnet_suffix, theme().info, 1);
+    fb.draw_text(28, 106, "Tailnet:", theme().text_muted, 1);
+    fb.draw_text(130, 106, &info.tailnet_suffix, theme().info, 1);
 
-    fb.draw_text(28, 115, "Kururu IP:", theme().text_muted, 1);
-    fb.draw_text(130, 115, &info.tailscale_ip, theme().text, 1);
+    fb.draw_text(28, 125, "Kururu IP:", theme().text_muted, 1);
+    fb.draw_text(130, 125, &info.tailscale_ip, theme().text, 1);
 
-    fb.draw_text(28, 134, "Direct Link:", theme().text_muted, 1);
-    fb.draw_text(130, 134, &info.active_link_str, theme().accent, 1);
+    fb.draw_text(28, 144, "Direct Link:", theme().text_muted, 1);
+    fb.draw_text(130, 144, &info.active_link_str, theme().accent, 1);
 
     // Server list with pixel status squares (active / online / offline)
-    let mut py = 162;
+    let mut py = 172;
     for peer in &info.homelab_nodes {
         let color = if peer.active {
             theme().accent
@@ -2074,10 +2034,10 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     }
 
     let summary_line = format!("Mesh Total: {} nodes registered in Tailnet", info.peers_total_count);
-    fb.draw_text(28, 278, &summary_line, theme().text_dim, 1);
+    fb.draw_text(28, 288, &summary_line, theme().text_dim, 1);
 
     // ── Card B: Wake-on-LAN controller & relay targets ──────────────────────
-    draw_card(fb, COL_B_X, 56, HALF_W, 244, Some(ICON_POWER), "WAKE-ON-LAN CONTROLLER", theme().warn);
+    kit::card(fb, kit::COL_B_X, kit::CONTENT_Y, kit::HALF_W, kit::CARD_H, Some(ICON_POWER), "WAKE-ON-LAN CONTROLLER", theme().warn);
 
     let daemon_label = if info.wol_daemon_running {
         "ACTIVE (:9096) - Kururu Native Rust"
@@ -2098,7 +2058,7 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
         ("Transmission:", "Layer 2 Magic Packet Burst (5x / 25ms)", theme().text_muted),
     ];
 
-    let mut wy = 96;
+    let mut wy = 106;
     for (label, val, col) in &wol_lines {
         fb.draw_text(532, wy, label, theme().text_muted, 1);
         fb.draw_text(676, wy, val, *col, 1);
@@ -2108,7 +2068,7 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Card C: WoL dispatch audit log ──────────────────────────────────────
     draw_log_console(
         fb, &info.wol_logs, &info.time_str,
-        MARGIN, 308, CONTENT_W, 252,
+        kit::MARGIN, kit::ROW2_Y, kit::CONTENT_W, kit::CARD_H,
         "WAKE-ON-LAN DISPATCH AUDIT LOG", ICON_TERMINAL,
         theme().info, theme().info,
         "No Wake-on-LAN packets dispatched yet. Waiting on port 9096...",
@@ -2120,33 +2080,33 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
 // -------------------------------------------------------------
 fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     // ── Hero: ambient retro clock ───────────────────────────────────────────
-    draw_card(fb, MARGIN, 56, CONTENT_W, 294, Some(ICON_CLOCK),
+    kit::card(fb, kit::MARGIN, kit::CONTENT_Y, kit::CONTENT_W, 300, Some(ICON_CLOCK),
               "MNEMOCINE TIME STATION - SOVEREIGN NTP CLOCK", theme().warn);
 
     // Huge clock: font 8x16 at scale 5 = 40x80 px/char; 8 chars = 320px wide.
-    fb.draw_text(352, 100, &info.time_str, theme().accent, 5);
+    fb.draw_text(352, 96, &info.time_str, theme().accent, 5);
 
     // Date banner (scale 2, centered)
     let date_x = (FB_WIDTH.saturating_sub(info.date_full_str.len() * 16)) / 2;
-    fb.draw_text(date_x, 196, &info.date_full_str, theme().info, 2);
+    fb.draw_text(date_x, 190, &info.date_full_str, theme().info, 2);
 
     // Sub-banner + status pill (centered)
     let sub = format!("Timezone: America/Sao_Paulo (UTC-3) | Host: {} | Uptime: {}", info.hostname, info.uptime_str);
-    fb.draw_text((FB_WIDTH.saturating_sub(sub.len() * 8)) / 2, 250, &sub, theme().text_muted, 1);
+    fb.draw_text((FB_WIDTH.saturating_sub(sub.len() * 8)) / 2, 246, &sub, theme().text_muted, 1);
 
     let pill = format!(
         "Homelab: {}/5 Servers Online   |   Wi-Fi: {} ({})   |   WOL Relay: Port 9096 Ready",
         info.homelab_online_count, info.wifi_ssid, info.wifi_signal_dbm
     );
-    fb.draw_text((FB_WIDTH.saturating_sub(pill.len() * 8)) / 2, 286, &pill, theme().text_dim, 1);
+    fb.draw_text((FB_WIDTH.saturating_sub(pill.len() * 8)) / 2, 284, &pill, theme().text_dim, 1);
 
     // ── Ambient ribbon: 3 symmetric vitals cards (320px each) ──────────────
     // Card 1: Hardware UPS / no-break
-    draw_card(fb, MARGIN, 358, RIBBON_W, 202, Some(ICON_BATTERY), "HARDWARE UPS / NO-BREAK", theme().warn);
+    kit::card(fb, kit::MARGIN, 382, kit::RIBBON_W, 170, Some(ICON_BATTERY), "HARDWARE UPS / NO-BREAK", theme().warn);
 
-    fb.draw_rect(28, 394, 292, 16, theme().border);
+    fb.draw_rect(28, 418, 292, 16, theme().border);
     let fill_w = (info.battery_pct_num as usize * 288) / 100;
-    fb.draw_rect(30, 396, fill_w, 12, battery_color(info.battery_pct_num));
+    fb.draw_rect(30, 420, fill_w, 12, battery_color(info.battery_pct_num));
 
     let ups_lines = [
         ("Charge:", format!("{}% ({})", info.battery_pct, info.battery_status)),
@@ -2156,7 +2116,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
         ("Buffer:", "3600 mAh Li-ion Cell".to_string()),
     ];
 
-    let mut uy = 420;
+    let mut uy = 440;
     for (label, val) in &ups_lines {
         fb.draw_text(28, uy, label, theme().text_muted, 1);
         fb.draw_text(115, uy, val, theme().text, 1);
@@ -2164,7 +2124,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     }
 
     // Card 2: Kururu node vitals
-    draw_card(fb, RIBBON_2_X, 358, RIBBON_W, 202, Some(ICON_CHIP), "KURURU NODE VITALS", theme().warn);
+    kit::card(fb, kit::RIBBON_2_X, 382, kit::RIBBON_W, 170, Some(ICON_CHIP), "KURURU NODE VITALS", theme().warn);
 
     let vitals_lines = [
         ("Device:", "Samsung SM-T110".to_string()),
@@ -2175,7 +2135,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
         ("Cooling:", "Passive (0 dB Silent)".to_string()),
     ];
 
-    let mut vy = 396;
+    let mut vy = 426;
     for (label, val) in &vitals_lines {
         fb.draw_text(364, vy, label, theme().text_muted, 1);
         fb.draw_text(440, vy, val, theme().text, 1);
@@ -2183,7 +2143,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     }
 
     // Card 3: Homelab network
-    draw_card(fb, RIBBON_3_X, 358, RIBBON_W, 202, Some(ICON_GLOBE), "HOMELAB NETWORK", theme().warn);
+    kit::card(fb, kit::RIBBON_3_X, 382, kit::RIBBON_W, 170, Some(ICON_GLOBE), "HOMELAB NETWORK", theme().warn);
 
     let net_lines = [
         ("Tailnet:", info.tailnet_suffix.clone()),
@@ -2194,7 +2154,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
         ("WOL Engine:", "Port 9096 Listener Ready".to_string()),
     ];
 
-    let mut ny = 396;
+    let mut ny = 426;
     for (label, val) in &net_lines {
         fb.draw_text(700, ny, label, theme().text_muted, 1);
         fb.draw_text(796, ny, val, theme().text, 1);
@@ -2203,7 +2163,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.8 (scale-2 touch UI: big text, 64px targets)...");
+    println!("[Kururu Display Daemon] Starting v3.0 (unified pixel kit, no ratatui)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -2331,12 +2291,10 @@ fn main() {
                     if screen == SCREEN_SETTINGS {
                         let editing = wifi_form().lock().map(|f| f.editing).unwrap_or(false);
                         if editing {
-                            if let Ok(mut f) = wifi_form().lock() {
-                                f.editing = false;
-                            }
+                            wifi_submit();
                         } else if let Ok(mut f) = wifi_form().lock() {
-                            f.focus = 0;
-                            f.editing = true;
+                            f.scanned = false;
+                            f.status = "Restarting scan...".to_string();
                         }
                     } else {
                         nav_home(&current_screen_keys, &menu_cursor_keys);
@@ -2519,33 +2477,37 @@ fn main() {
 
                     fb.clear(theme().bg);
 
+                    // Dot-grid backdrop on every screen except the terminal
+                    // (its cell grid is drawn over the raw background).
+                    if screen != SCREEN_TERMINAL {
+                        draw_background_grid(&mut fb);
+                    }
+
                     match screen {
                         SCREEN_MENU => {
                             let cursor = menu_cursor.load(Ordering::SeqCst);
-                            ui::render(&mut fb, |f| ui::menu(f, cursor));
-                            draw_frog(&mut fb);
+                            ui::menu(&mut fb, cursor);
                         }
                         SCREEN_ABOUT => {
                             let lines = about_lines(info);
-                            ui::render(&mut fb, |f| ui::about(f, &lines));
+                            ui::about(&mut fb, &lines);
                         }
                         SCREEN_SETTINGS => {
-                            let editing = wifi_editing();
-                            ui::render(&mut fb, |f| {
-                                ui::settings(f);
-                                if editing {
-                                    ui::keyboard(f);
-                                }
-                            });
+                            if wifi_editing() {
+                                ui::settings_form(&mut fb);
+                                kit::keyboard(&mut fb);
+                            } else {
+                                ui::settings(&mut fb);
+                            }
                         }
                         SCREEN_TERMINAL => {
-                            ui::render(&mut fb, |f| ui::terminal(f));
+                            ui::terminal(&mut fb);
+                            kit::keyboard(&mut fb);
                             if terminal::is_ready() {
                                 terminal::render(&mut fb, TERM_X, TERM_Y);
                             }
                         }
                         _ => {
-                            draw_background_grid(&mut fb);
                             let tab = current_tab.load(Ordering::SeqCst);
                             draw_header(&mut fb, tab);
                             match tab {
