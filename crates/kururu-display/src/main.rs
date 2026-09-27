@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
+use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -28,6 +29,17 @@ const KEY_POWER: u16 = 116;
 const KEY_VOLUMEUP: u16 = 115;
 const KEY_VOLUMEDOWN: u16 = 114;
 const KEY_HOMEPAGE: u16 = 102;
+
+// ── Touch input (Samsung sec_touchscreen on /dev/input/event1) ─────────
+const EVENT_TOUCH: &str = "/dev/input/event1";
+const TOUCH_CONF_PATH: &str = "/etc/kururu-touch.conf";
+const EV_ABS: u16 = 3;
+const BTN_TOUCH: u16 = 330;
+const ABS_X: u16 = 0;
+const ABS_Y: u16 = 1;
+const ABS_MT_POSITION_X: u16 = 53;
+const ABS_MT_POSITION_Y: u16 = 54;
+const ABS_MT_TRACKING_ID: u16 = 57;
 
 #[derive(Copy, Clone)]
 struct Color {
@@ -467,6 +479,127 @@ where
             }
         }
     });
+}
+
+// ── Touch calibration ──────────────────────────────────────────────────
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct AbsInfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+/// EVIOCGABS(abs) ioctl request: `_IOC(_IOC_READ, 'E', 0x40 + abs, sizeof(AbsInfo))`.
+const fn eviocgabs(abs: u16) -> u64 {
+    (2u64 << 30) | (24u64 << 16) | (0x45u64 << 8) | (0x40 + abs as u64)
+}
+
+fn abs_range(file: &File, abs: u16) -> Option<(i32, i32)> {
+    let mut info = AbsInfo::default();
+    let ret = unsafe { libc::ioctl(file.as_raw_fd(), eviocgabs(abs) as _, &mut info as *mut AbsInfo) };
+    if ret == 0 && info.maximum > info.minimum && info.maximum > 0 && info.maximum <= 65535 {
+        Some((info.minimum, info.maximum))
+    } else {
+        None
+    }
+}
+
+fn detect_ranges(path: &str) -> Option<((i32, i32), (i32, i32))> {
+    let file = File::open(path).ok()?;
+    let x = abs_range(&file, ABS_MT_POSITION_X).or_else(|| abs_range(&file, ABS_X))?;
+    let y = abs_range(&file, ABS_MT_POSITION_Y).or_else(|| abs_range(&file, ABS_Y))?;
+    Some((x, y))
+}
+
+fn parse_flag(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Raw→screen calibration. Priority: `/etc/kururu-touch.conf` → kernel
+/// auto-detected abs ranges → panel-native defaults (1024×600).
+#[derive(Clone, Copy)]
+struct TouchCal {
+    x_min: i32,
+    x_max: i32,
+    y_min: i32,
+    y_max: i32,
+    swap_xy: bool,
+    invert_x: bool,
+    invert_y: bool,
+}
+
+impl TouchCal {
+    fn defaults() -> Self {
+        Self { x_min: 0, x_max: 1023, y_min: 0, y_max: 599, swap_xy: false, invert_x: false, invert_y: false }
+    }
+
+    fn load() -> Self {
+        let mut cal = Self::defaults();
+        let mut saw_range_key = false;
+        if let Ok(content) = fs::read_to_string(TOUCH_CONF_PATH) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((k, v)) = line.split_once('=') else { continue };
+                let val = v.trim();
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "x_min" => if let Ok(n) = val.parse() { cal.x_min = n; saw_range_key = true; },
+                    "x_max" => if let Ok(n) = val.parse() { cal.x_max = n; saw_range_key = true; },
+                    "y_min" => if let Ok(n) = val.parse() { cal.y_min = n; saw_range_key = true; },
+                    "y_max" => if let Ok(n) = val.parse() { cal.y_max = n; saw_range_key = true; },
+                    "swap_xy" => cal.swap_xy = parse_flag(val),
+                    "invert_x" => cal.invert_x = parse_flag(val),
+                    "invert_y" => cal.invert_y = parse_flag(val),
+                    _ => {}
+                }
+            }
+        }
+        if !saw_range_key {
+            if let Some((x, y)) = detect_ranges(EVENT_TOUCH) {
+                cal.x_min = x.0;
+                cal.x_max = x.1;
+                cal.y_min = y.0;
+                cal.y_max = y.1;
+                // Landscape panel: if the raw X span matches the screen height
+                // (and Y the width), the controller reports in portrait → swap.
+                cal.swap_xy = (x.1 - x.0) < (y.1 - y.0);
+                println!("[Kururu Touch] Auto-detected abs range x=({},{}) y=({},{})", x.0, x.1, y.0, y.1);
+            }
+        }
+        println!(
+            "[Kururu Touch] Calibration x=({}..{}) y=({}..{}) swap_xy={} invert_x={} invert_y={}",
+            cal.x_min, cal.x_max, cal.y_min, cal.y_max, cal.swap_xy, cal.invert_x, cal.invert_y
+        );
+        cal
+    }
+
+    fn to_screen(&self, raw_x: i32, raw_y: i32) -> (usize, usize) {
+        // Screen horizontal maps to raw Y when the controller is portrait.
+        let (h_raw, h_min, h_max, v_raw, v_min, v_max) = if self.swap_xy {
+            (raw_y, self.y_min, self.y_max, raw_x, self.x_min, self.x_max)
+        } else {
+            (raw_x, self.x_min, self.x_max, raw_y, self.y_min, self.y_max)
+        };
+        let hw = (h_max - h_min).max(1) as i64;
+        let vh = (v_max - v_min).max(1) as i64;
+        let fx = (h_raw - h_min) as i64 * FB_WIDTH as i64 / hw;
+        let fy = (v_raw - v_min) as i64 * FB_HEIGHT as i64 / vh;
+        let mut sx = fx.clamp(0, FB_WIDTH as i64 - 1) as usize;
+        let mut sy = fy.clamp(0, FB_HEIGHT as i64 - 1) as usize;
+        if self.invert_x {
+            sx = FB_WIDTH - 1 - sx;
+        }
+        if self.invert_y {
+            sy = FB_HEIGHT - 1 - sy;
+        }
+        (sx, sy)
+    }
 }
 
 fn gather_system_info() -> SystemInfo {
@@ -964,6 +1097,51 @@ fn draw_card(
     fb.draw_rect(x + PAD, y + TITLE_H, w - 2 * PAD, 1, BORDER_COLOR);
 }
 
+/// Header tab rectangles (x, y, w, h) — single source of truth shared by the
+/// renderer (draw_header) and the touch hit-test.
+fn tab_rects() -> [(usize, usize, usize, usize); TAB_COUNT] {
+    let n = TAB_COUNT.min(MAX_TABS);
+    let gap = 8usize;
+    let tab_start = MARGIN + 22 + 10 + 6 * 16 + 24; // frog+brand (96px) + gap
+    let tab_end = FB_WIDTH - MARGIN;
+    let available = tab_end.saturating_sub(tab_start);
+    let tab_w = available.saturating_sub((n - 1) * gap) / n;
+
+    let mut rects = [(0usize, 0usize, 0usize, 0usize); TAB_COUNT];
+    for (i, r) in rects.iter_mut().enumerate() {
+        *r = (tab_start + i * (tab_w + gap), 6, tab_w, 36);
+    }
+    rects
+}
+
+/// Wake the screen and, if the tap lands on a header tab, switch dashboard.
+fn handle_tap(
+    raw_x: i32,
+    raw_y: i32,
+    cal: &TouchCal,
+    active: &AtomicBool,
+    wake: &AtomicBool,
+    tab: &AtomicUsize,
+) {
+    let (sx, sy) = cal.to_screen(raw_x, raw_y);
+    if !active.load(Ordering::SeqCst) {
+        set_display_hardware(true);
+        active.store(true, Ordering::SeqCst);
+    }
+    wake.store(true, Ordering::SeqCst);
+
+    for (i, (x, y, w, h)) in tab_rects().iter().enumerate() {
+        if sx >= *x && sx < x + w && sy >= *y && sy < y + h {
+            tab.store(i, Ordering::SeqCst);
+            println!(
+                "[Kururu Display] Touch -> Switched to Tab {} (raw {},{} -> {}, {})",
+                i + 1, raw_x, raw_y, sx, sy
+            );
+            break;
+        }
+    }
+}
+
 fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
     // Header panel: 48px tall + 2px border at y=48
     fb.draw_rect(0, 0, FB_WIDTH, 48, PANEL_BG);
@@ -979,26 +1157,19 @@ fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
     fb.draw_text(brand_x, 8, "KURURU", TEXT_EMERALD, 2);
 
     // Dynamic tabs fill the remaining span, right-aligned to the margin.
-    // Registry-driven: supports up to MAX_TABS, labels degrade to the index.
-    let n = TAB_COUNT.min(MAX_TABS);
-    let gap = 8usize;
-    let tab_start = brand_x + 6 * 16 + 24; // brand (96px) + gap
-    let tab_end = FB_WIDTH - MARGIN;
-    let available = tab_end.saturating_sub(tab_start);
-    let tab_w = available.saturating_sub((n - 1) * gap) / n;
-
-    let mut tx = tab_start;
-    for (i, name) in TABS.iter().take(n).enumerate() {
+    // Geometry comes from tab_rects() so touch hit-testing stays in sync.
+    for (i, name) in TABS.iter().take(TAB_COUNT.min(MAX_TABS)).enumerate() {
+        let (tx, ty, tab_w, tab_h) = tab_rects()[i];
         let is_active = i == active_tab;
         let bg = if is_active { PANEL_ACTIVE_BG } else { PANEL_BG };
         let border = if is_active { BORDER_ACTIVE } else { BORDER_COLOR };
         let text_color = if is_active { TEXT_EMERALD } else { TEXT_GRAY };
 
-        fb.draw_rect(tx, 6, tab_w, 36, bg);
-        fb.draw_rect(tx, 6, tab_w, 2, border);
-        fb.draw_rect(tx, 40, tab_w, 2, border);
+        fb.draw_rect(tx, ty, tab_w, tab_h, bg);
+        fb.draw_rect(tx, ty, tab_w, 2, border);
+        fb.draw_rect(tx, ty + tab_h - 2, tab_w, 2, border);
         if is_active {
-            fb.draw_rect(tx, 6, 3, 36, BORDER_ACTIVE);
+            fb.draw_rect(tx, ty, 3, tab_h, BORDER_ACTIVE);
         }
 
         // Adaptive label: "N NAME" when it fits, otherwise just "N".
@@ -1010,9 +1181,7 @@ fn draw_header(fb: &mut Framebuffer, active_tab: usize) {
             (num.as_str(), num.len() * 8)
         };
         let text_x = tx + tab_w.saturating_sub(label_px) / 2;
-        fb.draw_text(text_x, 16, label, text_color, 1);
-
-        tx += tab_w + gap;
+        fb.draw_text(text_x, ty + (tab_h - 16) / 2, label, text_color, 1);
     }
 }
 
@@ -1336,7 +1505,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.4 (Retro-HUD UI, sprite engine, live UPS)...");
+    println!("[Kururu Display Daemon] Starting v1.5 (Retro-HUD UI, sprite engine, live UPS, touch input)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -1414,6 +1583,51 @@ fn main() {
                 println!("[Kururu Display] Home key pressed -> Wake/Refreshed");
                 wake_signal_keys.store(true, Ordering::SeqCst);
             }
+        }
+    });
+
+    // Listener: touchscreen (sec_touchscreen on /dev/input/event1).
+    // A tap wakes the screen; a tap on a header tab switches dashboard.
+    let touch_active = screen_active.clone();
+    let touch_wake = wake_signal.clone();
+    let touch_tab = current_tab.clone();
+    let touch_cal = TouchCal::load();
+    let touch_debug = std::env::var_os("KURURU_TOUCH_DEBUG").is_some();
+    let mut touch_x: i32 = 0;
+    let mut touch_y: i32 = 0;
+    let mut touch_down = false;
+    spawn_input_listener(EVENT_TOUCH, move |event| {
+        if touch_debug {
+            eprintln!(
+                "[Kururu Touch] type={} code={} value={}",
+                event.type_, event.code, event.value
+            );
+        }
+        match event.type_ {
+            EV_ABS => match event.code {
+                ABS_MT_POSITION_X | ABS_X => touch_x = event.value,
+                ABS_MT_POSITION_Y | ABS_Y => touch_y = event.value,
+                ABS_MT_TRACKING_ID => {
+                    if event.value < 0 {
+                        if touch_down {
+                            touch_down = false;
+                            handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab);
+                        }
+                    } else {
+                        touch_down = true;
+                    }
+                }
+                _ => {}
+            },
+            EV_KEY if event.code == BTN_TOUCH => {
+                if event.value == 1 {
+                    touch_down = true;
+                } else if event.value == 0 && touch_down {
+                    touch_down = false;
+                    handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab);
+                }
+            }
+            _ => {}
         }
     });
 
