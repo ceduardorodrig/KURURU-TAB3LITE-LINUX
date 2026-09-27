@@ -86,6 +86,33 @@ const TABS: [&str; 3] = ["KURURU", "HOMELAB", "RETRO CLOCK"];
 const TAB_COUNT: usize = TABS.len();
 const MAX_TABS: usize = 8;
 
+// ── Unified UI shell: screens + menu registry ──────────────────────────
+const SCREEN_DASHBOARD: usize = 0;
+const SCREEN_MENU: usize = 1;
+const SCREEN_ABOUT: usize = 2;
+const SCREEN_SETTINGS: usize = 3;
+const SCREEN_TERMINAL: usize = 4;
+
+/// Menu entries: (label, target screen). Single source of truth for the
+/// renderer AND the touch hit-test.
+const MENU_ITEMS: [(&str, usize); 4] = [
+    ("Dashboard", SCREEN_DASHBOARD),
+    ("Settings", SCREEN_SETTINGS),
+    ("Terminal", SCREEN_TERMINAL),
+    ("About", SCREEN_ABOUT),
+];
+const MENU_COUNT: usize = MENU_ITEMS.len();
+const MENU_ITEM_H: usize = 40;
+const MENU_ITEM_GAP: usize = 8;
+const MENU_X: usize = 300;
+const MENU_W: usize = FB_WIDTH - 2 * MENU_X; // centered column (424)
+const MENU_Y0: usize = 96;
+
+/// Rectangle of a menu row — shared by render_menu and the touch hit-test.
+fn menu_item_rect(i: usize) -> (usize, usize, usize, usize) {
+    (MENU_X, MENU_Y0 + i * (MENU_ITEM_H + MENU_ITEM_GAP), MENU_W, MENU_ITEM_H)
+}
+
 // ── Pixel-art sprites ('#' = pixel). Data-driven masks rendered by
 //    Framebuffer::draw_sprite — adding art is just adding a mask. ──────
 const SP_FROG_BODY: &[&str] = &[
@@ -1074,6 +1101,8 @@ fn handle_tap(
     active: &AtomicBool,
     wake: &AtomicBool,
     tab: &AtomicUsize,
+    screen: &AtomicUsize,
+    menu_cursor: &AtomicUsize,
 ) {
     let (sx, sy) = cal.to_screen(raw_x, raw_y);
     if !active.load(Ordering::SeqCst) {
@@ -1082,14 +1111,33 @@ fn handle_tap(
     }
     wake.store(true, Ordering::SeqCst);
 
-    for (i, (x, y, w, h)) in tab_rects().iter().enumerate() {
-        if sx >= *x && sx < x + w && sy >= *y && sy < y + h {
-            tab.store(i, Ordering::SeqCst);
-            println!(
-                "[Kururu Display] Touch -> Switched to Tab {} (raw {},{} -> {}, {})",
-                i + 1, raw_x, raw_y, sx, sy
-            );
-            break;
+    match screen.load(Ordering::SeqCst) {
+        SCREEN_DASHBOARD => {
+            for (i, (x, y, w, h)) in tab_rects().iter().enumerate() {
+                if sx >= *x && sx < x + w && sy >= *y && sy < y + h {
+                    tab.store(i, Ordering::SeqCst);
+                    println!(
+                        "[Kururu Display] Touch -> Tab {} (raw {},{} -> {}, {})",
+                        i + 1, raw_x, raw_y, sx, sy
+                    );
+                    break;
+                }
+            }
+        }
+        SCREEN_MENU => {
+            for i in 0..MENU_COUNT {
+                let (x, y, w, h) = menu_item_rect(i);
+                if sx >= x && sx < x + w && sy >= y && sy < y + h {
+                    menu_cursor.store(i, Ordering::SeqCst);
+                    screen.store(MENU_ITEMS[i].1, Ordering::SeqCst);
+                    println!("[Kururu Display] Touch -> Menu '{}'", MENU_ITEMS[i].0);
+                    break;
+                }
+            }
+        }
+        _ => {
+            // Any tap on a secondary screen goes back to the menu.
+            screen.store(SCREEN_MENU, Ordering::SeqCst);
         }
     }
 }
@@ -1158,6 +1206,80 @@ fn draw_footer(fb: &mut Framebuffer, info: &SystemInfo) {
     fb.draw_text(sep_x - 8 - sleep.len() * 8, 576, sleep, TEXT_DIM, 1);
     fb.draw_text(sep_x, 576, "|", TEXT_DIM, 1);
     fb.draw_text(ups_x, 576, &ups, battery_color(info.battery_pct_num), 1);
+}
+
+// -------------------------------------------------------------
+// Unified UI shell — design-system widgets + non-dashboard screens
+// -------------------------------------------------------------
+/// Top bar for non-dashboard screens (consistent with the dashboard header).
+fn draw_topbar(fb: &mut Framebuffer, title: &str, hint: &str) {
+    fb.draw_rect(0, 0, FB_WIDTH, 48, PANEL_BG);
+    fb.draw_rect(0, 48, FB_WIDTH, 2, BORDER_COLOR);
+    fb.draw_rect(MARGIN, 18, 12, 12, TEXT_EMERALD); // accent marker
+    fb.draw_text(MARGIN + 24, 8, title, TEXT_WHITE, 2);
+    if !hint.is_empty() {
+        let hx = FB_WIDTH - MARGIN - hint.len() * 8;
+        fb.draw_text(hx, 16, hint, TEXT_GRAY, 1);
+    }
+}
+
+/// Bottom hint bar for non-dashboard screens.
+fn draw_hint_footer(fb: &mut Framebuffer, hint: &str) {
+    fb.draw_rect(0, 568, FB_WIDTH, 32, PANEL_BG);
+    fb.draw_rect(0, 568, FB_WIDTH, 1, BORDER_COLOR);
+    let x = (FB_WIDTH.saturating_sub(hint.len() * 8)) / 2;
+    fb.draw_text(x, 576, hint, TEXT_DIM, 1);
+}
+
+/// Reusable list row (menu / settings). `selected` draws the active style.
+fn draw_list_item(fb: &mut Framebuffer, x: usize, y: usize, w: usize, label: &str, selected: bool) {
+    let h = MENU_ITEM_H;
+    let bg = if selected { PANEL_ACTIVE_BG } else { PANEL_BG };
+    let border = if selected { BORDER_ACTIVE } else { BORDER_COLOR };
+    let fg = if selected { TEXT_EMERALD } else { TEXT_WHITE };
+    fb.draw_rect(x, y, w, h, bg);
+    fb.draw_rect(x, y, w, 1, border);
+    fb.draw_rect(x, y + h - 1, w, 1, border);
+    if selected {
+        fb.draw_rect(x, y, 3, h, BORDER_ACTIVE);
+    }
+    fb.draw_rect(x + 16, y + (h - 8) / 2, 8, 8, fg); // bullet
+    fb.draw_text(x + 36, y + (h - 16) / 2, label, fg, 1);
+}
+
+fn render_menu(fb: &mut Framebuffer, cursor: usize) {
+    draw_topbar(fb, "MENU", "[HOME] Enter");
+    for (i, (label, _)) in MENU_ITEMS.iter().enumerate() {
+        let (x, y, w, _) = menu_item_rect(i);
+        draw_list_item(fb, x, y, w, label, i == cursor);
+    }
+    draw_hint_footer(fb, "[VOL+] Up   [VOL-] Down   [HOME] Select   [POWER] Sleep");
+}
+
+fn render_about(fb: &mut Framebuffer, info: &SystemInfo) {
+    draw_topbar(fb, "ABOUT", "[HOME] Back");
+    let lines = [
+        "KURURU - Native Headless Linux Node".to_string(),
+        "Samsung Galaxy Tab 3 Lite (SM-T110 / goyawifi)".to_string(),
+        format!("Alpine Linux / musl  ·  Kernel {}", info.kernel_version),
+        "Display: kururu-display v1.8".to_string(),
+        format!("Uptime: {}", info.uptime_str),
+        "github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX".to_string(),
+    ];
+    let mut y = 150;
+    for line in &lines {
+        let x = (FB_WIDTH.saturating_sub(line.len() * 8)) / 2;
+        fb.draw_text(x, y, line, TEXT_GRAY, 1);
+        y += 28;
+    }
+    draw_hint_footer(fb, "[HOME] Back");
+}
+
+fn render_placeholder(fb: &mut Framebuffer, title: &str, msg: &str) {
+    draw_topbar(fb, title, "[HOME] Back");
+    let x = (FB_WIDTH.saturating_sub(msg.len() * 8)) / 2;
+    fb.draw_text(x, 280, msg, TEXT_DIM, 1);
+    draw_hint_footer(fb, "[HOME] Back");
 }
 
 // -------------------------------------------------------------
@@ -1457,7 +1579,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v1.7 (1s live refresh, Retro-HUD UI, live UPS, touch)...");
+    println!("[Kururu Display Daemon] Starting v1.8 (UI shell: menu + screen-aware buttons, 1s live refresh)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -1465,6 +1587,13 @@ fn main() {
         .and_then(|a| a.parse::<usize>().ok())
         .map(|t| t.min(TAB_COUNT - 1))
         .unwrap_or(0);
+
+    // Optional initial screen: `kururu-display <tab> <screen>` (kiosk/debug).
+    let initial_screen = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse::<usize>().ok())
+        .map(|s| s.min(SCREEN_TERMINAL))
+        .unwrap_or(SCREEN_DASHBOARD);
 
     // Force Brazil / Brasília time (UTC-3, fixed — no DST since 2019).
     // Use POSIX inline string "BRT3" instead of "America/Sao_Paulo" which
@@ -1486,6 +1615,12 @@ fn main() {
 
     let current_tab = Arc::new(AtomicUsize::new(initial_tab));
     let current_tab_keys = current_tab.clone();
+
+    let current_screen = Arc::new(AtomicUsize::new(initial_screen));
+    let current_screen_keys = current_screen.clone();
+
+    let menu_cursor = Arc::new(AtomicUsize::new(0));
+    let menu_cursor_keys = menu_cursor.clone();
 
     let wake_signal = Arc::new(AtomicBool::new(true));
     let wake_signal_power = wake_signal.clone();
@@ -1512,8 +1647,9 @@ fn main() {
         }
     });
 
-    // Listener: hardware Volume Up / Volume Down keys (/dev/input/event0)
-    // INVERTED: Volume Up goes right-to-left (prev tab); Volume Down goes left-to-right (next tab)
+    // Listener: hardware Volume Up / Down + Home keys (/dev/input/event0).
+    // Screen-aware: on the Dashboard, VOL± switch tabs and HOME opens the menu;
+    // elsewhere VOL± move the cursor and HOME selects / goes back.
     spawn_input_listener(EVENT_KEYS, move |event| {
         // Only respond on key down (value == 1)
         if event.type_ == EV_KEY && event.value == 1 {
@@ -1522,24 +1658,46 @@ fn main() {
                 println!("[Kururu Display] Key pressed while asleep -> Waking display up");
                 set_display_hardware(true);
                 screen_active_keys.store(true, Ordering::SeqCst);
-                wake_signal_keys.store(true, Ordering::SeqCst);
             }
+            wake_signal_keys.store(true, Ordering::SeqCst);
 
-            if event.code == KEY_VOLUMEUP {
-                // Volume Up: right-to-left (previous tab)
-                let prev = (current_tab_keys.load(Ordering::SeqCst) + TAB_COUNT - 1) % TAB_COUNT;
-                current_tab_keys.store(prev, Ordering::SeqCst);
-                println!("[Kururu Display] Volume UP -> Switched to Tab {} (<-)", prev + 1);
-                wake_signal_keys.store(true, Ordering::SeqCst);
-            } else if event.code == KEY_VOLUMEDOWN {
-                // Volume Down: left-to-right (next tab)
-                let next = (current_tab_keys.load(Ordering::SeqCst) + 1) % TAB_COUNT;
-                current_tab_keys.store(next, Ordering::SeqCst);
-                println!("[Kururu Display] Volume DOWN -> Switched to Tab {} (->)", next + 1);
-                wake_signal_keys.store(true, Ordering::SeqCst);
-            } else if event.code == KEY_HOMEPAGE {
-                println!("[Kururu Display] Home key pressed -> Wake/Refreshed");
-                wake_signal_keys.store(true, Ordering::SeqCst);
+            let screen = current_screen_keys.load(Ordering::SeqCst);
+            match event.code {
+                KEY_VOLUMEUP | KEY_VOLUMEDOWN => {
+                    let up = event.code == KEY_VOLUMEUP;
+                    if screen == SCREEN_DASHBOARD {
+                        let cur = current_tab_keys.load(Ordering::SeqCst);
+                        let next = if up {
+                            (cur + TAB_COUNT - 1) % TAB_COUNT
+                        } else {
+                            (cur + 1) % TAB_COUNT
+                        };
+                        current_tab_keys.store(next, Ordering::SeqCst);
+                    } else if screen == SCREEN_MENU {
+                        let cur = menu_cursor_keys.load(Ordering::SeqCst);
+                        let next = if up {
+                            (cur + MENU_COUNT - 1) % MENU_COUNT
+                        } else {
+                            (cur + 1) % MENU_COUNT
+                        };
+                        menu_cursor_keys.store(next, Ordering::SeqCst);
+                    }
+                }
+                KEY_HOMEPAGE => {
+                    if screen == SCREEN_DASHBOARD {
+                        menu_cursor_keys.store(0, Ordering::SeqCst);
+                        current_screen_keys.store(SCREEN_MENU, Ordering::SeqCst);
+                        println!("[Kururu Display] Home -> Menu");
+                    } else if screen == SCREEN_MENU {
+                        let cursor = menu_cursor_keys.load(Ordering::SeqCst);
+                        current_screen_keys.store(MENU_ITEMS[cursor].1, Ordering::SeqCst);
+                        println!("[Kururu Display] Home -> '{}'", MENU_ITEMS[cursor].0);
+                    } else {
+                        current_screen_keys.store(SCREEN_MENU, Ordering::SeqCst);
+                        println!("[Kururu Display] Home -> Back to Menu");
+                    }
+                }
+                _ => {}
             }
         }
     });
@@ -1549,6 +1707,8 @@ fn main() {
     let touch_active = screen_active.clone();
     let touch_wake = wake_signal.clone();
     let touch_tab = current_tab.clone();
+    let touch_screen = current_screen.clone();
+    let touch_menu = menu_cursor.clone();
     let touch_cal = TouchCal::load();
     let touch_debug = std::env::var_os("KURURU_TOUCH_DEBUG").is_some();
     let mut touch_x: i32 = 0;
@@ -1569,7 +1729,7 @@ fn main() {
                     if event.value < 0 {
                         if touch_down {
                             touch_down = false;
-                            handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab);
+                            handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab, &touch_screen, &touch_menu);
                         }
                     } else {
                         touch_down = true;
@@ -1582,7 +1742,7 @@ fn main() {
                     touch_down = true;
                 } else if event.value == 0 && touch_down {
                     touch_down = false;
-                    handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab);
+                    handle_tap(touch_x, touch_y, &touch_cal, &touch_active, &touch_wake, &touch_tab, &touch_screen, &touch_menu);
                 }
             }
             _ => {}
@@ -1670,19 +1830,28 @@ fn main() {
 
             if should_render {
                 if let Some(ref info) = cached_info {
-                    let tab = current_tab.load(Ordering::SeqCst);
+                    let screen = current_screen.load(Ordering::SeqCst);
 
                     fb.clear(BG_COLOR);
                     draw_background_grid(&mut fb);
-                    draw_header(&mut fb, tab);
 
-                    match tab {
-                        0 => render_tab_kururu(&mut fb, info),
-                        1 => render_tab_homelab(&mut fb, info),
-                        _ => render_tab_clock(&mut fb, info),
+                    match screen {
+                        SCREEN_MENU => render_menu(&mut fb, menu_cursor.load(Ordering::SeqCst)),
+                        SCREEN_ABOUT => render_about(&mut fb, info),
+                        SCREEN_SETTINGS => render_placeholder(&mut fb, "SETTINGS", "Settings - em construcao (Fase 4)."),
+                        SCREEN_TERMINAL => render_placeholder(&mut fb, "TERMINAL", "Terminal - em construcao (Fase 5)."),
+                        _ => {
+                            let tab = current_tab.load(Ordering::SeqCst);
+                            draw_header(&mut fb, tab);
+                            match tab {
+                                0 => render_tab_kururu(&mut fb, info),
+                                1 => render_tab_homelab(&mut fb, info),
+                                _ => render_tab_clock(&mut fb, info),
+                            }
+                            draw_footer(&mut fb, info);
+                        }
                     }
 
-                    draw_footer(&mut fb, info);
                     let _ = fb.flush();
                 }
             }
