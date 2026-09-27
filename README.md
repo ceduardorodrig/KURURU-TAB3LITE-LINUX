@@ -23,10 +23,12 @@ Millions of **Samsung Galaxy Tab 3 Lite 7.0 (`SM-T110`, codename `goyawifi`)** d
 
 **Kururu** transforms this device into a 24/7 dedicated, ultra-low-power (< 1W) **headless Linux server** running in your private **Tailnet** mesh network:
 * **Zero Android Bloat:** Android Java runtime (`zygote`), GUI (`surfaceflinger`), and Google frameworks are disabled at bootloader/init level.
-* **Massive RAM Gain:** RAM usage drops from ~750 MB down to **~40 MB**, leaving **>770 MB of free RAM** for Rust daemons and homelab services.
+* **Massive RAM Gain:** RAM usage drops from ~750 MB down to **~43 MB**, leaving **>770 MB of free RAM** for Rust daemons and homelab services.
+* **Integrated UPS / No-Break:** The tablet's built-in 3600 mAh battery acts as an uninterruptible power supply, keeping the node online for hours during power outages or line flickers.
+* **100% Autonomous & Wireless:** Once bootstrapped, the device runs untethered from any PC. It only requires a standard micro-USB wall charger (5V / 1A) and communicates over Wi-Fi and WireGuard.
 * **100% Hardware Stability:** Uses the official Samsung/Marvell Linux kernel 3.4.5 to keep proprietary Marvell SD8777 Wi-Fi calibration and AXP228 power management running flawlessly without overheating or dropping connection.
 * **Pure Alpine Linux Userspace:** Modern Alpine v3.20 rootfs (`musl libc`) with native ARMv7 tools.
-* **Physical Power Button Toggle:** Includes a custom background daemon (`kururu-display`) written in Rust that listens to `/dev/input/event2`. Pressing the tablet's physical Power button turns the screen ON (at readable brightness) or OFF (zero display power).
+* **Physical Power Button & Live Dashboard:** Includes a custom background daemon (`kururu-display`) in Rust that renders real-time telemetry, a live kernel log console, and a dedicated status panel for core homelab nodes directly to the 1024x600 framebuffer.
 
 ---
 
@@ -39,9 +41,10 @@ Millions of **Samsung Galaxy Tab 3 Lite 7.0 (`SM-T110`, codename `goyawifi`)** d
 | **Architecture** | `armv7l` (ARM 32-bit with NEON / VFPv3) |
 | **System Memory** | 1 GB LPDDR2 (~816 MB available, **~770 MB free**) |
 | **Internal Storage** | 8 GB eMMC v4.5 (5.1 GB dedicated `/data` ext4 partition) |
-| **Wireless** | Marvell SD8777 (802.11 b/g/n Wi-Fi + Bluetooth 4.0) |
+| **Wireless** | Marvell SD8777 (Single-Band 2.4 GHz 802.11 b/g/n, high wall penetration, 150 Mbps) |
+| **Integrated Battery** | 3600 mAh Li-ion (acts as built-in hardware UPS / no-break) |
 | **Power Consumption** | < 0.8W average in idle mode (screen unlit) |
-| **Network Interfaces** | Native `mlan0` (Wi-Fi) + `tailscale0` (WireGuard mesh) |
+| **Network Interfaces** | Native `mlan0` (Wi-Fi 2.4 GHz) + `tailscale0` (WireGuard mesh) |
 
 ---
 
@@ -136,9 +139,11 @@ The tablet will boot silently directly into Alpine Linux. In less than 30 second
 ssh root@192.168.3.55
 ```
 
-### Worldwide (Tailscale SSH)
-Once authenticated into your Tailnet:
+### Worldwide (Tailscale Mesh)
+Once authenticated into your Tailnet (`chimaera-heptatonic.ts.net`), connect from anywhere in the world:
 ```bash
+ssh root@kururu
+# or via Tailscale SSH CLI:
 tailscale ssh root@kururu
 ```
 
@@ -147,10 +152,15 @@ tailscale ssh root@kururu
 ## 📦 Included Rust Crates
 
 ### `crates/kururu-su`
-A lightweight, zero-dependency `su` binary compiled statically for `armv7-unknown-linux-musleabihf` that bypasses Android Bionic's missing `/etc/passwd` limitation.
+A lightweight, zero-dependency `su` binary compiled statically for `armv7-unknown-linux-musleabihf` that bypasses Android Bionic's missing `/etc/passwd` limitation and supports chroot breakout tools.
 
 ### `crates/kururu-display`
-An event-driven daemon that monitors `/dev/input/event2` (the tablet's PMIC hardware Power key). When awake, it renders a high-performance, retro-styled live terminal dashboard directly to `/dev/graphics/fb0` showing real-time node telemetry (CPU load, memory breakdown, battery percentage, Wi-Fi & Tailscale IPs) and live kernel `dmesg` logs. Includes hardware sleep/blanking toggle and a 120-second inactivity timer to protect the display and conserve energy.
+An event-driven hardware and graphics daemon written in native Rust (`edition = "2021"`). Features:
+* **Zero Overhead Framebuffer Rendering:** Directly maps `/dev/graphics/fb0` (1024x600, 32bpp) without running X11, Wayland, or Android SurfaceFlinger.
+* **100% Dynamic Telemetry:** Gathers live CPU load averages, RAM allocation, and PMIC battery health (percentage, microvolt fuelgauge voltage, and cell temperature).
+* **Homelab Node Monitor:** Dynamically inspects the Tailscale local API to monitor the 5 core cluster servers in real time: `Psicopompo`, `Kuaray`, `Kavure`, `Ybytu`, and `Ybyra` (indicating direct links, active WireGuard peers, and total mesh size).
+* **Live System Console:** Embedded JetBrains Mono bitmap font renders the tail of the kernel `dmesg` log in real-time.
+* **Hardware Power Key Control:** Listens to `/dev/input/event2` (Marvell 88PM822 PMIC `KEY_POWER`). Pushing the tablet's physical power button wakes or sleeps the display panel, with an automatic 120-second inactivity sleep timer.
 
 ---
 
