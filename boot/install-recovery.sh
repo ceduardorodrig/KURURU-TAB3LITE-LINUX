@@ -151,6 +151,8 @@ nohup chroot /data/alpine /usr/local/bin/kururu-display > /data/kururu-display.l
 # Start Kururu Wake-on-LAN (WOL) Relay Daemon on port 9096
 echo "[Kururu] Starting Wake-on-LAN HTTP Relay Daemon (port 9096)..."
 killall kururu-wake 2>/dev/null
-nohup chroot /data/alpine /usr/local/bin/kururu-wake --daemon 9096 > /var/log/kururu-wol-daemon.log 2>&1 &
+# NOTE: redirect target must exist in the Android init context (/var does not
+# exist there — that silently aborted the daemon at boot). Use /data instead.
+nohup chroot /data/alpine /usr/local/bin/kururu-wake --daemon 9096 > /data/kururu-wol-daemon.log 2>&1 &
 
 echo "=== [Kururu] Native Headless Boot Sequence Complete ==="
