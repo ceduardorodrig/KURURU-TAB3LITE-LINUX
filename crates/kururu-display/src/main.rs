@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 mod font;
 
+extern "C" {
+    fn tzset();
+}
+
 const FB_PATH: &str = "/dev/graphics/fb0";
 const EVENT_POWER: &str = "/dev/input/event2";
 const EVENT_KEYS: &str = "/dev/input/event0";
@@ -248,6 +252,20 @@ struct SystemInfo {
 
 fn check_wol_daemon() -> bool {
     TcpStream::connect("127.0.0.1:9096").is_ok()
+}
+
+/// Returns current local time as "[HH:MM:SS]" using the same TZ-aware libc
+/// path as the retro clock, ensuring all log timestamps stay consistent.
+fn local_time_str() -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let tm = libc::localtime(&t);
+        if !tm.is_null() {
+            format!("[{:02}:{:02}:{:02}]", (*tm).tm_hour, (*tm).tm_min, (*tm).tm_sec)
+        } else {
+            "[--:--:--]".to_string()
+        }
+    }
 }
 
 fn gather_system_info() -> SystemInfo {
@@ -521,6 +539,7 @@ fn gather_system_info() -> SystemInfo {
         }
     }
 
+    let ts = local_time_str();
     let mut logs = Vec::new();
     if let Ok(output) = Command::new("dmesg").output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -531,7 +550,8 @@ fn gather_system_info() -> SystemInfo {
             0
         };
         for line in &lines[start..] {
-            logs.push(line.trim_end().to_string());
+            // Prepend wall-clock timestamp so dmesg lines are clock-aligned
+            logs.push(format!("{} {}", ts, line.trim_end()));
         }
     }
 
@@ -555,6 +575,12 @@ fn gather_system_info() -> SystemInfo {
         "January", "February", "March", "April", "May", "June", "July", "August",
         "September", "October", "November", "December",
     ];
+
+    // Force Brazil / America/Sao_Paulo timezone
+    std::env::set_var("TZ", "America/Sao_Paulo");
+    unsafe {
+        tzset();
+    }
 
     let (time_str, date_str, day_name, date_full_str) = unsafe {
         let t = libc::time(std::ptr::null_mut());
@@ -759,34 +785,29 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
     };
 
     let telemetry_lines = [
-        format!("Device Model:   Samsung Tab 3 Lite (SM-T110)"),
-        format!("Linux Kernel:   {} (armv7l SMP)", info.kernel_version),
-        format!("Distribution:   Alpine Linux v3.20.3 (musl)"),
-        format!("APU Processor:  Marvell PXA988 Dual Cortex-A9"),
-        format!("CPU Frequency:  {} [ondemand governor]", info.cpu_freq_str),
-        format!("System Load:    {} (1m, 5m, 15m)", info.load_avg),
-        format!("Node Uptime:    {}", info.uptime_str),
-        format!(
-            "RAM Memory:     {} MB used / {} MB ({}% free)",
-            info.ram_used_mb, info.ram_total_mb, free_pct
+        ("Device Model:", "Samsung Tab 3 Lite (SM-T110)"),
+        ("Linux Kernel:", info.kernel_version.as_str()),
+        ("Distribution:", "Alpine Linux v3.20.3 (musl)"),
+        ("APU Processor:", "Marvell PXA988 Dual Cortex-A9"),
+        ("CPU Frequency:", info.cpu_freq_str.as_str()),
+        ("System Load:", info.load_avg.as_str()),
+        ("Node Uptime:", info.uptime_str.as_str()),
+        (
+            "RAM Memory:",
+            &format!("{} MB used / {} MB ({}% free)", info.ram_used_mb, info.ram_total_mb, free_pct),
         ),
-        format!(
-            "Storage Rootfs: {} MB free / {} MB total",
-            info.disk_free_mb, info.disk_total_mb
+        (
+            "Storage Rootfs:",
+            &format!("{} MB free / {} MB total", info.disk_free_mb, info.disk_total_mb),
         ),
-        format!("Init Mode:      Native Headless Bare-Metal"),
+        ("Init Mode:", "Native Headless Bare-Metal"),
     ];
 
-    let mut ty = 90;
-    for line in &telemetry_lines {
-        let (label, val) = if let Some(idx) = line.find(':') {
-            (&line[..=idx], &line[idx + 1..])
-        } else {
-            (line.as_str(), "")
-        };
+    let mut ty = 92;
+    for (label, val) in &telemetry_lines {
         fb.draw_text(28, ty, label, TEXT_GRAY, 1);
-        fb.draw_text(160, ty, val.trim_start(), TEXT_WHITE, 1);
-        ty += 18;
+        fb.draw_text(165, ty, val, TEXT_WHITE, 1);
+        ty += 19;
     }
 
     // Card 2: Top Right - PMIC Battery & Local Wi-Fi Radio
@@ -796,34 +817,29 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
 
     // Battery bar inside Card 2
     fb.draw_text(524, 92, "Battery Level:", TEXT_GRAY, 1);
-    fb.draw_rect(640, 90, 204, 16, BORDER_COLOR);
-    let fill_w = (info.battery_pct_num as usize * 200) / 100;
-    fb.draw_rect(642, 92, fill_w, 12, TEXT_EMERALD);
+    fb.draw_rect(656, 90, 200, 16, BORDER_COLOR);
+    let fill_w = (info.battery_pct_num as usize * 196) / 100;
+    fb.draw_rect(658, 92, fill_w, 12, TEXT_EMERALD);
     let bat_label = format!("{}% ({})", info.battery_pct, info.battery_status);
-    fb.draw_text(854, 92, &bat_label, TEXT_WHITE, 1);
+    fb.draw_text(866, 92, &bat_label, TEXT_WHITE, 1);
 
     let power_radio_lines = [
-        format!("Fuelgauge:      {} • Temp: {}", info.battery_volts, info.battery_temp_c),
-        format!("Hardware PMIC:  Marvell 88PM822 / AXP228 Driver"),
-        format!("UPS Protection: Active (3600 mAh Built-in Buffer)"),
-        format!("Wi-Fi Chipset:  Marvell SD8777 (Interface: mlan0)"),
-        format!("Connected AP:   {} (2.4 GHz BSSID)", info.wifi_ssid),
-        format!("Signal Level:   {} (Link Quality: 5/5)", info.wifi_signal_dbm),
-        format!("Local LAN IP:   {} (Port 22 Open)", info.lan_ip),
-        format!("Hardware MAC:   {}", info.wifi_mac),
-        format!("SSH Service:    Dropbear (authorized keys root)"),
+        ("Fuelgauge:", format!("{} • Temp: {}", info.battery_volts, info.battery_temp_c)),
+        ("Hardware PMIC:", "Marvell 88PM822 / AXP228 Driver".to_string()),
+        ("UPS Protection:", "Active (3600 mAh Built-in Buffer)".to_string()),
+        ("Wi-Fi Chipset:", "Marvell SD8777 (Interface: mlan0)".to_string()),
+        ("Connected AP:", format!("{} (2.4 GHz BSSID)", info.wifi_ssid)),
+        ("Signal Level:", format!("{} (Link Quality: 5/5)", info.wifi_signal_dbm)),
+        ("Local LAN IP:", format!("{} (Port 22 Open)", info.lan_ip)),
+        ("Hardware MAC:", info.wifi_mac.clone()),
+        ("SSH Service:", "Dropbear (authorized keys root)".to_string()),
     ];
 
     let mut ry = 114;
-    for line in &power_radio_lines {
-        let (label, val) = if let Some(idx) = line.find(':') {
-            (&line[..=idx], &line[idx + 1..])
-        } else {
-            (line.as_str(), "")
-        };
+    for (label, val) in &power_radio_lines {
         fb.draw_text(524, ry, label, TEXT_GRAY, 1);
-        fb.draw_text(645, ry, val.trim_start(), TEXT_WHITE, 1);
-        ry += 18;
+        fb.draw_text(668, ry, val, TEXT_WHITE, 1);
+        ry += 19;
     }
 
     // Card 3: Bottom - Live Kernel Log Console (dmesg tail)
@@ -839,8 +855,8 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
             log.as_str()
         };
         fb.draw_text(28, log_y, truncated, TEXT_GRAY, 1);
-        log_y += 15;
-        if log_y > 548 {
+        log_y += 17;
+        if log_y > 546 {
             break;
         }
     }
@@ -861,13 +877,13 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     fb.draw_text(28, 68, &cluster_header, TEXT_AMBER, 1);
 
     fb.draw_text(28, 90, "Tailnet:", TEXT_GRAY, 1);
-    fb.draw_text(110, 90, &info.tailnet_suffix, TEXT_CYAN, 1);
+    fb.draw_text(130, 90, &info.tailnet_suffix, TEXT_CYAN, 1);
 
     fb.draw_text(28, 108, "Kururu IP:", TEXT_GRAY, 1);
-    fb.draw_text(110, 108, &info.tailscale_ip, TEXT_WHITE, 1);
+    fb.draw_text(130, 108, &info.tailscale_ip, TEXT_WHITE, 1);
 
     fb.draw_text(28, 126, "Direct Link:", TEXT_GRAY, 1);
-    fb.draw_text(110, 126, &info.active_link_str, TEXT_EMERALD, 1);
+    fb.draw_text(130, 126, &info.active_link_str, TEXT_EMERALD, 1);
 
     // Dynamic Server List (5 core servers)
     let mut py = 148;
@@ -922,7 +938,7 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     let mut wy = 90;
     for (label, val, col) in &wol_lines {
         fb.draw_text(524, wy, label, TEXT_GRAY, 1);
-        fb.draw_text(655, wy, val, *col, 1);
+        fb.draw_text(678, wy, val, *col, 1);
         wy += 19;
     }
 
@@ -931,7 +947,7 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     fb.draw_rect(16, 308, 992, 2, BORDER_COLOR);
     fb.draw_text(28, 318, "RECENT WAKE-ON-LAN DISPATCH AUDIT LOG (/var/log/kururu-wol.log)", TEXT_EMERALD, 1);
 
-    let mut log_y = 340;
+    let mut log_y = 338;
     if info.wol_logs.is_empty() {
         fb.draw_text(28, log_y, "No Wake-on-LAN packets dispatched yet. Waiting for triggers on port 9096...", TEXT_DIM, 1);
     } else {
@@ -942,8 +958,8 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
                 log.as_str()
             };
             fb.draw_text(28, log_y, truncated, TEXT_CYAN, 1);
-            log_y += 15;
-            if log_y > 548 {
+            log_y += 17;
+            if log_y > 546 {
                 break;
             }
         }
@@ -958,17 +974,17 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     fb.draw_rect(16, 56, 992, 294, PANEL_BG);
     fb.draw_rect(16, 56, 992, 2, BORDER_COLOR);
 
-    fb.draw_text(40, 70, "MNEMOCINE TIME STATION • SOVEREIGN NTP CLOCK", TEXT_AMBER, 1);
+    fb.draw_text(32, 70, "MNEMOCINE TIME STATION • SOVEREIGN NTP CLOCK", TEXT_AMBER, 1);
 
     // Render huge 5x clock (Font 8x16 scaled 5x = 40x80 px per char)
     // 8 chars * 40 px = 320 px width -> Center at x = (1024 - 320) / 2 = 352
-    fb.draw_text(352, 98, &info.time_str, TEXT_EMERALD, 5);
+    fb.draw_text(352, 96, &info.time_str, TEXT_EMERALD, 5);
 
     // Date banner (Scale 2, centered)
     let date_char_w = 8 * 2;
     let date_width = info.date_full_str.len() * date_char_w;
     let date_x = (FB_WIDTH.saturating_sub(date_width)) / 2;
-    fb.draw_text(date_x, 198, &info.date_full_str, TEXT_CYAN, 2);
+    fb.draw_text(date_x, 196, &info.date_full_str, TEXT_CYAN, 2);
 
     // Minimal Sub-banner
     let sub = format!("Timezone: America/Sao_Paulo (UTC-3) • Host: {} • Uptime: {}", info.hostname, info.uptime_str);
@@ -981,7 +997,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
         info.homelab_online_count, info.wifi_ssid, info.wifi_signal_dbm
     );
     let dots_x = (FB_WIDTH.saturating_sub(cluster_pill.len() * 8)) / 2;
-    fb.draw_text(dots_x, 274, &cluster_pill, TEXT_DIM, 1);
+    fb.draw_text(dots_x, 272, &cluster_pill, TEXT_DIM, 1);
 
     // Bottom Ambient Ribbon: 3 Clean Symmetrical Vitals Cards (Each 316px wide)
     // Card 1: Hardware UPS & Power (Left)
@@ -989,21 +1005,22 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     fb.draw_rect(16, 358, 316, 2, BORDER_COLOR);
     fb.draw_text(28, 370, "HARDWARE UPS / NO-BREAK", TEXT_AMBER, 1);
 
-    fb.draw_rect(28, 396, 280, 16, BORDER_COLOR);
-    let fill_w = (info.battery_pct_num as usize * 276) / 100;
+    fb.draw_rect(28, 396, 292, 16, BORDER_COLOR);
+    let fill_w = (info.battery_pct_num as usize * 288) / 100;
     fb.draw_rect(30, 398, fill_w, 12, TEXT_EMERALD);
 
     let ups_lines = [
-        format!("Charge:     {}% ({})", info.battery_pct, info.battery_status),
-        format!("Voltage:    {}", info.battery_volts),
-        format!("Thermal:    {}", info.battery_temp_c),
-        format!("AC Supply:  5V Continuous Micro-USB"),
-        format!("Buffer:     3600 mAh Li-ion Cell"),
+        ("Charge:", format!("{}% ({})", info.battery_pct, info.battery_status)),
+        ("Voltage:", info.battery_volts.clone()),
+        ("Thermal:", info.battery_temp_c.clone()),
+        ("AC Supply:", "5V Micro-USB Continuous".to_string()),
+        ("Buffer:", "3600 mAh Li-ion Cell".to_string()),
     ];
 
     let mut uy = 422;
-    for line in &ups_lines {
-        fb.draw_text(28, uy, line, TEXT_WHITE, 1);
+    for (label, val) in &ups_lines {
+        fb.draw_text(28, uy, label, TEXT_GRAY, 1);
+        fb.draw_text(115, uy, val, TEXT_WHITE, 1);
         uy += 22;
     }
 
@@ -1013,17 +1030,18 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     fb.draw_text(360, 370, "KURURU NODE VITALS", TEXT_AMBER, 1);
 
     let vitals_lines = [
-        format!("Device:     Samsung SM-T110 (Goyawifi)"),
-        format!("APU:        Marvell PXA988 @ {}", info.cpu_freq_str),
-        format!("Load:       {} (1m, 5m, 15m)", info.load_avg),
-        format!("RAM:        {} MB used / {} MB", info.ram_used_mb, info.ram_total_mb),
-        format!("Storage:    {} MB free in rootfs", info.disk_free_mb),
-        format!("Cooling:    Passive Thermal (Silent 0 dB)"),
+        ("Device:", "Samsung SM-T110 (Goyawifi)".to_string()),
+        ("APU:", format!("Marvell PXA988 @ {}", info.cpu_freq_str)),
+        ("Load:", format!("{} (1m, 5m, 15m)", info.load_avg)),
+        ("RAM:", format!("{} MB used / {} MB", info.ram_used_mb, info.ram_total_mb)),
+        ("Storage:", format!("{} MB free in rootfs", info.disk_free_mb)),
+        ("Cooling:", "Passive Thermal (Silent 0 dB)".to_string()),
     ];
 
     let mut vy = 398;
-    for line in &vitals_lines {
-        fb.draw_text(360, vy, line, TEXT_WHITE, 1);
+    for (label, val) in &vitals_lines {
+        fb.draw_text(360, vy, label, TEXT_GRAY, 1);
+        fb.draw_text(440, vy, val, TEXT_WHITE, 1);
         vy += 22;
     }
 
@@ -1033,23 +1051,30 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
     fb.draw_text(704, 370, "HOMELAB NETWORK", TEXT_AMBER, 1);
 
     let net_lines = [
-        format!("Tailnet:    {}", info.tailnet_suffix),
-        format!("Node IP:    {}", info.tailscale_ip),
-        format!("Servers:    {}/5 Nodes Active", info.homelab_online_count),
-        format!("Wi-Fi AP:   {}", info.wifi_ssid),
-        format!("Signal:     {}", info.wifi_signal_dbm),
-        format!("WOL Engine: Port 9096 Listener Ready"),
+        ("Tailnet:", info.tailnet_suffix.clone()),
+        ("Node IP:", info.tailscale_ip.clone()),
+        ("Servers:", format!("{}/5 Nodes Active", info.homelab_online_count)),
+        ("Wi-Fi AP:", info.wifi_ssid.clone()),
+        ("Signal:", info.wifi_signal_dbm.clone()),
+        ("WOL Engine:", "Port 9096 Listener Ready".to_string()),
     ];
 
     let mut ny = 398;
-    for line in &net_lines {
-        fb.draw_text(704, ny, line, TEXT_WHITE, 1);
+    for (label, val) in &net_lines {
+        fb.draw_text(704, ny, label, TEXT_GRAY, 1);
+        fb.draw_text(800, ny, val, TEXT_WHITE, 1);
         ny += 22;
     }
 }
 
 fn main() {
     println!("[Kururu Display Daemon] Starting v1.3 (Inverted Volume Navigation & Modular Dashboards)...");
+
+    // Force Brazil / America/Sao_Paulo timezone across entire process
+    std::env::set_var("TZ", "America/Sao_Paulo");
+    unsafe {
+        tzset();
+    }
 
     let screen_active = Arc::new(AtomicBool::new(true));
     let screen_active_power = screen_active.clone();
@@ -1166,43 +1191,81 @@ fn main() {
     let mut last_awake_time = Instant::now();
     let mut was_active = false;
 
+    // Cached system info — refreshed every REFRESH_INTERVAL, rendered on every wake
+    let mut cached_info: Option<SystemInfo> = None;
+    let mut last_refresh = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
+
+    const TICK_MS: u64 = 50;          // Poll interval: 50ms max button latency
+    const REFRESH_SECS: u64 = 2;      // Full telemetry refresh cadence
+
     loop {
         let is_active = screen_active.load(Ordering::SeqCst);
 
         if is_active {
-            if !was_active || wake_signal.swap(false, Ordering::SeqCst) {
+            let got_wake = wake_signal.swap(false, Ordering::SeqCst);
+
+            if !was_active {
+                // Just woke up — reset activity timer and force immediate refresh
                 last_awake_time = Instant::now();
+                last_refresh = last_awake_time
+                    .checked_sub(Duration::from_secs(10))
+                    .unwrap_or(last_awake_time);
                 was_active = true;
             }
 
-            // Check auto-sleep timeout (120 seconds)
+            if got_wake {
+                // Button pressed — reset inactivity timer
+                last_awake_time = Instant::now();
+            }
+
+            // Check auto-sleep timeout (120 seconds of inactivity)
             if last_awake_time.elapsed() > Duration::from_secs(120) {
                 println!("[Kururu Display] Inactivity timeout (120s) -> Sleeping display");
                 set_display_hardware(false);
                 screen_active.store(false, Ordering::SeqCst);
                 was_active = false;
-                thread::sleep(Duration::from_millis(500));
+                cached_info = None;
+                thread::sleep(Duration::from_millis(200));
                 continue;
             }
 
-            let tab = current_tab.load(Ordering::SeqCst);
-            let info = gather_system_info();
+            // Refresh telemetry every REFRESH_SECS, or immediately on first paint
+            let needs_refresh = cached_info.is_none()
+                || last_refresh.elapsed() >= Duration::from_secs(REFRESH_SECS);
 
-            fb.clear(BG_COLOR);
-            draw_header(&mut fb, tab);
+            // Render immediately on button press even without a full refresh,
+            // so the tab switch feels instant (<50ms).
+            let should_render = got_wake || needs_refresh;
 
-            match tab {
-                0 => render_tab_kururu(&mut fb, &info),
-                1 => render_tab_homelab(&mut fb, &info),
-                _ => render_tab_clock(&mut fb, &info),
+            if needs_refresh {
+                cached_info = Some(gather_system_info());
+                last_refresh = Instant::now();
             }
 
-            draw_footer(&mut fb);
-            let _ = fb.flush();
+            if should_render {
+                if let Some(ref info) = cached_info {
+                    let tab = current_tab.load(Ordering::SeqCst);
 
-            thread::sleep(Duration::from_secs(2));
+                    fb.clear(BG_COLOR);
+                    draw_header(&mut fb, tab);
+
+                    match tab {
+                        0 => render_tab_kururu(&mut fb, info),
+                        1 => render_tab_homelab(&mut fb, info),
+                        _ => render_tab_clock(&mut fb, info),
+                    }
+
+                    draw_footer(&mut fb);
+                    let _ = fb.flush();
+                }
+            }
+
+            thread::sleep(Duration::from_millis(TICK_MS));
         } else {
             was_active = false;
+            cached_info = None;
             // Sleep quietly while screen is off, checking state every 200ms
             thread::sleep(Duration::from_millis(200));
         }
