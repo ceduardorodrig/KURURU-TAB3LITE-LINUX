@@ -5,7 +5,7 @@ use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,7 +72,6 @@ const fn mix(a: Color, b: Color, pct: i32) -> Color {
 struct Theme {
     key: &'static str,
     name: &'static str,
-    light: bool,
     bg: Color,
     panel: Color,
     panel_active: Color,
@@ -89,11 +88,10 @@ struct Theme {
 
 /// Derive a monochrome-phosphor theme from a (background, foreground) pair,
 /// mirroring cool-retro-term's bg/fontColor schemes.
-const fn pal(key: &'static str, name: &'static str, bg: Color, fg: Color, light: bool) -> Theme {
+const fn pal(key: &'static str, name: &'static str, bg: Color, fg: Color) -> Theme {
     Theme {
         key,
         name,
-        light,
         bg,
         panel: mix(bg, fg, 10),
         panel_active: mix(bg, fg, 22),
@@ -114,7 +112,6 @@ impl Theme {
     const KURURU: Theme = Theme {
         key: "kururu",
         name: "Kururu",
-        light: false,
         bg: rgb(10, 14, 20),
         panel: rgb(16, 22, 32),
         panel_active: rgb(24, 36, 54),
@@ -130,26 +127,25 @@ impl Theme {
     };
 }
 
-const THEME_COUNT: usize = 16;
+const THEME_COUNT: usize = 15;
 
 /// Kururu (multi-colour, default) + the cool-retro-term schemes (monochrome phosphor).
 static THEMES: [Theme; THEME_COUNT] = [
     Theme::KURURU,
-    pal("amber", "Default Amber", rgb(0, 0, 0), rgb(0xff, 0x81, 0x00), false),
-    pal("monochrome_green", "Monochrome Green", rgb(0, 0, 0), rgb(0x0c, 0xcc, 0x68), false),
-    pal("deep_blue", "Deep Blue", rgb(0, 0, 0), rgb(0x7f, 0xb4, 0xff), false),
-    pal("c64", "Commodore 64", rgb(0x3b, 0x3b, 0x8f), rgb(0xa9, 0xa7, 0xff), false),
-    pal("pet", "Commodore PET", rgb(0, 0, 0), rgb(0xff, 0xff, 0xff), false),
-    pal("apple2", "Apple ][", rgb(0x00, 0x11, 0x00), rgb(0x4d, 0xff, 0x6b), false),
-    pal("atari400", "Atari 400", rgb(0x0f, 0x1f, 0x5a), rgb(0x8e, 0xd6, 0xff), false),
-    pal("ibm_vga", "IBM VGA 8x16", rgb(0, 0, 0), rgb(0xc0, 0xc0, 0xc0), false),
-    pal("ibm3278", "IBM 3278 Reborn", rgb(0, 0, 0), rgb(0x3c, 0xff, 0x7a), false),
-    pal("neon_cyan", "Neon Cyan", rgb(0x00, 0x10, 0x18), rgb(0x52, 0xf7, 0xff), false),
-    pal("ghost", "Ghost Terminal", rgb(0x0b, 0x10, 0x14), rgb(0xa6, 0xb3, 0xc0), false),
-    pal("plasma", "Plasma", rgb(0x07, 0x00, 0x14), rgb(0xff, 0x9b, 0xd6), false),
-    pal("boring", "Boring", rgb(0, 0, 0), rgb(0xff, 0xff, 0xff), false),
-    pal("eink", "E-Ink", rgb(0xf2, 0xf2, 0xec), rgb(0x10, 0x10, 0x10), true),
-    pal("eink_dark", "E-Ink Dark", rgb(0x10, 0x10, 0x10), rgb(0xf2, 0xf2, 0xec), false),
+    pal("amber", "Amber", rgb(0, 0, 0), rgb(0xff, 0x81, 0x00)),
+    pal("monochrome_green", "Monochrome Green", rgb(0, 0, 0), rgb(0x0c, 0xcc, 0x68)),
+    pal("deep_blue", "Deep Blue", rgb(0, 0, 0), rgb(0x7f, 0xb4, 0xff)),
+    pal("c64", "Commodore 64", rgb(0x3b, 0x3b, 0x8f), rgb(0xa9, 0xa7, 0xff)),
+    pal("pet", "Commodore PET", rgb(0, 0, 0), rgb(0xff, 0xff, 0xff)),
+    pal("apple2", "Apple ][", rgb(0x00, 0x11, 0x00), rgb(0x4d, 0xff, 0x6b)),
+    pal("atari400", "Atari 400", rgb(0x0f, 0x1f, 0x5a), rgb(0x8e, 0xd6, 0xff)),
+    pal("ibm_vga", "IBM VGA 8x16", rgb(0, 0, 0), rgb(0xc0, 0xc0, 0xc0)),
+    pal("ibm3278", "IBM 3278 Reborn", rgb(0, 0, 0), rgb(0x3c, 0xff, 0x7a)),
+    pal("neon_cyan", "Neon Cyan", rgb(0x00, 0x10, 0x18), rgb(0x52, 0xf7, 0xff)),
+    pal("ghost", "Ghost Terminal", rgb(0x0b, 0x10, 0x14), rgb(0xa6, 0xb3, 0xc0)),
+    pal("plasma", "Plasma", rgb(0x07, 0x00, 0x14), rgb(0xff, 0x9b, 0xd6)),
+    pal("boring", "Boring", rgb(0, 0, 0), rgb(0xff, 0xff, 0xff)),
+    pal("eink", "E-Ink", rgb(0xf2, 0xf2, 0xec), rgb(0x10, 0x10, 0x10)),
 ];
 
 // Start on Kururu (default); overridden by config/env.
@@ -1265,6 +1261,14 @@ fn handle_tap(
                 }
             }
         }
+        SCREEN_SETTINGS => {
+            let editing = wifi_form().lock().map(|f| f.editing).unwrap_or(false);
+            if editing {
+                keyboard_tap(sx, sy);
+            } else {
+                settings_tap(sx, sy);
+            }
+        }
         _ => {
             // Any tap on a secondary screen goes back to the menu.
             screen.store(SCREEN_MENU, Ordering::SeqCst);
@@ -1398,14 +1402,7 @@ fn render_menu(fb: &mut Framebuffer, cursor: usize) {
             MenuAction::ToggleTheme => format!("{}: {}", label, theme().name),
             MenuAction::ToggleEffects => {
                 let on = EFFECTS.load(Ordering::Relaxed) != 0;
-                let state = if on && theme().light {
-                    "OFF (light)"
-                } else if on {
-                    "ON"
-                } else {
-                    "OFF"
-                };
-                format!("{}: {}", label, state)
+                format!("{}: {}", label, if on { "ON" } else { "OFF" })
             }
             MenuAction::Screen(_) => (*label).to_string(),
         };
@@ -1438,6 +1435,319 @@ fn render_placeholder(fb: &mut Framebuffer, title: &str, msg: &str) {
     let x = (FB_WIDTH.saturating_sub(msg.len() * 8)) / 2;
     fb.draw_text(x, 280, msg, theme().text_dim, 1);
     draw_hint_footer(fb, "[HOME] Back");
+}
+
+// -------------------------------------------------------------
+// On-screen keyboard (QWERTY + modifiers/arrows) — reusable
+// -------------------------------------------------------------
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Ch(char),
+    Backspace,
+    Enter,
+    Space,
+    Tab,
+    Esc,
+    Shift,
+    Ctrl,
+    Alt,
+    Left,
+    Up,
+    Down,
+    Right,
+}
+
+struct KKey {
+    label: &'static str,
+    key: Key,
+    w: usize, // width in units
+}
+
+const fn k(label: &'static str, key: Key, w: usize) -> KKey {
+    KKey { label, key, w }
+}
+
+const KB_ROWS: &[&[KKey]] = &[
+    &[
+        k("1", Key::Ch('1'), 1), k("2", Key::Ch('2'), 1), k("3", Key::Ch('3'), 1),
+        k("4", Key::Ch('4'), 1), k("5", Key::Ch('5'), 1), k("6", Key::Ch('6'), 1),
+        k("7", Key::Ch('7'), 1), k("8", Key::Ch('8'), 1), k("9", Key::Ch('9'), 1),
+        k("0", Key::Ch('0'), 1), k("-", Key::Ch('-'), 1), k("=", Key::Ch('='), 1),
+        k("Bksp", Key::Backspace, 2),
+    ],
+    &[
+        k("Tab", Key::Tab, 2), k("q", Key::Ch('q'), 1), k("w", Key::Ch('w'), 1),
+        k("e", Key::Ch('e'), 1), k("r", Key::Ch('r'), 1), k("t", Key::Ch('t'), 1),
+        k("y", Key::Ch('y'), 1), k("u", Key::Ch('u'), 1), k("i", Key::Ch('i'), 1),
+        k("o", Key::Ch('o'), 1), k("p", Key::Ch('p'), 1), k("[", Key::Ch('['), 1),
+        k("]", Key::Ch(']'), 1),
+    ],
+    &[
+        k("Ctrl", Key::Ctrl, 2), k("a", Key::Ch('a'), 1), k("s", Key::Ch('s'), 1),
+        k("d", Key::Ch('d'), 1), k("f", Key::Ch('f'), 1), k("g", Key::Ch('g'), 1),
+        k("h", Key::Ch('h'), 1), k("j", Key::Ch('j'), 1), k("k", Key::Ch('k'), 1),
+        k("l", Key::Ch('l'), 1), k(";", Key::Ch(';'), 1), k("'", Key::Ch('\''), 1),
+        k("Enter", Key::Enter, 2),
+    ],
+    &[
+        k("Shift", Key::Shift, 3), k("z", Key::Ch('z'), 1), k("x", Key::Ch('x'), 1),
+        k("c", Key::Ch('c'), 1), k("v", Key::Ch('v'), 1), k("b", Key::Ch('b'), 1),
+        k("n", Key::Ch('n'), 1), k("m", Key::Ch('m'), 1), k(",", Key::Ch(','), 1),
+        k(".", Key::Ch('.'), 1), k("/", Key::Ch('/'), 1), k("Shift", Key::Shift, 3),
+    ],
+    &[
+        k("Alt", Key::Alt, 2), k("Esc", Key::Esc, 2), k("Space", Key::Space, 8),
+        k("<-", Key::Left, 1), k("^", Key::Up, 1), k("v", Key::Down, 1), k("->", Key::Right, 1),
+    ],
+];
+
+const KB_U: usize = 56;      // key unit width
+const KB_GAP: usize = 6;
+const KB_H: usize = 44;
+const KB_TOP: usize = 276;
+const KB_ROW_GAP: usize = 8;
+
+/// Bounding box (x, y, w, h) of the key at (row, col).
+fn kb_key_rect(row: usize, col: usize) -> (usize, usize, usize, usize) {
+    let keys = KB_ROWS[row];
+    let total: usize = keys.iter().map(|k| k.w).sum();
+    let row_w = total * KB_U + keys.len().saturating_sub(1) * KB_GAP;
+    let mut x = (FB_WIDTH.saturating_sub(row_w)) / 2;
+    for (i, key) in keys.iter().enumerate() {
+        let w = key.w * KB_U + key.w.saturating_sub(1) * KB_GAP;
+        if i == col {
+            return (x, KB_TOP + row * (KB_H + KB_ROW_GAP), w, KB_H);
+        }
+        x += w + KB_GAP;
+    }
+    (0, 0, 0, 0)
+}
+
+static KB_SHIFT: AtomicBool = AtomicBool::new(false);
+static KB_CTRL: AtomicBool = AtomicBool::new(false);
+static KB_ALT: AtomicBool = AtomicBool::new(false);
+
+fn shift_char(c: char) -> char {
+    match c {
+        '1' => '!', '2' => '@', '3' => '#', '4' => '$', '5' => '%',
+        '6' => '^', '7' => '&', '8' => '*', '9' => '(', '0' => ')',
+        '-' => '_', '=' => '+', '[' => '{', ']' => '}', ';' => ':',
+        '\'' => '"', ',' => '<', '.' => '>', '/' => '?',
+        c => c.to_ascii_uppercase(),
+    }
+}
+
+fn draw_keyboard(fb: &mut Framebuffer, editing_label: &str) {
+    fb.draw_rect(0, KB_TOP - 28, FB_WIDTH, FB_HEIGHT - (KB_TOP - 28), theme().bg);
+    fb.draw_text(MARGIN, KB_TOP - 22, &format!("Editing: {}", editing_label), theme().text_muted, 1);
+
+    for (r, keys) in KB_ROWS.iter().enumerate() {
+        for (c, key) in keys.iter().enumerate() {
+            let (x, y, w, h) = kb_key_rect(r, c);
+            let active = match key.key {
+                Key::Shift => KB_SHIFT.load(Ordering::Relaxed),
+                Key::Ctrl => KB_CTRL.load(Ordering::Relaxed),
+                Key::Alt => KB_ALT.load(Ordering::Relaxed),
+                _ => false,
+            };
+            let bg = if active { theme().panel_active } else { theme().panel };
+            let border = if active { theme().accent } else { theme().border };
+            fb.draw_rect(x, y, w, h, bg);
+            fb.draw_rect(x, y, w, 1, border);
+            fb.draw_rect(x, y + h - 1, w, 1, border);
+            let scale = if key.label.len() == 1 { 2 } else { 1 };
+            let tw = key.label.len() * 8 * scale;
+            let tx = x + w.saturating_sub(tw) / 2;
+            let ty = y + (h.saturating_sub(16 * scale)) / 2;
+            let fg = if active { theme().accent } else { theme().text };
+            fb.draw_text(tx, ty, key.label, fg, scale);
+        }
+    }
+}
+
+// -------------------------------------------------------------
+// Settings: Wi-Fi connect (uses the keyboard)
+// -------------------------------------------------------------
+#[derive(Default)]
+struct WifiForm {
+    ssid: String,
+    psk: String,
+    focus: usize, // 0 = SSID, 1 = Password, 2 = Connect
+    editing: bool,
+    status: String,
+}
+
+static WIFI_FORM: OnceLock<Mutex<WifiForm>> = OnceLock::new();
+fn wifi_form() -> &'static Mutex<WifiForm> {
+    WIFI_FORM.get_or_init(|| Mutex::new(WifiForm::default()))
+}
+
+const SET_X: usize = 200;
+const SET_FIELD_BX: usize = SET_X + 130;
+const SET_FIELD_BW: usize = FB_WIDTH - SET_FIELD_BX - MARGIN;
+const SET_SSID_Y: usize = 96;
+const SET_PSK_Y: usize = 150;
+const SET_BTN_Y: usize = 210;
+const SET_BTN_W: usize = 200;
+const SET_BTN_H: usize = 32;
+
+fn draw_field(fb: &mut Framebuffer, y: usize, label: &str, value: &str, focused: bool, editing: bool) {
+    fb.draw_text(SET_X, y, label, theme().text_muted, 1);
+    let bg = if focused { theme().panel_active } else { theme().panel };
+    let border = if focused { theme().accent } else { theme().border };
+    fb.draw_rect(SET_FIELD_BX, y - 4, SET_FIELD_BW, 24, bg);
+    fb.draw_rect(SET_FIELD_BX, y - 4, SET_FIELD_BW, 1, border);
+    fb.draw_rect(SET_FIELD_BX, y + 19, SET_FIELD_BW, 1, border);
+    let shown = if value.is_empty() { "<vazio>" } else { value };
+    fb.draw_text(SET_FIELD_BX + 8, y, shown, theme().text, 1);
+    if focused && editing {
+        let cx = SET_FIELD_BX + 8 + value.len() * 8;
+        fb.draw_rect(cx, y, 8, 16, theme().accent); // cursor
+    }
+}
+
+fn draw_button(fb: &mut Framebuffer, x: usize, y: usize, w: usize, h: usize, label: &str, focused: bool) {
+    let bg = if focused { theme().panel_active } else { theme().panel };
+    let border = if focused { theme().accent } else { theme().border };
+    let fg = if focused { theme().accent } else { theme().text };
+    fb.draw_rect(x, y, w, h, bg);
+    fb.draw_rect(x, y, w, 1, border);
+    fb.draw_rect(x, y + h - 1, w, 1, border);
+    fb.draw_text(x + w.saturating_sub(label.len() * 8) / 2, y + h.saturating_sub(16) / 2, label, fg, 1);
+}
+
+fn render_settings(fb: &mut Framebuffer) {
+    let (ssid, psk_mask, focus, editing, status) = match wifi_form().lock() {
+        Ok(f) => (f.ssid.clone(), "*".repeat(f.psk.chars().count()), f.focus, f.editing, f.status.clone()),
+        Err(_) => (String::new(), String::new(), 0, false, String::new()),
+    };
+
+    let hint = if editing { "[BACK] Done" } else { "[HOME] Edit" };
+    draw_topbar(fb, "SETTINGS", hint);
+
+    fb.draw_text(SET_X, 66, "WI-FI NETWORK", theme().warn, 1);
+    draw_field(fb, SET_SSID_Y, "SSID", &ssid, focus == 0, editing && focus == 0);
+    draw_field(fb, SET_PSK_Y, "Password", &psk_mask, focus == 1, editing && focus == 1);
+    draw_button(fb, SET_FIELD_BX, SET_BTN_Y, SET_BTN_W, SET_BTN_H, "Connect", focus == 2);
+
+    if !status.is_empty() {
+        fb.draw_text(SET_X, 262, &status, theme().info, 1);
+    }
+
+    if editing {
+        let label = if focus == 0 { "SSID" } else { "Password" };
+        draw_keyboard(fb, label);
+    } else {
+        draw_hint_footer(fb, "[VOL+] Field   [VOL-] Field   [HOME] Edit/Connect   [BACK] Menu");
+    }
+}
+
+/// Connect wpa_supplicant to an SSID (PSK if provided). Returns a status line.
+fn wifi_connect(ssid: &str, psk: &str) -> String {
+    let run = |args: &[&str]| -> Option<String> {
+        Command::new("wpa_cli")
+            .args(args)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let Some(add) = run(&["add_network"]) else {
+        return "wpa_cli indisponivel".to_string();
+    };
+    let id: String = add.chars().filter(|c| c.is_ascii_digit()).collect();
+    if id.is_empty() {
+        return format!("Falha ao criar rede ({})", add);
+    }
+    run(&["set_network", &id, "ssid", &format!("\"{}\"", ssid)]);
+    if psk.is_empty() {
+        run(&["set_network", &id, "key_mgmt", "NONE"]);
+    } else {
+        run(&["set_network", &id, "psk", &format!("\"{}\"", psk)]);
+    }
+    run(&["enable_network", &id]);
+    run(&["select_network", &id]);
+    run(&["save_config"]);
+    format!("Conectando a {}...", ssid)
+}
+
+fn kb_type_char(ch: char) {
+    if let Ok(mut f) = wifi_form().lock() {
+        match f.focus {
+            0 => f.ssid.push(ch),
+            1 => f.psk.push(ch),
+            _ => {}
+        }
+    }
+}
+
+fn kb_backspace() {
+    if let Ok(mut f) = wifi_form().lock() {
+        match f.focus {
+            0 => { f.ssid.pop(); }
+            1 => { f.psk.pop(); }
+            _ => {}
+        }
+    }
+}
+
+fn wifi_submit() {
+    let (ssid, psk) = match wifi_form().lock() {
+        Ok(f) => (f.ssid.clone(), f.psk.clone()),
+        Err(_) => return,
+    };
+    let status = if ssid.is_empty() {
+        "Informe o SSID".to_string()
+    } else {
+        wifi_connect(&ssid, &psk)
+    };
+    if let Ok(mut f) = wifi_form().lock() {
+        f.status = status;
+        f.editing = false;
+    }
+}
+
+/// Apply a keyboard key press to the current text target / modifiers.
+fn kb_press(key: Key) {
+    match key {
+        Key::Shift => KB_SHIFT.store(!KB_SHIFT.load(Ordering::Relaxed), Ordering::Relaxed),
+        Key::Ctrl => KB_CTRL.store(!KB_CTRL.load(Ordering::Relaxed), Ordering::Relaxed),
+        Key::Alt => KB_ALT.store(!KB_ALT.load(Ordering::Relaxed), Ordering::Relaxed),
+        Key::Backspace => kb_backspace(),
+        Key::Space => kb_type_char(' '),
+        Key::Enter => wifi_submit(),
+        Key::Ch(c) => {
+            let ch = if KB_SHIFT.load(Ordering::Relaxed) { shift_char(c) } else { c };
+            kb_type_char(ch);
+            KB_SHIFT.store(false, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// Touch hit-test over the on-screen keyboard. Returns true if a key was hit.
+fn keyboard_tap(sx: usize, sy: usize) -> bool {
+    for (r, keys) in KB_ROWS.iter().enumerate() {
+        for c in 0..keys.len() {
+            let (x, y, w, h) = kb_key_rect(r, c);
+            if sx >= x && sx < x + w && sy >= y && sy < y + h {
+                kb_press(keys[c].key);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn settings_tap(sx: usize, sy: usize) {
+    let in_rect = |x: usize, y: usize, w: usize, h: usize| sx >= x && sx < x + w && sy >= y && sy < y + h;
+    if in_rect(SET_FIELD_BX, SET_SSID_Y - 4, SET_FIELD_BW, 24) {
+        if let Ok(mut f) = wifi_form().lock() { f.focus = 0; f.editing = true; }
+    } else if in_rect(SET_FIELD_BX, SET_PSK_Y - 4, SET_FIELD_BW, 24) {
+        if let Ok(mut f) = wifi_form().lock() { f.focus = 1; f.editing = true; }
+    } else if in_rect(SET_FIELD_BX, SET_BTN_Y, SET_BTN_W, SET_BTN_H) {
+        if let Ok(mut f) = wifi_form().lock() { f.focus = 2; }
+        wifi_submit();
+    }
 }
 
 /// Execute a menu action. Returns Some(screen) when the UI must switch screens.
@@ -1520,6 +1830,13 @@ fn load_display_config() {
         theme().name,
         EFFECTS.load(Ordering::Relaxed)
     );
+
+    // Debug/kiosk aid: open Settings with the keyboard already active.
+    if std::env::var_os("KURURU_EDIT").is_some() {
+        if let Ok(mut f) = wifi_form().lock() {
+            f.editing = true;
+        }
+    }
 }
 
 /// Vignette brightness mask (0..=255), computed once.
@@ -1546,7 +1863,7 @@ fn vignette_mask() -> &'static [u8] {
 /// a single pass. Runs once per rendered frame.
 fn apply_crt_effects(fb: &mut Framebuffer) {
     let effects = EFFECTS.load(Ordering::Relaxed);
-    if effects == 0 || theme().light {
+    if effects == 0 {
         return;
     }
     let scan = effects & EFFECT_SCANLINES != 0;
@@ -1882,7 +2199,7 @@ fn render_tab_clock(fb: &mut Framebuffer, info: &SystemInfo) {
 }
 
 fn main() {
-    println!("[Kururu Display Daemon] Starting v2.1 (16 themes, default Kururu, unified UI shell)...");
+    println!("[Kururu Display Daemon] Starting v2.2 (on-screen keyboard + Settings/Wi-Fi)...");
 
     // Optional initial dashboard: `kururu-display 2` (kiosk/debug). Default 0.
     let initial_tab = std::env::args()
@@ -1987,15 +2304,38 @@ fn main() {
                             (cur + 1) % MENU_COUNT
                         };
                         menu_cursor_keys.store(next, Ordering::SeqCst);
+                    } else if screen == SCREEN_SETTINGS {
+                        let editing = wifi_form().lock().map(|f| f.editing).unwrap_or(false);
+                        if !editing {
+                            if let Ok(mut f) = wifi_form().lock() {
+                                f.focus = if up { (f.focus + 2) % 3 } else { (f.focus + 1) % 3 };
+                            }
+                        }
                     }
                 }
                 KEY_HOMEPAGE => {
-                    nav_activate(&current_screen_keys, &menu_cursor_keys);
-                    println!(
-                        "[Kururu Display] HOME: screen {} -> {}",
-                        screen,
-                        current_screen_keys.load(Ordering::SeqCst)
-                    );
+                    if screen == SCREEN_SETTINGS {
+                        let editing = wifi_form().lock().map(|f| f.editing).unwrap_or(false);
+                        if editing {
+                            if let Ok(mut f) = wifi_form().lock() {
+                                f.editing = false;
+                            }
+                        } else {
+                            let focus = wifi_form().lock().map(|f| f.focus).unwrap_or(0);
+                            if focus == 2 {
+                                wifi_submit();
+                            } else if let Ok(mut f) = wifi_form().lock() {
+                                f.editing = true;
+                            }
+                        }
+                    } else {
+                        nav_activate(&current_screen_keys, &menu_cursor_keys);
+                        println!(
+                            "[Kururu Display] HOME: screen {} -> {}",
+                            screen,
+                            current_screen_keys.load(Ordering::SeqCst)
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -2058,7 +2398,15 @@ fn main() {
                             nav_activate(&touch_screen, &touch_menu);
                         } else {
                             println!("[Kururu Display] BACK touchkey");
-                            nav_back(&touch_screen);
+                            let editing = touch_screen.load(Ordering::SeqCst) == SCREEN_SETTINGS
+                                && wifi_form().lock().map(|f| f.editing).unwrap_or(false);
+                            if editing {
+                                if let Ok(mut f) = wifi_form().lock() {
+                                    f.editing = false;
+                                }
+                            } else {
+                                nav_back(&touch_screen);
+                            }
                         }
                     }
                 }
@@ -2157,7 +2505,7 @@ fn main() {
                     match screen {
                         SCREEN_MENU => render_menu(&mut fb, menu_cursor.load(Ordering::SeqCst)),
                         SCREEN_ABOUT => render_about(&mut fb, info),
-                        SCREEN_SETTINGS => render_placeholder(&mut fb, "SETTINGS", "Settings - em construcao (Fase 4)."),
+                        SCREEN_SETTINGS => render_settings(&mut fb),
                         SCREEN_TERMINAL => render_placeholder(&mut fb, "TERMINAL", "Terminal - em construcao (Fase 5)."),
                         _ => {
                             let tab = current_tab.load(Ordering::SeqCst);
