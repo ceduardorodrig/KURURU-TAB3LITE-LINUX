@@ -1,0 +1,29 @@
+name: ci
+
+# Auditoria de governança pelo StenioSentinel.
+#
+# Consome a composite action publicada pelo próprio motor, que baixa o binário
+# já compilado da release em vez de compilar Rust aqui (CI em segundos, e uma
+# única versão do motor para todos os repositórios).
+#
+# Ver: https://github.com/ceduardorodrig/STENIO-SENTINEL/.github/actions/stenio-check
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: Governance Audit (Rust Native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: StenioSentinel — auditar repositório
+        uses: ceduardorodrig/STENIO-SENTINEL/.github/actions/stenio-check@v1
+        with:
+          scope: all
+          path: .
+          github-format: "true"
