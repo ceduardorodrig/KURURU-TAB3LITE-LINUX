@@ -1188,6 +1188,37 @@ fn tab_rects() -> [(usize, usize, usize, usize); TAB_COUNT] {
     rects
 }
 
+pub const WOL_BTN_PSICOPOMPO: (usize, usize, usize, usize) = (536, 148, 220, 92);
+pub const WOL_BTN_KAVURE: (usize, usize, usize, usize) = (772, 148, 220, 92);
+
+fn wol_btn_hit(sx: usize, sy: usize) -> Option<&'static str> {
+    let btns = [
+        (WOL_BTN_PSICOPOMPO, "psicopompo"),
+        (WOL_BTN_KAVURE, "kavure"),
+    ];
+    for ((x, y, w, h), target) in btns {
+        if sx >= x && sx < x + w && sy >= y && sy < y + h {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn trigger_wol(target: &str) {
+    let target = target.to_string();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        if let Ok(mut stream) = std::net::TcpStream::connect("127.0.0.1:9096") {
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+            let req = format!(
+                "GET /wake/{} HTTP/1.1\r\nHost: 127.0.0.1:9096\r\nConnection: close\r\n\r\n",
+                target
+            );
+            let _ = stream.write_all(req.as_bytes());
+        }
+    });
+}
+
 /// Wake the screen and, if the tap lands on a header tab, switch dashboard.
 fn handle_tap(
     raw_x: i32,
@@ -1208,6 +1239,7 @@ fn handle_tap(
 
     match screen.load(Ordering::SeqCst) {
         SCREEN_DASHBOARD => {
+            let mut hit_tab = false;
             for (i, (x, y, w, h)) in tab_rects().iter().enumerate() {
                 if sx >= *x && sx < x + w && sy >= *y && sy < y + h {
                     tab.store(i, Ordering::SeqCst);
@@ -1215,7 +1247,14 @@ fn handle_tap(
                         "[Kururu Display] Touch -> Tab {} (raw {},{} -> {}, {})",
                         i + 1, raw_x, raw_y, sx, sy
                     );
+                    hit_tab = true;
                     break;
+                }
+            }
+            if !hit_tab && tab.load(Ordering::SeqCst) == 1 {
+                if let Some(target) = wol_btn_hit(sx, sy) {
+                    println!("[Kururu Display] Touch -> WoL Target '{}'", target);
+                    trigger_wol(target);
                 }
             }
         }
@@ -1990,6 +2029,26 @@ fn render_tab_kururu(fb: &mut Framebuffer, info: &SystemInfo) {
     );
 }
 
+fn draw_wol_button(
+    fb: &mut Framebuffer,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    label: &str,
+    accent: Color,
+) {
+    fb.draw_rect(x, y, w, h, theme().panel);
+    fb.draw_rect(x, y, w, 2, accent);
+    fb.draw_rect(x, y + h - 2, w, 2, accent);
+    fb.draw_rect(x, y, 2, h, accent);
+    fb.draw_rect(x + w - 2, y, 2, h, accent);
+    let text_w = label.len() * 8;
+    let tx = x + (w.saturating_sub(text_w)) / 2;
+    let ty = y + (h.saturating_sub(16)) / 2;
+    fb.draw_text(tx, ty, label, accent, 1);
+}
+
 // -------------------------------------------------------------
 // TAB 1: HOMELAB & WOL (Cluster Telemetry & Wake-on-LAN)
 // -------------------------------------------------------------
@@ -2046,24 +2105,16 @@ fn render_tab_homelab(fb: &mut Framebuffer, info: &SystemInfo) {
     };
     let daemon_color = if info.wol_daemon_running { theme().accent } else { theme().error };
 
-    let wol_lines = [
-        ("Daemon Status:", daemon_label, daemon_color),
-        ("Broadcast Target:", "192.168.3.255:9 (mlan0 direct AP)", theme().text),
-        ("Target 1 (Host):", "Psicopompo (Workstation & Gaming)", theme().text),
-        ("Target 1 (MAC):", info.wol_target1_mac.as_str(), theme().warn),
-        ("Target 1 (URI):", "http://kururu:9096/wake/psicopompo", theme().info),
-        ("Target 2 (Host):", "Kavure (Services & Microserver)", theme().text),
-        ("Target 2 (MAC):", info.wol_target2_mac.as_str(), theme().warn),
-        ("Target 2 (URI):", "http://kururu:9096/wake/kavure", theme().info),
-        ("Transmission:", "Layer 2 Magic Packet Burst (5x / 25ms)", theme().text_muted),
-    ];
+    fb.draw_text(532, 102, "Daemon Status:", theme().text_muted, 1);
+    fb.draw_text(660, 102, daemon_label, daemon_color, 1);
+    fb.draw_text(532, 122, "Broadcast:", theme().text_muted, 1);
+    fb.draw_text(660, 122, "192.168.3.255:9 (mlan0 L2 Magic Packet)", theme().text, 1);
 
-    let mut wy = 106;
-    for (label, val, col) in &wol_lines {
-        fb.draw_text(532, wy, label, theme().text_muted, 1);
-        fb.draw_text(676, wy, val, *col, 1);
-        wy += ROW_H;
-    }
+    // Interactive Touch Buttons for WoL
+    draw_wol_button(fb, WOL_BTN_PSICOPOMPO.0, WOL_BTN_PSICOPOMPO.1, WOL_BTN_PSICOPOMPO.2, WOL_BTN_PSICOPOMPO.3, "[ ⚡ WAKE PSICOPOMPO ]", theme().warn);
+    draw_wol_button(fb, WOL_BTN_KAVURE.0, WOL_BTN_KAVURE.1, WOL_BTN_KAVURE.2, WOL_BTN_KAVURE.3, "[ ⚡ WAKE KAVURE ]", theme().accent);
+
+    fb.draw_text(548, 258, "Touch button to dispatch Magic Packet (L2 UDP) across LAN", theme().text_dim, 1);
 
     // ── Card C: WoL dispatch audit log ──────────────────────────────────────
     draw_log_console(

@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -264,11 +264,260 @@ fn run_daemon(port: u16) {
     }
 }
 
+fn forward_get(addr_str: &str, path: &str, timeout_ms: u64) -> Result<String, String> {
+    let socket_addrs: Vec<std::net::SocketAddr> = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("Failed to resolve {}: {}", addr_str, e))?
+        .collect();
+    if socket_addrs.is_empty() {
+        return Err(format!("No address resolved for {}", addr_str));
+    }
+    let mut stream = TcpStream::connect_timeout(&socket_addrs[0], Duration::from_millis(timeout_ms))
+        .map_err(|e| format!("Connect to {} failed: {}", addr_str, e))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)));
+
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        path, addr_str
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("Write failed: {}", e))?;
+
+    let mut resp = Vec::new();
+    stream
+        .read_to_end(&mut resp)
+        .map_err(|e| format!("Read failed: {}", e))?;
+    let resp_str = String::from_utf8_lossy(&resp).to_string();
+    if resp_str.starts_with("HTTP/1.1 200") || resp_str.starts_with("HTTP/1.0 200") {
+        Ok(resp_str)
+    } else {
+        Err(format!(
+            "Non-200 response from {}: {}",
+            addr_str,
+            resp_str.lines().next().unwrap_or("empty")
+        ))
+    }
+}
+
+fn handle_dispatcher_client(mut stream: TcpStream) {
+    let mut buf = [0u8; 1024];
+    let bytes_read = match stream.read(&mut buf) {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+
+    let req = String::from_utf8_lossy(&buf[..bytes_read]);
+    let first_line = req.lines().next().unwrap_or_default();
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+    if parts.len() < 2 {
+        return;
+    }
+
+    let is_head = parts[0] == "HEAD";
+    let path = parts[1];
+
+    let kururu_addr = env::var("KURURU_ADDR").unwrap_or_else(|_| "100.127.188.45:9096".to_string());
+    let psicopompo_addr = env::var("PSICOPOMPO_ADDR").unwrap_or_else(|_| "100.82.51.112:9096".to_string());
+    let kavure_addr = env::var("KAVURE_ADDR").unwrap_or_else(|_| "100.124.146.77:9096".to_string());
+
+    if path == "/" || path == "/health" || path == "/health/" {
+        let k_ok = forward_get(&kururu_addr, "/health", 800).is_ok();
+        let p_ok = if !k_ok {
+            forward_get(&psicopompo_addr, "/health", 800).is_ok()
+        } else {
+            true
+        };
+        let v_ok = if !k_ok && !p_ok {
+            forward_get(&kavure_addr, "/health", 800).is_ok()
+        } else {
+            true
+        };
+
+        let any_online = k_ok || p_ok || v_ok;
+        let (status_code, body) = if any_online {
+            (
+                "200 OK",
+                format!(
+                    r#"{{"status":"online","service":"wol-dispatcher","kururu":{},"psicopompo":{},"kavure":{}}}"#,
+                    k_ok, p_ok, v_ok
+                ),
+            )
+        } else {
+            (
+                "503 Service Unavailable",
+                r#"{"status":"error","service":"wol-dispatcher","message":"All LAN wake nodes unreachable"}"#.to_string(),
+            )
+        };
+
+        let response = if is_head {
+            format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status_code,
+                body.len()
+            )
+        } else {
+            format!(
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_code,
+                body.len(),
+                body
+            )
+        };
+        let _ = stream.write_all(response.as_bytes());
+        return;
+    }
+
+    let target = if path.starts_with("/wake/") {
+        path[6..].trim_end_matches('/').to_lowercase()
+    } else {
+        String::new()
+    };
+
+    if target == "kavure" {
+        log_action("[Dispatcher] Wake request for kavure -> trying kururu primary...");
+        match forward_get(&kururu_addr, "/wake/kavure", 1500) {
+            Ok(_) => {
+                log_action("[Dispatcher] Successfully woke kavure via kururu");
+                let body = r#"{"status":"ok","target":"kavure","via":"kururu","emitted":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            Err(e1) => {
+                log_action(&format!(
+                    "[Dispatcher] Kururu failed ({}). Falling back to psicopompo...",
+                    e1
+                ));
+                match forward_get(&psicopompo_addr, "/wake", 1500) {
+                    Ok(_) => {
+                        log_action("[Dispatcher] Successfully woke kavure via psicopompo fallback");
+                        let body = r#"{"status":"ok","target":"kavure","via":"psicopompo","emitted":true}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(e2) => {
+                        log_action(&format!(
+                            "[Dispatcher] Psicopompo fallback also failed ({})",
+                            e2
+                        ));
+                        let body = format!(
+                            r#"{{"status":"error","target":"kavure","message":"All wake nodes offline (kururu: {}, psicopompo: {})"}}"#,
+                            e1, e2
+                        );
+                        let response = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                }
+            }
+        }
+    } else if target == "psicopompo" {
+        log_action("[Dispatcher] Wake request for psicopompo -> trying kururu primary...");
+        match forward_get(&kururu_addr, "/wake/psicopompo", 1500) {
+            Ok(_) => {
+                log_action("[Dispatcher] Successfully woke psicopompo via kururu");
+                let body = r#"{"status":"ok","target":"psicopompo","via":"kururu","emitted":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            Err(e1) => {
+                log_action(&format!(
+                    "[Dispatcher] Kururu failed ({}). Falling back to kavure...",
+                    e1
+                ));
+                match forward_get(&kavure_addr, "/wake", 1500) {
+                    Ok(_) => {
+                        log_action("[Dispatcher] Successfully woke psicopompo via kavure fallback");
+                        let body = r#"{"status":"ok","target":"psicopompo","via":"kavure","emitted":true}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(e2) => {
+                        log_action(&format!("[Dispatcher] Kavure fallback also failed ({})", e2));
+                        let body = format!(
+                            r#"{{"status":"error","target":"psicopompo","message":"All wake nodes offline (kururu: {}, kavure: {})"}}"#,
+                            e1, e2
+                        );
+                        let response = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                }
+            }
+        }
+    } else {
+        let body = format!(r#"{{"status":"error","message":"Unknown target '{}'"}}"#, target);
+        let response = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+    }
+}
+
+fn run_dispatcher(port: u16) {
+    let host = env::var("WOL_LISTEN_ADDR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let effective_port = env::var("WOL_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(port);
+    let bind_addr = format!("{}:{}", host, effective_port);
+    log_action(&format!(
+        "[WOL Dispatcher] Starting Smart Dispatcher HTTP listener on {}...",
+        bind_addr
+    ));
+
+    let listener = match TcpListener::bind(&bind_addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind Dispatcher listener on {}: {}", bind_addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    for stream in listener.incoming() {
+        if let Ok(s) = stream {
+            thread::spawn(move || {
+                handle_dispatcher_client(s);
+            });
+        }
+    }
+}
+
 fn print_usage() {
-    println!("Kururu Wake-on-LAN (WOL) Tool v1.1");
+    println!("Kururu Wake-on-LAN (WOL) Tool v1.2");
     println!("Usage:");
     println!("  kururu-wake <HOSTNAME|MAC>         Send Magic Packet to configured target or MAC");
     println!("  kururu-wake --daemon [PORT]        Run HTTP WOL Relay daemon (default: 9096)");
+    println!("  kururu-wake --dispatcher [PORT]    Run Smart WoL Dispatcher with auto-failover (default: 9096)");
     println!("\nConfiguration:");
     println!("  Targets are mapped in /etc/kururu-wake.conf (e.g. host=aa:bb:cc:dd:ee:ff)");
 }
@@ -291,6 +540,13 @@ fn main() {
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(9096);
             run_daemon(port);
+        }
+        "--dispatcher" | "--dispatch" => {
+            let port = args
+                .get(1)
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(9096);
+            run_dispatcher(port);
         }
         target => {
             if let Some(mac) = resolve_target_mac(target) {
