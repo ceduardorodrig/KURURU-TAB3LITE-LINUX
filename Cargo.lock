@@ -189,6 +189,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kururu-sentinel"
+version = "0.1.0"
+
+[[package]]
 name = "kururu-su"
 version = "0.1.0"
 dependencies = [

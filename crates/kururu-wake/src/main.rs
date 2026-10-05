@@ -140,6 +140,27 @@ fn send_magic_packet(mac: [u8; 6], target_name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn trigger_system_shutdown() {
+    thread::spawn(|| {
+        thread::sleep(Duration::from_millis(500));
+        let candidates: &[(&str, &[&str])] = &[
+            ("/usr/bin/systemd-run", &["--on-active=2s", "/usr/sbin/shutdown", "-P", "now"]),
+            ("/usr/sbin/shutdown", &["-P", "now"]),
+            ("/sbin/shutdown", &["-P", "now"]),
+            ("/sbin/poweroff", &[]),
+        ];
+        for (bin, args) in candidates {
+            if std::path::Path::new(bin).exists() {
+                if let Ok(mut child) = std::process::Command::new(bin).args(*args).spawn() {
+                    let _ = child.wait();
+                    return;
+                }
+            }
+        }
+        log_action("[POWER] ERROR: Failed to execute shutdown command (no suitable binary found)");
+    });
+}
+
 fn handle_http_client(mut stream: TcpStream) {
     let mut buf = [0u8; 1024];
     let bytes_read = match stream.read(&mut buf) {
@@ -173,6 +194,20 @@ fn handle_http_client(mut stream: TcpStream) {
             )
         };
         let _ = stream.write_all(response.as_bytes());
+        return;
+    }
+
+    if path == "/power/shutdown" || path == "/power/shutdown/" || path.starts_with("/power/shutdown?") {
+        log_action("[POWER] Received shutdown request via HTTP. Triggering system shutdown...");
+        let body = r#"{"status":"ok","action":"shutdown","message":"System shutdown initiated"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        trigger_system_shutdown();
         return;
     }
 
@@ -232,7 +267,32 @@ fn handle_http_client(mut stream: TcpStream) {
     }
 }
 
+fn ensure_sentinel_running() {
+    let sentinel_path = "/usr/local/bin/kururu-sentinel";
+    if !std::path::Path::new(sentinel_path).exists() {
+        return;
+    }
+    let mut already_running = false;
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let cmdline = entry.path().join("cmdline");
+            if let Ok(content) = fs::read_to_string(cmdline) {
+                if content.contains("kururu-sentinel") {
+                    already_running = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !already_running {
+        log_action("[SUPERVISOR] Spawning kururu-sentinel daemon in background...");
+        let _ = std::process::Command::new(sentinel_path).spawn();
+    }
+}
+
 fn run_daemon(port: u16) {
+    ensure_sentinel_running();
+
     let host = env::var("WOL_LISTEN_ADDR")
         .ok()
         .filter(|s| !s.is_empty())

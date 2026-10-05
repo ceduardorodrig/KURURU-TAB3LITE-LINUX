@@ -3,6 +3,7 @@ members = [
     "crates/kururu-su",
     "crates/kururu-display",
     "crates/kururu-wake",
+    "crates/kururu-sentinel",
 ]
 resolver = "2"
 
