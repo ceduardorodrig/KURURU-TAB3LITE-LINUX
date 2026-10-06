@@ -246,11 +246,17 @@ fn trigger_parallel_wake() {
     let _ = h2.join();
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum BlackoutReason {
+    StaticDockLostAc,
+    WanLostInPortable,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SentinelState {
     AcNormal,
     PortableUsage,
-    BlackoutPending,
+    BlackoutPending(BlackoutReason),
     ExecutingShutdown,
     WaitingForPower,
     StabilizingRecovery(u64),
@@ -305,20 +311,37 @@ fn main() {
                         (Some(c), Some(b)) => c.distance_to(&b),
                         _ => 0.0,
                     };
+                    let wan = is_wan_online();
 
                     if delta >= ORIENTATION_SHIFT_THRESHOLD {
-                        log_event(&format!(
-                            "[INFO] AC disconnected WITH physical movement (delta={:.1} >= {:.1}) -> Handheld/Portable usage detected. Standing by.",
-                            delta, ORIENTATION_SHIFT_THRESHOLD
-                        ));
-                        state = SentinelState::PortableUsage;
+                        if wan {
+                            log_event(&format!(
+                                "[ASSESSMENT] Confidence: 10% | Physical pickup (delta={:.1} >= {:.1}) with active WAN -> PortableUsage.",
+                                delta, ORIENTATION_SHIFT_THRESHOLD
+                            ));
+                            state = SentinelState::PortableUsage;
+                        } else {
+                            log_event(&format!(
+                                "[ASSESSMENT] Confidence: 85% | Physical pickup (delta={:.1}) BUT WAN offline -> BlackoutPending(WanLostInPortable).",
+                                delta
+                            ));
+                            state = SentinelState::BlackoutPending(BlackoutReason::WanLostInPortable);
+                        }
                     } else {
-                        let wan = is_wan_online();
-                        log_event(&format!(
-                            "[ALERT] AC disconnected while tablet remains static on dock (delta={:.1} < {:.1}, wan={})! Blackout suspected.",
-                            delta, ORIENTATION_SHIFT_THRESHOLD, if wan { "ONLINE" } else { "OFFLINE" }
-                        ));
-                        state = SentinelState::BlackoutPending;
+                        // Static on dock without AC
+                        if wan {
+                            log_event(&format!(
+                                "[ASSESSMENT] Confidence: 75% | Static on dock without AC (delta={:.1} < {:.1}, WAN active via UPS) -> BlackoutPending(StaticDockLostAc).",
+                                delta, ORIENTATION_SHIFT_THRESHOLD
+                            ));
+                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                        } else {
+                            log_event(&format!(
+                                "[ASSESSMENT] Confidence: 100% | Static on dock without AC AND WAN offline (delta={:.1}) -> BlackoutPending(StaticDockLostAc).",
+                                delta
+                            ));
+                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                        }
                     }
                 } else if last_heartbeat.elapsed() >= Duration::from_secs(60) {
                     let kav_up = ping_check(KAVURE_TS_IP, 1);
@@ -345,41 +368,65 @@ fn main() {
                 } else {
                     let wan = is_wan_online();
                     if !wan {
-                        log_event("[ALERT] WAN connectivity lost during battery operation! Escalating to BlackoutPending.");
-                        state = SentinelState::BlackoutPending;
+                        log_event("[ASSESSMENT] Confidence: 85% | WAN connectivity lost during battery operation -> BlackoutPending(WanLostInPortable).");
+                        state = SentinelState::BlackoutPending(BlackoutReason::WanLostInPortable);
                     }
                 }
             }
 
-            SentinelState::BlackoutPending => {
+            SentinelState::BlackoutPending(reason) => {
                 if ac {
                     log_event("[EVENT] AC restored while in BlackoutPending. Draining debit.");
                     state = SentinelState::AcNormal;
                     blackout_debit_secs = 0;
                 } else {
-                    // Check if human picked up tablet during blackout pending countdown
                     let curr_vec = read_accelerometer();
                     let delta = match (curr_vec, dock_baseline) {
                         (Some(c), Some(b)) => c.distance_to(&b),
                         _ => 0.0,
                     };
+                    let wan = is_wan_online();
 
-                    if delta >= ORIENTATION_SHIFT_THRESHOLD {
-                        log_event(&format!(
-                            "[INFO] Tablet picked up during blackout pending (delta={:.1} >= {:.1}). Transitioning to PortableUsage.",
-                            delta, ORIENTATION_SHIFT_THRESHOLD
-                        ));
+                    // Check if conditions warrant de-escalation back to PortableUsage
+                    let deescalate = match reason {
+                        BlackoutReason::StaticDockLostAc => {
+                            // User physically approached dock and picked up tablet while WAN is alive
+                            if delta >= ORIENTATION_SHIFT_THRESHOLD && wan {
+                                log_event(&format!(
+                                    "[TRANSITION] Human picked up tablet from dock during countdown (delta={:.1} >= {:.1}, wan=OK). Transitioning to PortableUsage.",
+                                    delta, ORIENTATION_SHIFT_THRESHOLD
+                                ));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        BlackoutReason::WanLostInPortable => {
+                            // Temporary Wi-Fi/WAN glitch recovered while in handheld mode
+                            if wan {
+                                log_event("[TRANSITION] WAN connectivity recovered during portable operation. Transitioning back to PortableUsage.");
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+
+                    if deescalate {
                         state = SentinelState::PortableUsage;
                         blackout_debit_secs = 0;
                     } else {
                         blackout_debit_secs += PROBE_INTERVAL_SECS;
                         log_event(&format!(
-                            "[DEBIT] ac_online=0 static_dock=true delta={:.1} debit={}/{}s",
-                            delta, blackout_debit_secs, DEFAULT_BLACKOUT_TIMEOUT_SECS
+                            "[DEBIT] ac_online=0 reason={:?} delta={:.1} wan={} debit={}/{}s",
+                            reason, delta, if wan { "OK" } else { "FAIL" }, blackout_debit_secs, DEFAULT_BLACKOUT_TIMEOUT_SECS
                         ));
 
                         if blackout_debit_secs >= DEFAULT_BLACKOUT_TIMEOUT_SECS {
-                            log_event("[CRITICAL] Blackout debit threshold reached (3 minutes). Triggering safe shutdown!");
+                            log_event(&format!(
+                                "[CRITICAL] Blackout debit threshold reached (3 minutes) under reason {:?}. Triggering safe shutdown!",
+                                reason
+                            ));
                             state = SentinelState::ExecutingShutdown;
                         }
                     }
