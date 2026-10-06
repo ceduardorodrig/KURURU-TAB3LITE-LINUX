@@ -18,6 +18,40 @@ const DEFAULT_BLACKOUT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_RECOVERY_QUARANTINE_SECS: u64 = 180;
 const PROBE_INTERVAL_SECS: u64 = 5;
 
+// Accelerometer physical motion detection
+// Calibration: Cat jump / desk shockwave settles at ~86 units max. Handheld pickup reaches 310-530 units.
+const ORIENTATION_SHIFT_THRESHOLD: f64 = 180.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Vector3D {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+impl Vector3D {
+    fn distance_to(&self, other: &Vector3D) -> f64 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+}
+
+/// Reads current raw acceleration vector from sysfs
+fn read_accelerometer() -> Option<Vector3D> {
+    let content = fs::read_to_string("/sys/class/sensors/accelerometer_sensor/raw_data").ok()?;
+    let parts: Vec<&str> = content.trim().split(',').collect();
+    if parts.len() >= 3 {
+        let x = parts[0].trim().parse::<f64>().ok()?;
+        let y = parts[1].trim().parse::<f64>().ok()?;
+        let z = parts[2].trim().parse::<f64>().ok()?;
+        Some(Vector3D { x, y, z })
+    } else {
+        None
+    }
+}
+
 // Network targets
 const KAVURE_TS_IP: &str = "100.124.146.77";
 const PSICOPOMPO_TS_IP: &str = "100.82.51.112";
@@ -225,10 +259,14 @@ enum SentinelState {
 
 fn main() {
     log_event("=================================================================");
-    log_event("Kururu Power Sentinel v1.0 (Autonomous Homelab Power Guardian)");
+    log_event("Kururu Power Sentinel v1.1 (Autonomous Homelab Power Guardian)");
     log_event(&format!(
         "Config: Blackout threshold: {}s | Quarantine: {}s | Probes: {}s",
         DEFAULT_BLACKOUT_TIMEOUT_SECS, DEFAULT_RECOVERY_QUARANTINE_SECS, PROBE_INTERVAL_SECS
+    ));
+    log_event(&format!(
+        "Physics: Dynamic Dock Baseline | Motion Threshold: {:.0} units",
+        ORIENTATION_SHIFT_THRESHOLD
     ));
     log_event(&format!(
         "Targets: Kavure ({}) | Psicopompo ({})",
@@ -239,6 +277,7 @@ fn main() {
     let mut state = SentinelState::AcNormal;
     let mut blackout_debit_secs: u64 = 0;
     let mut last_heartbeat = Instant::now();
+    let mut dock_baseline: Option<Vector3D> = None;
 
     loop {
         let ac = is_ac_online();
@@ -246,23 +285,53 @@ fn main() {
         match state {
             SentinelState::AcNormal => {
                 blackout_debit_secs = 0;
+
+                // Continuously calibrate dock baseline orientation while resting on AC
+                if let Some(curr_vec) = read_accelerometer() {
+                    match dock_baseline {
+                        None => dock_baseline = Some(curr_vec),
+                        Some(ref mut b) => {
+                            // Low-pass filter (90% existing baseline, 10% new sample)
+                            b.x = b.x * 0.9 + curr_vec.x * 0.1;
+                            b.y = b.y * 0.9 + curr_vec.y * 0.1;
+                            b.z = b.z * 0.9 + curr_vec.z * 0.1;
+                        }
+                    }
+                }
+
                 if !ac {
-                    // Check secondary indicator (WAN)
-                    let wan = is_wan_online();
-                    if wan {
-                        log_event("[INFO] AC disconnected while WAN is online -> Portable usage detected. Standing by.");
+                    let curr_vec = read_accelerometer();
+                    let delta = match (curr_vec, dock_baseline) {
+                        (Some(c), Some(b)) => c.distance_to(&b),
+                        _ => 0.0,
+                    };
+
+                    if delta >= ORIENTATION_SHIFT_THRESHOLD {
+                        log_event(&format!(
+                            "[INFO] AC disconnected WITH physical movement (delta={:.1} >= {:.1}) -> Handheld/Portable usage detected. Standing by.",
+                            delta, ORIENTATION_SHIFT_THRESHOLD
+                        ));
                         state = SentinelState::PortableUsage;
                     } else {
-                        log_event("[ALERT] AC disconnected AND WAN probe failed! Blackout suspected.");
+                        let wan = is_wan_online();
+                        log_event(&format!(
+                            "[ALERT] AC disconnected while tablet remains static on dock (delta={:.1} < {:.1}, wan={})! Blackout suspected.",
+                            delta, ORIENTATION_SHIFT_THRESHOLD, if wan { "ONLINE" } else { "OFFLINE" }
+                        ));
                         state = SentinelState::BlackoutPending;
                     }
                 } else if last_heartbeat.elapsed() >= Duration::from_secs(60) {
                     let kav_up = ping_check(KAVURE_TS_IP, 1);
                     let psi_up = ping_check(PSICOPOMPO_TS_IP, 1);
+                    let base_str = match dock_baseline {
+                        Some(b) => format!("dock=({:.0},{:.0},{:.0})", b.x, b.y, b.z),
+                        None => "dock=calibrating".to_string(),
+                    };
                     log_event(&format!(
-                        "[HEARTBEAT] state=AcNormal ac_online=1 kavure_ts={} psicopompo_ts={} debit=0s",
+                        "[HEARTBEAT] state=AcNormal ac_online=1 kavure_ts={} psicopompo_ts={} {} debit=0s",
                         if kav_up { "UP" } else { "DOWN" },
-                        if psi_up { "UP" } else { "DOWN" }
+                        if psi_up { "UP" } else { "DOWN" },
+                        base_str
                     ));
                     last_heartbeat = Instant::now();
                 }
@@ -272,8 +341,8 @@ fn main() {
                 if ac {
                     log_event("[INFO] AC power reconnected. Resuming AcNormal state.");
                     state = SentinelState::AcNormal;
+                    dock_baseline = None; // Trigger immediate recalibration to dock
                 } else {
-                    // Re-check WAN
                     let wan = is_wan_online();
                     if !wan {
                         log_event("[ALERT] WAN connectivity lost during battery operation! Escalating to BlackoutPending.");
@@ -288,15 +357,31 @@ fn main() {
                     state = SentinelState::AcNormal;
                     blackout_debit_secs = 0;
                 } else {
-                    blackout_debit_secs += PROBE_INTERVAL_SECS;
-                    log_event(&format!(
-                        "[DEBIT] ac_online=0 wan=FAIL debit={}/{}s",
-                        blackout_debit_secs, DEFAULT_BLACKOUT_TIMEOUT_SECS
-                    ));
+                    // Check if human picked up tablet during blackout pending countdown
+                    let curr_vec = read_accelerometer();
+                    let delta = match (curr_vec, dock_baseline) {
+                        (Some(c), Some(b)) => c.distance_to(&b),
+                        _ => 0.0,
+                    };
 
-                    if blackout_debit_secs >= DEFAULT_BLACKOUT_TIMEOUT_SECS {
-                        log_event("[CRITICAL] Blackout debit threshold reached (3 minutes). Triggering safe shutdown!");
-                        state = SentinelState::ExecutingShutdown;
+                    if delta >= ORIENTATION_SHIFT_THRESHOLD {
+                        log_event(&format!(
+                            "[INFO] Tablet picked up during blackout pending (delta={:.1} >= {:.1}). Transitioning to PortableUsage.",
+                            delta, ORIENTATION_SHIFT_THRESHOLD
+                        ));
+                        state = SentinelState::PortableUsage;
+                        blackout_debit_secs = 0;
+                    } else {
+                        blackout_debit_secs += PROBE_INTERVAL_SECS;
+                        log_event(&format!(
+                            "[DEBIT] ac_online=0 static_dock=true delta={:.1} debit={}/{}s",
+                            delta, blackout_debit_secs, DEFAULT_BLACKOUT_TIMEOUT_SECS
+                        ));
+
+                        if blackout_debit_secs >= DEFAULT_BLACKOUT_TIMEOUT_SECS {
+                            log_event("[CRITICAL] Blackout debit threshold reached (3 minutes). Triggering safe shutdown!");
+                            state = SentinelState::ExecutingShutdown;
+                        }
                     }
                 }
             }
