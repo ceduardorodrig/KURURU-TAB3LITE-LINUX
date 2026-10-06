@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_BLACKOUT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_RECOVERY_QUARANTINE_SECS: u64 = 180;
 const PROBE_INTERVAL_SECS: u64 = 5;
+const CRITICAL_BATTERY_PERCENT: u8 = 20;
 
 // Accelerometer physical motion detection
 // Calibration: Cat jump / desk shockwave settles at ~86 units max. Handheld pickup reaches 310-530 units.
@@ -94,6 +95,20 @@ fn log_event(msg: &str) {
     }
 }
 
+/// Reads tablet battery charge capacity percentage (0-100%) from sysfs
+fn read_battery_capacity() -> Option<u8> {
+    let ps_dir = Path::new("/sys/class/power_supply");
+    for bat_name in &["battery", "sec-battery", "sec-fuelgauge"] {
+        let cap_file = ps_dir.join(bat_name).join("capacity");
+        if let Ok(val) = fs::read_to_string(&cap_file) {
+            if let Ok(num) = val.trim().parse::<u8>() {
+                return Some(num);
+            }
+        }
+    }
+    None
+}
+
 /// Checks physical AC mains power status on Kururu hardware
 /// Inspects Linux sysfs power_supply classes
 fn is_ac_online() -> bool {
@@ -102,35 +117,21 @@ fn is_ac_online() -> bool {
         return true; // Default fallback if running outside hardware
     }
 
-    // Check dedicated AC / mains supplies first
-    if let Ok(entries) = fs::read_dir(ps_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            
-            // Check online attribute if present
-            let online_file = path.join("online");
-            if online_file.exists() {
-                if let Ok(val) = fs::read_to_string(&online_file) {
-                    let v = val.trim();
-                    if name.contains("ac") || name.contains("mains") || name.contains("sec-charger") || name.contains("usb") {
-                        if v == "1" {
-                            return true;
-                        }
-                    }
-                }
+    // Direct check of known charger nodes
+    for name in &["ac", "usb", "sec-charger"] {
+        let online_file = ps_dir.join(name).join("online");
+        if let Ok(val) = fs::read_to_string(&online_file) {
+            if val.trim() == "1" {
+                return true;
             }
+        }
+    }
 
-            // Check battery status
-            let status_file = path.join("status");
-            if status_file.exists() {
-                if let Ok(val) = fs::read_to_string(&status_file) {
-                    let v = val.trim();
-                    if v == "Charging" || v == "Full" {
-                        return true;
-                    }
-                }
-            }
+    // Secondary check: battery actively charging
+    let battery_status = ps_dir.join("battery").join("status");
+    if let Ok(val) = fs::read_to_string(&battery_status) {
+        if val.trim() == "Charging" {
+            return true;
         }
     }
 
@@ -250,6 +251,7 @@ fn trigger_parallel_wake() {
 enum BlackoutReason {
     StaticDockLostAc,
     WanLostInPortable,
+    CriticalBattery,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -290,7 +292,10 @@ fn main() {
 
         match state {
             SentinelState::AcNormal => {
-                blackout_debit_secs = 0;
+                // Drain any residual blackout debit gradually (10s per 5s cycle)
+                if blackout_debit_secs > 0 {
+                    blackout_debit_secs = blackout_debit_secs.saturating_sub(PROBE_INTERVAL_SECS * 2);
+                }
 
                 // Continuously calibrate dock baseline orientation while resting on AC
                 if let Some(curr_vec) = read_accelerometer() {
@@ -346,15 +351,21 @@ fn main() {
                 } else if last_heartbeat.elapsed() >= Duration::from_secs(60) {
                     let kav_up = ping_check(KAVURE_TS_IP, 1);
                     let psi_up = ping_check(PSICOPOMPO_TS_IP, 1);
+                    let bat_str = match read_battery_capacity() {
+                        Some(c) => format!("bat={}%", c),
+                        None => "bat=N/A".to_string(),
+                    };
                     let base_str = match dock_baseline {
                         Some(b) => format!("dock=({:.0},{:.0},{:.0})", b.x, b.y, b.z),
                         None => "dock=calibrating".to_string(),
                     };
                     log_event(&format!(
-                        "[HEARTBEAT] state=AcNormal ac_online=1 kavure_ts={} psicopompo_ts={} {} debit=0s",
+                        "[HEARTBEAT] state=AcNormal ac_online=1 {} kavure_ts={} psicopompo_ts={} {} debit={}s",
+                        bat_str,
                         if kav_up { "UP" } else { "DOWN" },
                         if psi_up { "UP" } else { "DOWN" },
-                        base_str
+                        base_str,
+                        blackout_debit_secs
                     ));
                     last_heartbeat = Instant::now();
                 }
@@ -366,19 +377,58 @@ fn main() {
                     state = SentinelState::AcNormal;
                     dock_baseline = None; // Trigger immediate recalibration to dock
                 } else {
-                    let wan = is_wan_online();
-                    if !wan {
-                        log_event("[ASSESSMENT] Confidence: 85% | WAN connectivity lost during battery operation -> BlackoutPending(WanLostInPortable).");
-                        state = SentinelState::BlackoutPending(BlackoutReason::WanLostInPortable);
+                    // Check 1: Critical battery level (Safety Watchdog)
+                    if let Some(cap) = read_battery_capacity() {
+                        if cap <= CRITICAL_BATTERY_PERCENT {
+                            log_event(&format!(
+                                "[CRITICAL] Tablet battery critically low ({}% <= {}%) in portable mode! Escalating to BlackoutPending.",
+                                cap, CRITICAL_BATTERY_PERCENT
+                            ));
+                            state = SentinelState::BlackoutPending(BlackoutReason::CriticalBattery);
+                        }
+                    }
+
+                    // Check 2: Physical return to resting dock position without AC
+                    if state == SentinelState::PortableUsage {
+                        let curr_vec = read_accelerometer();
+                        let delta = match (curr_vec, dock_baseline) {
+                            (Some(c), Some(b)) => c.distance_to(&b),
+                            _ => 999.0,
+                        };
+
+                        if delta < ORIENTATION_SHIFT_THRESHOLD {
+                            log_event(&format!(
+                                "[ASSESSMENT] Confidence: 75% | Tablet returned to resting dock position without AC (delta={:.1} < {:.1}) -> BlackoutPending(StaticDockLostAc).",
+                                delta, ORIENTATION_SHIFT_THRESHOLD
+                            ));
+                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                        }
+                    }
+
+                    // Check 3: External WAN probe lost
+                    if state == SentinelState::PortableUsage {
+                        let wan = is_wan_online();
+                        if !wan {
+                            log_event("[ASSESSMENT] Confidence: 85% | WAN connectivity lost during battery operation -> BlackoutPending(WanLostInPortable).");
+                            state = SentinelState::BlackoutPending(BlackoutReason::WanLostInPortable);
+                        }
                     }
                 }
             }
 
             SentinelState::BlackoutPending(reason) => {
                 if ac {
-                    log_event("[EVENT] AC restored while in BlackoutPending. Draining debit.");
-                    state = SentinelState::AcNormal;
-                    blackout_debit_secs = 0;
+                    // Leaky bucket drain: AC present drains 2x probe interval per cycle
+                    let drain_rate = PROBE_INTERVAL_SECS * 2;
+                    blackout_debit_secs = blackout_debit_secs.saturating_sub(drain_rate);
+                    log_event(&format!(
+                        "[RECOVERY] AC detected in BlackoutPending. Draining debit: {}/{}s remaining.",
+                        blackout_debit_secs, DEFAULT_BLACKOUT_TIMEOUT_SECS
+                    ));
+                    if blackout_debit_secs == 0 {
+                        log_event("[EVENT] AC power fully stabilized. Returning to AcNormal state.");
+                        state = SentinelState::AcNormal;
+                    }
                 } else {
                     let curr_vec = read_accelerometer();
                     let delta = match (curr_vec, dock_baseline) {
@@ -410,6 +460,7 @@ fn main() {
                                 false
                             }
                         }
+                        BlackoutReason::CriticalBattery => false,
                     };
 
                     if deescalate {
