@@ -2,6 +2,7 @@
 
 <div align="center">
 
+[![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Alpine Linux](https://img.shields.io/badge/Distro-Alpine%20Linux%20v3.20-blue.svg)](https://alpinelinux.org/)

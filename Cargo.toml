@@ -7,6 +7,13 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+authors = ["Carlos Eduardo Rodrigues <ceduardorodrig@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX"
+
 [profile.release]
 opt-level = "z"
 lto = true
