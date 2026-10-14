@@ -54,6 +54,8 @@ fn read_accelerometer() -> Option<Vector3D> {
 }
 
 // Network targets
+const KAVURE_LAN_IP: &str = "192.168.3.41";
+const PSICOPOMPO_LAN_IP: &str = "192.168.3.100";
 const KAVURE_TS_IP: &str = "100.124.146.77";
 const PSICOPOMPO_TS_IP: &str = "100.82.51.112";
 const WOL_LOCAL_URL: &str = "http://127.0.0.1:9096";
@@ -61,6 +63,11 @@ const WOL_LOCAL_URL: &str = "http://127.0.0.1:9096";
 // External WAN probe IPs
 const WAN_PRIMARY_IP: &str = "1.1.1.1";
 const WAN_BACKUP_IP: &str = "8.8.8.8";
+
+/// Probes a node across both local LAN and Tailscale mesh
+fn is_node_online(lan_ip: &str, ts_ip: &str) -> bool {
+    ping_check(lan_ip, 1) || ping_check(ts_ip, 1)
+}
 
 // Log file locations (persistent on /data if available, fallback to /var/log)
 const LOG_PATHS: [&str; 2] = [
@@ -199,24 +206,67 @@ fn send_http_post(url_str: &str, timeout_ms: u64) -> Result<String, String> {
     }
 }
 
+/// Dispatches shutdown request to a node using concurrent race (LAN ⚡ Tailscale)
+fn trigger_node_shutdown(node_name: &str, lan_ip: &str, ts_ip: &str) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+
+    let lan_url = format!("http://{}:9096/power/shutdown", lan_ip);
+    let tx_lan = tx.clone();
+    let name_lan = node_name.to_string();
+    thread::spawn(move || {
+        let res = send_http_post(&lan_url, 3000);
+        let _ = tx_lan.send((name_lan, "LAN", res));
+    });
+
+    let ts_url = format!("http://{}:9096/power/shutdown", ts_ip);
+    let tx_ts = tx;
+    let name_ts = node_name.to_string();
+    thread::spawn(move || {
+        let res = send_http_post(&ts_url, 3000);
+        let _ = tx_ts.send((name_ts, "Tailscale", res));
+    });
+
+    let mut accepted = false;
+    for _ in 0..2 {
+        if let Ok((name, iface, res)) = rx.recv_timeout(Duration::from_millis(3200)) {
+            match res {
+                Ok(_) => {
+                    if !accepted {
+                        log_event(&format!(
+                            "[SHUTDOWN] {} accepted shutdown request via {} (HTTP 200).",
+                            name, iface
+                        ));
+                        accepted = true;
+                    }
+                }
+                Err(e) => {
+                    log_event(&format!(
+                        "[SHUTDOWN] Probe to {} via {} failed: {}",
+                        name, iface, e
+                    ));
+                }
+            }
+        }
+    }
+
+    if !accepted {
+        log_event(&format!(
+            "[SHUTDOWN] CRITICAL: Failed to dispatch shutdown to {} across both LAN and Tailscale!",
+            node_name
+        ));
+    }
+}
+
 /// Dispatches simultaneous shutdown commands to Kavure and Psicopompo
 fn trigger_parallel_shutdown() {
-    log_event("[ACTION: SHUTDOWN] Emitting parallel shutdown signals via Tailscale...");
+    log_event("[ACTION: SHUTDOWN] Emitting parallel shutdown signals via LAN ⚡ Tailscale...");
 
     let h1 = thread::spawn(|| {
-        let url = format!("http://{}:9096/power/shutdown", KAVURE_TS_IP);
-        match send_http_post(&url, 3000) {
-            Ok(_) => log_event("[SHUTDOWN] Kavure accepted shutdown request (HTTP 200)."),
-            Err(e) => log_event(&format!("[SHUTDOWN] Failed to send shutdown to Kavure: {}", e)),
-        }
+        trigger_node_shutdown("Kavure", KAVURE_LAN_IP, KAVURE_TS_IP);
     });
 
     let h2 = thread::spawn(|| {
-        let url = format!("http://{}:9096/power/shutdown", PSICOPOMPO_TS_IP);
-        match send_http_post(&url, 3000) {
-            Ok(_) => log_event("[SHUTDOWN] Psicopompo accepted shutdown request (HTTP 200)."),
-            Err(e) => log_event(&format!("[SHUTDOWN] Failed to send shutdown to Psicopompo: {}", e)),
-        }
+        trigger_node_shutdown("Psicopompo", PSICOPOMPO_LAN_IP, PSICOPOMPO_TS_IP);
     });
 
     let _ = h1.join();
@@ -277,8 +327,8 @@ fn main() {
         ORIENTATION_SHIFT_THRESHOLD
     ));
     log_event(&format!(
-        "Targets: Kavure ({}) | Psicopompo ({})",
-        KAVURE_TS_IP, PSICOPOMPO_TS_IP
+        "Targets: Kavure ({}/{}) | Psicopompo ({}/{})",
+        KAVURE_LAN_IP, KAVURE_TS_IP, PSICOPOMPO_LAN_IP, PSICOPOMPO_TS_IP
     ));
     log_event("=================================================================");
 
@@ -349,8 +399,8 @@ fn main() {
                         }
                     }
                 } else if last_heartbeat.elapsed() >= Duration::from_secs(60) {
-                    let kav_up = ping_check(KAVURE_TS_IP, 1);
-                    let psi_up = ping_check(PSICOPOMPO_TS_IP, 1);
+                    let kav_up = is_node_online(KAVURE_LAN_IP, KAVURE_TS_IP);
+                    let psi_up = is_node_online(PSICOPOMPO_LAN_IP, PSICOPOMPO_TS_IP);
                     let bat_str = match read_battery_capacity() {
                         Some(c) => format!("bat={}%", c),
                         None => "bat=N/A".to_string(),
@@ -494,11 +544,11 @@ fn main() {
 
                 for _ in 0..12 {
                     thread::sleep(Duration::from_secs(5));
-                    if !kav_down && !ping_check(KAVURE_TS_IP, 1) {
+                    if !kav_down && !is_node_online(KAVURE_LAN_IP, KAVURE_TS_IP) {
                         kav_down = true;
                         log_event("[CONFIRM] Kavure confirmed offline (S5).");
                     }
-                    if !psi_down && !ping_check(PSICOPOMPO_TS_IP, 1) {
+                    if !psi_down && !is_node_online(PSICOPOMPO_LAN_IP, PSICOPOMPO_TS_IP) {
                         psi_down = true;
                         log_event("[CONFIRM] Psicopompo confirmed offline (S5).");
                     }
@@ -547,13 +597,13 @@ fn main() {
                 for attempt in 1..=12 {
                     thread::sleep(Duration::from_secs(10));
 
-                    if !kav_online && ping_check(KAVURE_TS_IP, 1) {
+                    if !kav_online && is_node_online(KAVURE_LAN_IP, KAVURE_TS_IP) {
                         kav_online = true;
-                        log_event("[SUCCESS] Kavure confirmed online on Tailnet!");
+                        log_event("[SUCCESS] Kavure confirmed online!");
                     }
-                    if !psi_online && ping_check(PSICOPOMPO_TS_IP, 1) {
+                    if !psi_online && is_node_online(PSICOPOMPO_LAN_IP, PSICOPOMPO_TS_IP) {
                         psi_online = true;
-                        log_event("[SUCCESS] Psicopompo confirmed online on Tailnet!");
+                        log_event("[SUCCESS] Psicopompo confirmed online!");
                     }
 
                     if kav_online && psi_online {
