@@ -11,7 +11,7 @@ resolver = "2"
 version = "1.0.0"
 edition = "2021"
 authors = ["Carlos Eduardo Rodrigues <ceduardorodrig@gmail.com>"]
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX"
 
 [profile.release]

@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/ceduardorodrig/KURURU-TAB3LITE-LINUX/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Rust](https://img.shields.io/badge/Built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Alpine Linux](https://img.shields.io/badge/Distro-Alpine%20Linux%20v3.20-blue.svg)](https://alpinelinux.org/)
 [![Tailscale](https://img.shields.io/badge/Network-Tailscale%20WireGuard-black.svg)](https://tailscale.com/)
@@ -173,7 +173,7 @@ A native, sovereign Wake-on-LAN (WoL) burst relay and HTTP daemon written in Rus
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
 
 ---
 
