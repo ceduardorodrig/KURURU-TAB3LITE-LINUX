@@ -179,12 +179,9 @@ This project is licensed under the [GNU Affero General Public License v3.0 (AGPL
 
 <div align="center">
 
-### 🛡️ Human-in-the-Loop Agentic Engineering & Deterministic Governance
+### 🛡️ Human-in-the-Loop Agentic Engineering
 
-> **Architected by an Anthropologist, Built with Autonomous AI Agents, Governed by Deterministic Code.**
-> 
-> This project was developed through rigorous human-AI pair programming led by **Carlos Eduardo Rodrigues** ([@ceduardorodrig](https://github.com/ceduardorodrig)) — an anthropologist and product architect using autonomous coding agents under strict, sub-millisecond static governance.
->
-> Every commit, driver, and system architecture is continuously audited and enforced by 🤖 **[StenioSentinel](https://github.com/ceduardorodrig/STENIO-SENTINEL)** (our native Rust quality gate) with zero tolerance for hallucinated tests, blind merges, or bypassed checks.
+Developed by [Carlos Eduardo Rodrigues](https://github.com/ceduardorodrig) with AI coding agents.
+Every change is verified by the deterministic quality gate [StenioSentinel](https://github.com/ceduardorodrig/STENIO-SENTINEL).
 
 </div>
