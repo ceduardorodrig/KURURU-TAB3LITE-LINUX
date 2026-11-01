@@ -64,6 +64,29 @@ const WOL_LOCAL_URL: &str = "http://127.0.0.1:9096";
 const WAN_PRIMARY_IP: &str = "1.1.1.1";
 const WAN_BACKUP_IP: &str = "8.8.8.8";
 
+// Smart Lamps (Tuya Local 10W Bulbs) — physical mains grid witnesses
+// These bulbs are screwed into standard house sockets without battery or UPS backup.
+// If any bulb responds on TCP port 6668, mains grid electricity is definitively online.
+const SMART_LAMPS: [&str; 4] = [
+    "192.168.3.36:6668", // Fridge lamp
+    "192.168.3.37:6668", // Door lamp
+    "192.168.3.38:6668", // Sink lamp
+    "192.168.3.39:6668", // Desk lamp
+];
+
+/// Probes whether any smart lamp on the mains AC grid is reachable via TCP port 6668.
+/// Returns true if at least one lamp responds, conclusively proving that mains power is active.
+fn is_mains_grid_online() -> bool {
+    for addr_str in &SMART_LAMPS {
+        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Probes a node across both local LAN and Tailscale mesh
 fn is_node_online(lan_ip: &str, ts_ip: &str) -> bool {
     ping_check(lan_ip, 1) || ping_check(ts_ip, 1)
@@ -75,7 +98,7 @@ const LOG_PATHS: [&str; 2] = [
     "/var/log/kururu-sentinel.log",
 ];
 
-/// Returns formatted timestamp "[HH:MM:SS]" in Brasília Time (UTC-3)
+/// Returns formatted timestamp "[HH:MM:SS]" in Brasilia Time (UTC-3)
 fn timestamp_str() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -308,6 +331,7 @@ enum BlackoutReason {
 enum SentinelState {
     AcNormal,
     PortableUsage,
+    CableFault,
     BlackoutPending(BlackoutReason),
     ExecutingShutdown,
     WaitingForPower,
@@ -317,7 +341,7 @@ enum SentinelState {
 
 fn main() {
     log_event("=================================================================");
-    log_event("Kururu Power Sentinel v1.1 (Autonomous Homelab Power Guardian)");
+    log_event("Kururu Power Sentinel v1.2 (Autonomous Homelab Power Guardian)");
     log_event(&format!(
         "Config: Blackout threshold: {}s | Quarantine: {}s | Probes: {}s",
         DEFAULT_BLACKOUT_TIMEOUT_SECS, DEFAULT_RECOVERY_QUARANTINE_SECS, PROBE_INTERVAL_SECS
@@ -367,32 +391,41 @@ fn main() {
                         _ => 0.0,
                     };
                     let wan = is_wan_online();
+                    let mains = is_mains_grid_online();
 
                     if delta >= ORIENTATION_SHIFT_THRESHOLD {
-                        if wan {
+                        if wan || mains {
                             log_event(&format!(
-                                "[ASSESSMENT] Confidence: 10% | Physical pickup (delta={:.1} >= {:.1}) with active WAN -> PortableUsage.",
+                                "[ASSESSMENT] Confidence: 10% | Physical pickup (delta={:.1} >= {:.1}) with active network -> PortableUsage.",
                                 delta, ORIENTATION_SHIFT_THRESHOLD
                             ));
                             state = SentinelState::PortableUsage;
                         } else {
                             log_event(&format!(
-                                "[ASSESSMENT] Confidence: 85% | Physical pickup (delta={:.1}) BUT WAN offline -> BlackoutPending(WanLostInPortable).",
+                                "[ASSESSMENT] Confidence: 85% | Physical pickup (delta={:.1}) BUT network offline -> BlackoutPending(WanLostInPortable).",
                                 delta
                             ));
                             state = SentinelState::BlackoutPending(BlackoutReason::WanLostInPortable);
                         }
+                    } else if mains {
+                        // Static on dock without AC, BUT smart lamps prove mains grid electricity is healthy!
+                        log_event(&format!(
+                            "[ASSESSMENT] Confidence: 0% | Static on dock (delta={:.1} < {:.1}), AC lost BUT smart lamps are ONLINE! Mains grid healthy; cable fault or unplugged charger -> CableFault.",
+                            delta, ORIENTATION_SHIFT_THRESHOLD
+                        ));
+                        state = SentinelState::CableFault;
+                        blackout_debit_secs = 0;
                     } else {
-                        // Static on dock without AC
+                        // Static on dock without AC, AND smart lamps are offline!
                         if wan {
                             log_event(&format!(
-                                "[ASSESSMENT] Confidence: 75% | Static on dock without AC (delta={:.1} < {:.1}, WAN active via UPS) -> BlackoutPending(StaticDockLostAc).",
-                                delta, ORIENTATION_SHIFT_THRESHOLD
+                                "[ASSESSMENT] Confidence: 90% | Static on dock without AC and smart lamps offline (WAN alive via UPS, delta={:.1}) -> BlackoutPending(StaticDockLostAc).",
+                                delta
                             ));
                             state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
                         } else {
                             log_event(&format!(
-                                "[ASSESSMENT] Confidence: 100% | Static on dock without AC AND WAN offline (delta={:.1}) -> BlackoutPending(StaticDockLostAc).",
+                                "[ASSESSMENT] Confidence: 100% | Static on dock without AC, smart lamps offline AND WAN offline (delta={:.1}) -> BlackoutPending(StaticDockLostAc).",
                                 delta
                             ));
                             state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
@@ -447,11 +480,20 @@ fn main() {
                         };
 
                         if delta < ORIENTATION_SHIFT_THRESHOLD {
-                            log_event(&format!(
-                                "[ASSESSMENT] Confidence: 75% | Tablet returned to resting dock position without AC (delta={:.1} < {:.1}) -> BlackoutPending(StaticDockLostAc).",
-                                delta, ORIENTATION_SHIFT_THRESHOLD
-                            ));
-                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                            let mains = is_mains_grid_online();
+                            if mains {
+                                log_event(&format!(
+                                    "[ASSESSMENT] Confidence: 0% | Tablet returned to resting dock position without AC, but smart lamps are ONLINE (delta={:.1} < {:.1}) -> CableFault.",
+                                    delta, ORIENTATION_SHIFT_THRESHOLD
+                                ));
+                                state = SentinelState::CableFault;
+                            } else {
+                                log_event(&format!(
+                                    "[ASSESSMENT] Confidence: 90% | Tablet returned to resting dock position without AC and smart lamps offline (delta={:.1} < {:.1}) -> BlackoutPending(StaticDockLostAc).",
+                                    delta, ORIENTATION_SHIFT_THRESHOLD
+                                ));
+                                state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                            }
                         }
                     }
 
@@ -462,6 +504,64 @@ fn main() {
                             log_event("[ASSESSMENT] Confidence: 85% | WAN connectivity lost during battery operation -> BlackoutPending(WanLostInPortable).");
                             state = SentinelState::BlackoutPending(BlackoutReason::WanLostInPortable);
                         }
+                    }
+                }
+            }
+
+            SentinelState::CableFault => {
+                if ac {
+                    log_event("[INFO] AC power reconnected. Resuming AcNormal state.");
+                    state = SentinelState::AcNormal;
+                    dock_baseline = None; // Trigger immediate recalibration to dock
+                } else {
+                    // Check 1: Critical battery level (Safety Watchdog)
+                    if let Some(cap) = read_battery_capacity() {
+                        if cap <= CRITICAL_BATTERY_PERCENT {
+                            log_event(&format!(
+                                "[CRITICAL] Tablet battery critically low ({}% <= {}%) during CableFault! Escalating to BlackoutPending.",
+                                cap, CRITICAL_BATTERY_PERCENT
+                            ));
+                            state = SentinelState::BlackoutPending(BlackoutReason::CriticalBattery);
+                        }
+                    }
+
+                    // Check 2: Physical movement
+                    if state == SentinelState::CableFault {
+                        let curr_vec = read_accelerometer();
+                        let delta = match (curr_vec, dock_baseline) {
+                            (Some(c), Some(b)) => c.distance_to(&b),
+                            _ => 999.0,
+                        };
+
+                        if delta >= ORIENTATION_SHIFT_THRESHOLD {
+                            log_event(&format!(
+                                "[TRANSITION] Tablet picked up from dock during CableFault (delta={:.1} >= {:.1}) -> PortableUsage.",
+                                delta, ORIENTATION_SHIFT_THRESHOLD
+                            ));
+                            state = SentinelState::PortableUsage;
+                        }
+                    }
+
+                    // Check 3: Real power grid outage occurred while in CableFault
+                    if state == SentinelState::CableFault {
+                        let mains = is_mains_grid_online();
+                        if !mains {
+                            log_event("[ALERT] Smart lamps went offline while in CableFault! Power grid failure detected -> BlackoutPending(StaticDockLostAc).");
+                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                        }
+                    }
+
+                    // Periodic heartbeat during CableFault
+                    if state == SentinelState::CableFault && last_heartbeat.elapsed() >= Duration::from_secs(60) {
+                        let bat_str = match read_battery_capacity() {
+                            Some(c) => format!("bat={}%", c),
+                            None => "bat=N/A".to_string(),
+                        };
+                        log_event(&format!(
+                            "[HEARTBEAT] state=CableFault ac_online=0 mains=UP {} standing by (no shutdown)",
+                            bat_str
+                        ));
+                        last_heartbeat = Instant::now();
                     }
                 }
             }
@@ -486,6 +586,13 @@ fn main() {
                         _ => 0.0,
                     };
                     let wan = is_wan_online();
+
+                    // If smart lamps come back online while in StaticDockLostAc, mains power was restored!
+                    if matches!(reason, BlackoutReason::StaticDockLostAc) && is_mains_grid_online() {
+                        log_event("[TRANSITION] Smart lamps became reachable during blackout countdown! Mains power restored -> CableFault.");
+                        state = SentinelState::CableFault;
+                        blackout_debit_secs = 0;
+                    }
 
                     // Check if conditions warrant de-escalation back to PortableUsage
                     let deescalate = match reason {
