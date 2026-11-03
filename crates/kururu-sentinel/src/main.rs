@@ -19,6 +19,12 @@ const DEFAULT_RECOVERY_QUARANTINE_SECS: u64 = 180;
 const PROBE_INTERVAL_SECS: u64 = 5;
 const CRITICAL_BATTERY_PERCENT: u8 = 20;
 
+// SMB327 / SMB328 hardware charge termination (float) voltage cap (HB-105):
+// Register 0x02 (SMB327_FLOAT_VOLTAGE) bits 6:1 = 0x21 (0x42) -> 4.14 V (~90% Li-ion ceiling).
+// Prevents calendar ageing at 4.32 V while keeping full AC mains power path active.
+const SMB327_FLOAT_VOLTAGE_REG: &str = "02\n";
+const SMB327_FLOAT_VOLTAGE_4140MV_HEX: &str = "42\n";
+
 // Accelerometer physical motion detection
 // Calibration: Cat jump / desk shockwave settles at ~86 units max. Handheld pickup reaches 310-530 units.
 const ORIENTATION_SHIFT_THRESHOLD: f64 = 180.0;
@@ -137,6 +143,29 @@ fn read_battery_capacity() -> Option<u8> {
         }
     }
     None
+}
+
+/// Enforces the SMB327/SMB328 hardware float voltage cap at 4.14 V (`0x42` in reg `0x02`, HB-105).
+/// Idempotent: reads register `0x02` first and only writes if the kernel driver reset it to default (`0x56`).
+fn enforce_charger_float_voltage_cap() {
+    let chg_dir = Path::new("/sys/class/power_supply/sec-charger");
+    let reg_path = chg_dir.join("reg");
+    let data_path = chg_dir.join("data");
+    if !reg_path.exists() || !data_path.exists() {
+        return;
+    }
+    if fs::write(&reg_path, SMB327_FLOAT_VOLTAGE_REG).is_ok() {
+        if let Ok(curr) = fs::read_to_string(&data_path) {
+            if !curr.trim().eq_ignore_ascii_case("42") {
+                if fs::write(&data_path, SMB327_FLOAT_VOLTAGE_4140MV_HEX).is_ok() {
+                    log_event(&format!(
+                        "[BATTERY-CAP] Applied SMB327 float voltage cap 4.14V (reg 0x02: 0x{} -> 0x42).",
+                        curr.trim()
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Checks physical AC mains power status on Kururu hardware
@@ -361,8 +390,13 @@ fn main() {
     let mut last_heartbeat = Instant::now();
     let mut dock_baseline: Option<Vector3D> = None;
 
+    enforce_charger_float_voltage_cap();
+
     loop {
         let ac = is_ac_online();
+        if ac {
+            enforce_charger_float_voltage_cap();
+        }
 
         match state {
             SentinelState::AcNormal => {

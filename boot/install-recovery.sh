@@ -20,6 +20,14 @@ date -s "2026-01-01 00:00:00"
 
 # Hardware display management is delegated to kururu-display daemon
 
+# Cap SMB327/SMB328 hardware charge termination (float) voltage at 4.14 V (~90%, HB-105)
+# Register 0x02 (SMB327_FLOAT_VOLTAGE) = 0x42 (bits 6:1 = 0x21 -> 4140 mV).
+if [ -w /sys/class/power_supply/sec-charger/reg ] && [ -w /sys/class/power_supply/sec-charger/data ]; then
+    echo "[Kururu] Applying SMB327 hardware float voltage cap (4.14 V / 0x42)..."
+    echo 02 > /sys/class/power_supply/sec-charger/reg 2>/dev/null
+    echo 42 > /sys/class/power_supply/sec-charger/data 2>/dev/null
+fi
+
 # Reset firewall to accept incoming traffic (SSH/Tailscale)
 echo "[Kururu] Flushing iptables firewall rules..."
 iptables -F 2>/dev/null
@@ -158,7 +166,7 @@ echo "[Kururu NTP] Clock now: $(date)"
     sleep 3
 
     echo "[Kururu] Running Tailscale up..." >> "$LOGFILE"
-    chroot /data/alpine /usr/local/bin/tailscale up --hostname=kururu --ssh --accept-routes=false > /data/tailscale_auth.txt 2>&1
+    chroot /data/alpine /usr/local/bin/tailscale up --hostname=kururu --ssh=false --accept-routes=false > /data/tailscale_auth.txt 2>&1
     chmod 666 /data/tailscale_auth.txt 2>/dev/null
     echo "[Kururu Watcher] Tailscale command executed." >> "$LOGFILE"
 ) &
@@ -174,5 +182,10 @@ killall kururu-wake 2>/dev/null
 # NOTE: redirect target must exist in the Android init context (/var does not
 # exist there — that silently aborted the daemon at boot). Use /data instead.
 nohup chroot /data/alpine /usr/local/bin/kururu-wake --daemon 9096 > /data/kururu-wol-daemon.log 2>&1 &
+
+# Start Kururu Power Sentinel (UPS & Charge Cap Guardian)
+echo "[Kururu] Starting Kururu Power Sentinel..."
+killall kururu-sentinel 2>/dev/null
+nohup chroot /data/alpine /usr/local/bin/kururu-sentinel > /data/kururu-sentinel-stdout.log 2>&1 &
 
 echo "=== [Kururu] Native Headless Boot Sequence Complete ==="
