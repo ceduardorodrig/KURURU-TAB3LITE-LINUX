@@ -175,7 +175,14 @@ fn timestamp_str() -> String {
 fn log_event(msg: &str) {
     let ts = timestamp_str();
     let line = format!("{} {}", ts, msg);
-    println!("{}", line);
+
+    // One writer owns the log. Printing unconditionally duplicated every line as soon as a launcher
+    // redirected stdout into the same storage — the boot hook sends it to
+    // `/data/kururu-sentinel-stdout.log`, a second unbounded file with no rotation. The console copy
+    // is therefore opt-in: KURURU_CONSOLE=1 for a foreground/debug run.
+    if std::env::var_os("KURURU_CONSOLE").is_some() {
+        println!("{}", line);
+    }
 
     let path = log_path();
     rotate_if_needed(path);
