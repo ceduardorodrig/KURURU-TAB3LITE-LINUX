@@ -287,6 +287,90 @@ fn witness_label(witness: MainsWitness) -> &'static str {
     }
 }
 
+/// The decision table, computed. `assess` is the single source of truth for what the guardian does
+/// with the vectors it has just read; the tests below walk every row, so this table and the document
+/// cannot drift apart again (HB-109 — the doc described a weighted model the code never computed).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Decision {
+    PortableUsage,
+    CableFault,
+    Blackout(BlackoutReason),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Assessment {
+    decision: Decision,
+    confidence: u8,
+    reason: &'static str,
+}
+
+/// Decides while on battery. AC present is handled by the caller, which never asks.
+///
+/// The confidence is a label assigned by the row that fired, not an arithmetic score over the
+/// vectors: for a safety interlock an audit trail ("this row, this evidence") beats a weighted sum
+/// nobody can reproduce.
+fn assess(moved: bool, witness: MainsWitness, wan: bool, battery: Option<u8>) -> Assessment {
+    // The battery outranks every vector: a guardian that dies guessing is worse than one that acts
+    // early, and it is the only reading that does not travel over the network.
+    if let Some(capacity) = battery {
+        if capacity <= CRITICAL_BATTERY_PERCENT {
+            return Assessment {
+                decision: Decision::Blackout(BlackoutReason::CriticalBattery),
+                confidence: 95,
+                reason: "tablet battery critically low",
+            };
+        }
+    }
+
+    if moved {
+        return match witness {
+            MainsWitness::Healthy => Assessment {
+                decision: Decision::PortableUsage,
+                confidence: 10,
+                reason: "lifted from the dock while the mains witness is healthy",
+            },
+            MainsWitness::Unknown if unknown_escalates(witness, battery) => Assessment {
+                decision: Decision::Blackout(BlackoutReason::StaticDockLostAc),
+                confidence: 80,
+                reason: "lifted, witness unknown and the tablet is out of time",
+            },
+            MainsWitness::Unknown => Assessment {
+                decision: Decision::PortableUsage,
+                confidence: 30,
+                reason: "lifted, witness unknown: portable use, not a blackout",
+            },
+            MainsWitness::Dead => Assessment {
+                decision: Decision::Blackout(BlackoutReason::WanLostInPortable),
+                confidence: 85,
+                reason: "lifted with the grid down",
+            },
+        };
+    }
+
+    match witness {
+        MainsWitness::Healthy => Assessment {
+            decision: Decision::CableFault,
+            confidence: 0,
+            reason: "static on the dock, mains witness healthy: cable fault or unplugged charger",
+        },
+        MainsWitness::Unknown if unknown_escalates(witness, battery) => Assessment {
+            decision: Decision::Blackout(BlackoutReason::StaticDockLostAc),
+            confidence: 80,
+            reason: "static, witness unknown and the tablet is out of time",
+        },
+        MainsWitness::Unknown => Assessment {
+            decision: Decision::CableFault,
+            confidence: 0,
+            reason: "static, witness unknown: standing by, not escalating",
+        },
+        MainsWitness::Dead => Assessment {
+            decision: Decision::Blackout(BlackoutReason::StaticDockLostAc),
+            confidence: if wan { 90 } else { 100 },
+            reason: "static on the dock, mains witness dead while the network answers",
+        },
+    }
+}
+
 /// Says whether an unknown witness is allowed to escalate. It is not, while the tablet has battery
 /// to wait with: the tablet's own charge is the only clock that does not travel over the network.
 fn unknown_escalates(witness: MainsWitness, battery: Option<u8>) -> bool {
@@ -713,86 +797,42 @@ fn main() {
                         _ => 0.0,
                     };
                     let wan = is_wan_online();
-                    // Tri-state: a silent lamp is evidence only while the rest of the network still
-                    // answers. `escalate_on_unknown` is the middle term — an unknown witness never
-                    // shuts the homelab down while there is battery to wait with, and does once the
-                    // tablet itself is running out (the only clock that ignores the network).
+                    // One decision, one place. `assess` is pure and the whole table is under test,
+                    // so this branch and the document cannot drift apart again (HB-109).
                     let witness = mains_witness();
-                    let mains = witness == MainsWitness::Healthy;
-                    let unknown = witness == MainsWitness::Unknown;
                     let battery = read_battery_capacity();
-                    let escalate_on_unknown = unknown_escalates(witness, battery);
-
-                    if delta >= ORIENTATION_SHIFT_THRESHOLD {
-                        if wan || mains || (unknown && !escalate_on_unknown) {
-                            if unknown {
-                                push_alert(&format!(
-                                    "witness unknown (moved): cannot see the home network, NOT escalating. bat={:?}",
-                                    battery
-                                ));
-                            }
-                            log_event(&format!(
-                                "[ASSESSMENT] Confidence: 10% | Physical pickup (delta={:.1} >= {:.1}) with active network -> PortableUsage.",
-                                delta, ORIENTATION_SHIFT_THRESHOLD
-                            ));
-                            state = SentinelState::PortableUsage;
-                        } else {
-                            log_event(&format!(
-                                "[ASSESSMENT] Confidence: 85% | Physical pickup (delta={:.1}) BUT network offline -> BlackoutPending(WanLostInPortable).",
-                                delta
-                            ));
-                            state = SentinelState::BlackoutPending(BlackoutReason::WanLostInPortable);
-                        }
-                    } else if mains {
-                        // Static on dock without AC, BUT smart lamps prove mains grid electricity is healthy!
-                        log_event(&format!(
-                            "[ASSESSMENT] Confidence: 0% | Static on dock (delta={:.1} < {:.1}), AC lost BUT smart lamps are ONLINE! Mains grid healthy; cable fault or unplugged charger -> CableFault.",
-                            delta, ORIENTATION_SHIFT_THRESHOLD
+                    let assessment = assess(delta >= ORIENTATION_SHIFT_THRESHOLD, witness, wan, battery);
+                    log_event(&format!(
+                        "[ASSESSMENT] confidence={}% | delta={:.1} witness={} wan={} bat={:?} -> {}",
+                        assessment.confidence,
+                        delta,
+                        witness_label(witness),
+                        if wan { "UP" } else { "DOWN" },
+                        battery,
+                        assessment.reason
+                    ));
+                    if witness == MainsWitness::Unknown {
+                        push_alert(&format!(
+                            "witness unknown: cannot see the home network -> {}. bat={:?}",
+                            assessment.reason, battery
                         ));
-                        state = SentinelState::CableFault;
-                        blackout_debit_secs = 0;
-                    } else if unknown {
-                        if escalate_on_unknown {
-                            // Blind and out of time: the tablet's own battery is the only clock that
-                            // does not travel over the network, so it gets to decide.
-                            log_event(&format!(
-                                "[ASSESSMENT] Confidence: 80% | Witness UNKNOWN and battery {:?} <= {}% -> escalating before the guardian itself dies.",
-                                battery, UNKNOWN_WITNESS_BATTERY_PERCENT
-                            ));
-                            push_alert(&format!(
-                                "witness UNKNOWN and bat={:?}: escalating without proof of blackout (tablet out of time)",
-                                battery
-                            ));
-                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
-                        } else {
-                            // Nothing answers: the lamps' silence is not evidence, it is a blind
-                            // spot. Staying on CableFault keeps the homelab up (HB-109).
-                            log_event(&format!(
-                                "[ASSESSMENT] Witness UNKNOWN | Static on dock (delta={:.1}), AC lost, no probe answers -> CableFault, NOT escalating. bat={:?}",
-                                delta, battery
-                            ));
-                            push_alert(&format!(
-                                "witness unknown on dock: cannot see the home network, NOT escalating. ac=0 bat={:?} debit={}s",
-                                battery, blackout_debit_secs
-                            ));
+                    }
+                    match assessment.decision {
+                        Decision::CableFault => {
                             state = SentinelState::CableFault;
                             blackout_debit_secs = 0;
                         }
-                    } else {
-                        // Static on dock without AC, AND smart lamps are offline (the network still
-                        // answers, so their silence is real evidence of a grid failure).
-                        if wan {
-                            log_event(&format!(
-                                "[ASSESSMENT] Confidence: 90% | Static on dock without AC and smart lamps offline (WAN alive via UPS, delta={:.1}) -> BlackoutPending(StaticDockLostAc).",
-                                delta
-                            ));
-                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
-                        } else {
-                            log_event(&format!(
-                                "[ASSESSMENT] Confidence: 100% | Static on dock without AC, smart lamps offline AND WAN offline (delta={:.1}) -> BlackoutPending(StaticDockLostAc).",
-                                delta
-                            ));
-                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                        Decision::PortableUsage => state = SentinelState::PortableUsage,
+                        Decision::Blackout(reason) => {
+                            if reason != BlackoutReason::CriticalBattery {
+                                push_alert(&format!(
+                                    "escalating to BlackoutPending: {} (witness={} bat={:?})",
+                                    assessment.reason,
+                                    witness_label(witness),
+                                    battery
+                                ));
+                            }
+                            state = SentinelState::BlackoutPending(reason);
                         }
                     }
                 } else if last_heartbeat.elapsed() >= Duration::from_secs(60) {
@@ -1193,6 +1233,70 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_documented_matrix_is_the_binary_and_the_binary_is_the_matrix() {
+        // One assertion per row of the table in services/kururu-power-sentinel.md §D. If a row
+        // changes, this test changes in the same commit — that is the whole point (HB-109).
+        use MainsWitness::{Dead, Healthy, Unknown};
+
+        // AC present is never asked here (the caller short-circuits), so every case is on battery.
+        assert_eq!(
+            assess(false, Healthy, true, Some(80)).decision,
+            Decision::CableFault,
+            "static, lamps answering, charger loose"
+        );
+        assert_eq!(
+            assess(true, Healthy, false, Some(80)).decision,
+            Decision::PortableUsage,
+            "lifted while the grid is healthy"
+        );
+        assert_eq!(
+            assess(false, Dead, true, Some(80)).decision,
+            Decision::Blackout(BlackoutReason::StaticDockLostAc),
+            "static, lamps silent, WAN alive via UPS"
+        );
+        assert_eq!(assess(false, Dead, true, Some(80)).confidence, 90);
+        assert_eq!(assess(false, Dead, false, Some(80)).confidence, 100);
+        assert_eq!(
+            assess(true, Dead, false, Some(80)).decision,
+            Decision::Blackout(BlackoutReason::WanLostInPortable),
+            "lifted with the grid down"
+        );
+
+        // The rows the document never had: a witness that cannot look is not a verdict.
+        assert_eq!(
+            assess(false, Unknown, false, Some(80)).decision,
+            Decision::CableFault,
+            "static, blind, plenty of battery: never escalate"
+        );
+        assert_eq!(
+            assess(true, Unknown, false, Some(80)).decision,
+            Decision::PortableUsage,
+            "lifted, blind, plenty of battery: portable use"
+        );
+        assert_eq!(
+            assess(false, Unknown, false, Some(25)).decision,
+            Decision::Blackout(BlackoutReason::StaticDockLostAc),
+            "blind and out of time: the battery clock decides"
+        );
+
+        // The battery outranks every vector.
+        assert_eq!(
+            assess(false, Healthy, true, Some(20)).decision,
+            Decision::Blackout(BlackoutReason::CriticalBattery),
+            "critical battery wins even with the grid healthy"
+        );
+        assert_eq!(
+            assess(true, Dead, false, Some(19)).decision,
+            Decision::Blackout(BlackoutReason::CriticalBattery)
+        );
+        assert_eq!(
+            assess(false, Healthy, true, None).decision,
+            Decision::CableFault,
+            "a missing battery reading must not fabricate a veto"
+        );
     }
 
     #[test]
