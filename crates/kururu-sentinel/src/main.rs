@@ -8,8 +8,9 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -66,6 +67,12 @@ const KAVURE_TS_IP: &str = "100.124.146.77";
 const PSICOPOMPO_TS_IP: &str = "100.82.51.112";
 const WOL_LOCAL_URL: &str = "http://127.0.0.1:9096";
 
+// Dead-man switch: the guardian reports IN, instead of a monitor polling it from a dev machine.
+// ntfy is self-hosted on ybytu and private to the tailnet (unauthenticated topics by design), and
+// it is already the fleet's alert channel. Absence of these pushes is the alarm.
+const NTFY_ALERTS_URL: &str = "http://100.115.253.109:8083/alerts";
+const NTFY_PUSH_INTERVAL_SECS: u64 = 300;
+
 // External WAN probe IPs
 const WAN_PRIMARY_IP: &str = "1.1.1.1";
 const WAN_BACKUP_IP: &str = "8.8.8.8";
@@ -98,11 +105,58 @@ fn is_node_online(lan_ip: &str, ts_ip: &str) -> bool {
     ping_check(lan_ip, 1) || ping_check(ts_ip, 1)
 }
 
-// Log file locations (persistent on /data if available, fallback to /var/log)
-const LOG_PATHS: [&str; 2] = [
+// Log file location: ONE canonical path, resolved once at startup and announced in the first
+// line. The previous code walked two candidates and broke at the first that opened, silently —
+// so `/var/log/kururu-sentinel.log` became a decoy frozen on 2026-10-05 while the live log sat in
+// `/data` and nobody could tell which file to read (HB-108).
+const LOG_CANDIDATES: [&str; 2] = [
     "/data/kururu-sentinel.log",
     "/var/log/kururu-sentinel.log",
 ];
+/// Rotate at 2 MiB and keep three generations (`…log.1` oldest kept generation is `.3`).
+/// 9.6 MiB in 30 days on an 8 GiB eMMC with a 5.1 GiB rootfs, with no rotation, was growing
+/// without bound (HB-108).
+const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const LOG_GENERATIONS: u8 = 3;
+
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Resolves the log file once: the first candidate whose directory accepts a write wins.
+/// An unwritable candidates list still yields a path, so logging never panics — it degrades
+/// to stdout only.
+fn log_path() -> &'static Path {
+    LOG_PATH.get_or_init(|| {
+        for candidate in LOG_CANDIDATES {
+            if OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(candidate)
+                .is_ok()
+            {
+                return PathBuf::from(candidate);
+            }
+        }
+        PathBuf::from(LOG_CANDIDATES[LOG_CANDIDATES.len() - 1])
+    })
+}
+
+/// Shifts the log by size: `log.2`→`log.3`, `log.1`→`log.2`, `log`→`log.1`.
+fn rotate_if_needed(path: &Path) {
+    let too_big = fs::metadata(path)
+        .map(|meta| meta.len() > LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if !too_big {
+        return;
+    }
+    let base = path.to_string_lossy().to_string();
+    for generation in (1..LOG_GENERATIONS).rev() {
+        let _ = fs::rename(
+            format!("{}.{}", base, generation),
+            format!("{}.{}", base, generation + 1),
+        );
+    }
+    let _ = fs::rename(&base, format!("{}.1", base));
+}
 
 /// Returns formatted timestamp "[HH:MM:SS]" in Brasilia Time (UTC-3)
 fn timestamp_str() -> String {
@@ -123,11 +177,10 @@ fn log_event(msg: &str) {
     let line = format!("{} {}", ts, msg);
     println!("{}", line);
 
-    for path in &LOG_PATHS {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{}", line);
-            break;
-        }
+    let path = log_path();
+    rotate_if_needed(path);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{}", line);
     }
 }
 
@@ -165,6 +218,57 @@ fn enforce_charger_float_voltage_cap() {
                 }
             }
         }
+    }
+}
+
+/// Reads the SMB327 float-voltage register (`0x02`) as the driver reports it — hex, the same
+/// representation `enforce_charger_float_voltage_cap` writes.
+fn read_float_voltage_reg() -> Option<String> {
+    let chg_dir = Path::new("/sys/class/power_supply/sec-charger");
+    let reg_path = chg_dir.join("reg");
+    let data_path = chg_dir.join("data");
+    if fs::write(&reg_path, SMB327_FLOAT_VOLTAGE_REG).is_err() {
+        return None;
+    }
+    fs::read_to_string(&data_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+}
+
+/// Short label for the finite-state machine, used in the pushed heartbeat.
+fn state_label(state: &SentinelState) -> &'static str {
+    match state {
+        SentinelState::AcNormal => "AcNormal",
+        SentinelState::PortableUsage => "PortableUsage",
+        SentinelState::CableFault => "CableFault",
+        SentinelState::BlackoutPending(_) => "BlackoutPending",
+        SentinelState::ExecutingShutdown => "ExecutingShutdown",
+        SentinelState::WaitingForPower => "WaitingForPower",
+        SentinelState::StabilizingRecovery(_) => "StabilizingRecovery",
+        SentinelState::ClosedLoopWake => "ClosedLoopWake",
+    }
+}
+
+/// Pushes one state line to the fleet's ntfy topic. The guardian reports *in*, so silence is the
+/// alarm — no monitor has to poll a host that may be the one that died. Every failure is logged
+/// and swallowed: a broken network must never take the guardian down with it.
+fn push_state(state: &SentinelState, debit: u64) {
+    let battery = read_battery_capacity()
+        .map(|percent| format!("{}%", percent))
+        .unwrap_or_else(|| "N/A".to_string());
+    let float_reg = read_float_voltage_reg().unwrap_or_else(|| "?".to_string());
+    let ac = if is_ac_online() { 1 } else { 0 };
+    let body = format!(
+        "kururu guardian: state={} ac={} bat={} float_reg_0x02={} debit={}s",
+        state_label(state),
+        ac,
+        battery,
+        float_reg,
+        debit
+    );
+    let headers = [("Title", "kururu power guardian"), ("Tags", "battery,guardian")];
+    if let Err(err) = send_http_post_with(NTFY_ALERTS_URL, &body, &headers, 3000) {
+        log_event(&format!("[NTFY] heartbeat push failed: {}", err));
     }
 }
 
@@ -216,6 +320,17 @@ fn is_wan_online() -> bool {
 
 /// Sends an HTTP POST request to trigger remote shutdown
 fn send_http_post(url_str: &str, timeout_ms: u64) -> Result<String, String> {
+    send_http_post_with(url_str, "", &[], timeout_ms)
+}
+
+/// POSTs a body plus extra headers (ntfy reads the message from the body and the metadata from
+/// headers such as `Title` and `Tags`). One implementation for every POST this daemon makes.
+fn send_http_post_with(
+    url_str: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+    timeout_ms: u64,
+) -> Result<String, String> {
     // Parse URL (format: http://host:port/path)
     let url_no_proto = url_str.strip_prefix("http://").unwrap_or(url_str);
     let (host_port, path) = match url_no_proto.split_once('/') {
@@ -238,10 +353,15 @@ fn send_http_post(url_str: &str, timeout_ms: u64) -> Result<String, String> {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)));
 
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        path, host_port
-    );
+    let mut request = format!("POST {} HTTP/1.1\r\nHost: {}\r\n", path, host_port);
+    for (name, value) in headers {
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+    request.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    ));
 
     stream
         .write_all(request.as_bytes())
@@ -370,7 +490,7 @@ enum SentinelState {
 
 fn main() {
     log_event("=================================================================");
-    log_event("Kururu Power Sentinel v1.2 (Autonomous Homelab Power Guardian)");
+    log_event("Kururu Power Sentinel v1.3 (Autonomous Homelab Power Guardian)");
     log_event(&format!(
         "Config: Blackout threshold: {}s | Quarantine: {}s | Probes: {}s",
         DEFAULT_BLACKOUT_TIMEOUT_SECS, DEFAULT_RECOVERY_QUARANTINE_SECS, PROBE_INTERVAL_SECS
@@ -388,9 +508,20 @@ fn main() {
     let mut state = SentinelState::AcNormal;
     let mut blackout_debit_secs: u64 = 0;
     let mut last_heartbeat = Instant::now();
+    let mut last_push = Instant::now();
     let mut dock_baseline: Option<Vector3D> = None;
 
+    log_event(&format!(
+        "Logging to {} (rotation at {} KiB, {} generations)",
+        log_path().display(),
+        LOG_MAX_BYTES / 1024,
+        LOG_GENERATIONS
+    ));
+
     enforce_charger_float_voltage_cap();
+
+    // One push at startup so the fleet knows the guardian (re)started; failure is non-fatal.
+    push_state(&state, blackout_debit_secs);
 
     loop {
         let ac = is_ac_online();
@@ -776,5 +907,56 @@ fn main() {
         }
 
         thread::sleep(Duration::from_secs(PROBE_INTERVAL_SECS));
+
+        if last_push.elapsed() >= Duration::from_secs(NTFY_PUSH_INTERVAL_SECS) {
+            push_state(&state, blackout_debit_secs);
+            last_push = Instant::now();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_labels_are_stable() {
+        assert_eq!(state_label(&SentinelState::AcNormal), "AcNormal");
+        assert_eq!(
+            state_label(&SentinelState::BlackoutPending(
+                BlackoutReason::CriticalBattery
+            )),
+            "BlackoutPending"
+        );
+        assert_eq!(
+            state_label(&SentinelState::StabilizingRecovery(30)),
+            "StabilizingRecovery"
+        );
+    }
+
+    #[test]
+    fn rotation_shifts_generations_and_keeps_the_history() {
+        let dir = std::env::temp_dir().join(format!("kururu-log-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let log = dir.join("sentinel.log");
+        let oversized = vec![b'x'; (LOG_MAX_BYTES + 1) as usize];
+        let _ = fs::write(&log, &oversized);
+        let _ = fs::write(dir.join("sentinel.log.1"), b"older generation");
+
+        rotate_if_needed(&log);
+
+        assert!(
+            dir.join("sentinel.log.1").exists(),
+            "the oversized file becomes generation .1"
+        );
+        assert!(
+            dir.join("sentinel.log.2").exists(),
+            "the previous .1 shifts to .2 — history is kept, not overwritten"
+        );
+        assert!(
+            !log.exists(),
+            "the file is renamed, never truncated in place"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
