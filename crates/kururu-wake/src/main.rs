@@ -293,6 +293,16 @@ fn ensure_sentinel_running() {
 fn run_daemon(port: u16) {
     ensure_sentinel_running();
 
+    // Supervision loop. Two starters exist in this image (the Android boot hook and this daemon),
+    // and at boot they race — on 2026-11-04 both won and two sentinels ran side by side, doubling
+    // ntfy pushes, shutdown requests and log lines. The sentinel now claims a single instance, so a
+    // losing start exits by itself; this loop guarantees that at least one is alive and restarts it
+    // within a minute if it dies.
+    thread::spawn(|| loop {
+        thread::sleep(Duration::from_secs(60));
+        ensure_sentinel_running();
+    });
+
     let host = env::var("WOL_LISTEN_ADDR")
         .ok()
         .filter(|s| !s.is_empty())

@@ -309,12 +309,25 @@ fn is_ac_online() -> bool {
 }
 
 /// Probes an IP address using ICMP ping with a small timeout
+///
+/// Absolute paths first. This daemon is started by the Android boot hook, whose PATH is
+/// `/system/xbin:/system/bin:…` and contains neither `/bin` nor `/usr/bin`, so a bare
+/// `Command::new("ping")` failed there while the network was perfectly healthy — on 2026-11-04 the
+/// FSM read *both* hosts as DOWN right after boot. During a cable loss that is a false blackout,
+/// which ends in a homelab shutdown. A missing binary falls through to the next candidate; a
+/// reachable binary that fails the probe returns false immediately.
+const PING_BINARIES: [&str; 3] = ["/bin/ping", "/usr/bin/ping", "ping"];
+
 fn ping_check(ip: &str, timeout_secs: u64) -> bool {
-    Command::new("ping")
-        .args(["-c", "1", "-W", &timeout_secs.to_string(), ip])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    for candidate in PING_BINARIES {
+        let result = Command::new(candidate)
+            .args(["-c", "1", "-W", &timeout_secs.to_string(), ip])
+            .output();
+        if let Ok(out) = result {
+            return out.status.success();
+        }
+    }
+    false
 }
 
 /// Checks external WAN connectivity
@@ -495,7 +508,46 @@ enum SentinelState {
     ClosedLoopWake,
 }
 
+/// Single-instance guard. Two starters exist in this image — the Android boot hook (which
+/// `killall`s and starts the binary) and `kururu-wake`, whose supervisor loop spawns it when a
+/// `/proc` scan finds nothing. At boot they race: on 2026-11-04 both won and two daemons ran,
+/// doubling the ntfy pushes, the shutdown requests and the log lines. The guard makes the daemon
+/// own its uniqueness, so no caller can create a second instance.
+///
+/// The pid file is a hint, not a lock: a crashed daemon leaves it behind, so a stale pid is
+/// detected (`/proc/<pid>` absent) and taken over instead of blocking the next start forever.
+const PID_FILE: &str = "/data/kururu-sentinel.pid";
+
+fn claim_single_instance() -> bool {
+    let pid = std::process::id();
+    let path = Path::new(PID_FILE);
+
+    if let Ok(existing) = fs::read_to_string(path) {
+        if let Ok(other) = existing.trim().parse::<u32>() {
+            if other != pid && Path::new(&format!("/proc/{}", other)).exists() {
+                return false;
+            }
+        }
+    }
+
+    match fs::write(path, format!("{}\n", pid)) {
+        Ok(_) => true,
+        // Unwritable pid file must not stop a guardian: log nothing here (the logger resolves the
+        // same directory) and keep running, accepting the theoretical duplicate.
+        Err(_) => true,
+    }
+}
+
 fn main() {
+    if !claim_single_instance() {
+        eprintln!("kururu-sentinel: another instance already holds {}", PID_FILE);
+        return;
+    }
+
+    // The Android boot hook exports its own PATH (`/system/bin:/system/xbin`). Normalise it once so
+    // every helper this daemon shells out to resolves like it does in an interactive Alpine shell.
+    std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+
     log_event("=================================================================");
     log_event("Kururu Power Sentinel v1.3 (Autonomous Homelab Power Guardian)");
     log_event(&format!(
