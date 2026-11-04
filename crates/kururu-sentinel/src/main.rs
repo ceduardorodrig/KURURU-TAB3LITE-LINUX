@@ -518,28 +518,40 @@ enum SentinelState {
 /// detected (`/proc/<pid>` absent) and taken over instead of blocking the next start forever.
 const PID_FILE: &str = "/data/kururu-sentinel.pid";
 
-fn claim_single_instance() -> bool {
+fn claim_single_instance(path: &Path) -> bool {
     let pid = std::process::id();
-    let path = Path::new(PID_FILE);
 
-    if let Ok(existing) = fs::read_to_string(path) {
-        if let Ok(other) = existing.trim().parse::<u32>() {
-            if other != pid && Path::new(&format!("/proc/{}", other)).exists() {
-                return false;
+    for _ in 0..2 {
+        // O_EXCL: the create IS the lock. A read-then-write let both boot starters through on
+        // 2026-11-04 (pids 548 and 553 both ran), because neither had written when the other read.
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", pid);
+                return true;
             }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder = fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| content.trim().parse::<u32>().ok());
+                match holder {
+                    // A live holder means this start loses, by design.
+                    Some(other) if Path::new(&format!("/proc/{}", other)).exists() => return false,
+                    // Stale pid (crashed daemon): take the file over instead of blocking forever.
+                    _ => {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+            // Unwritable pid file must not stop a guardian: run, accepting a theoretical duplicate.
+            Err(_) => return true,
         }
     }
 
-    match fs::write(path, format!("{}\n", pid)) {
-        Ok(_) => true,
-        // Unwritable pid file must not stop a guardian: log nothing here (the logger resolves the
-        // same directory) and keep running, accepting the theoretical duplicate.
-        Err(_) => true,
-    }
+    false
 }
 
 fn main() {
-    if !claim_single_instance() {
+    if !claim_single_instance(Path::new(PID_FILE)) {
         eprintln!("kururu-sentinel: another instance already holds {}", PID_FILE);
         return;
     }
@@ -991,6 +1003,43 @@ mod tests {
             state_label(&SentinelState::StabilizingRecovery(30)),
             "StabilizingRecovery"
         );
+    }
+
+    #[test]
+    fn live_holder_blocks_a_second_start() {
+        let dir = std::env::temp_dir().join(format!("kururu-pid-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let pid_file = dir.join("sentinel.pid");
+        let _ = fs::write(&pid_file, format!("{}\n", std::process::id()));
+
+        assert!(
+            !claim_single_instance(&pid_file),
+            "a live pid already in the file must refuse the second start"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_pid_is_taken_over() {
+        let dir = std::env::temp_dir().join(format!("kururu-pid-stale-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let pid_file = dir.join("sentinel.pid");
+        // A pid that cannot exist: a crashed daemon must not block the next start forever.
+        let _ = fs::write(&pid_file, "2147483647\n");
+
+        assert!(
+            claim_single_instance(&pid_file),
+            "a stale pid file must be taken over"
+        );
+        let content = fs::read_to_string(&pid_file).unwrap_or_default();
+        assert_eq!(
+            content.trim(),
+            std::process::id().to_string(),
+            "the winner rewrites the pid file with its own pid"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
