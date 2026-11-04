@@ -26,9 +26,22 @@ APK_PACKAGES="ripgrep fd bat eza sd dust procs bottom"
 # PATH=/usr/sbin:/usr/bin:/sbin:/bin, so anything in /usr/local/bin is invisible to `ssh <host> <cmd>`
 # and reads as "not found" even with the file present.
 #
-# `git-delta` is waived on purpose. It is Rust, but pulls `libz-sys`, whose build needs an
-# armv7-musl C compiler (`arm-linux-musleabihf-gcc`) that this host does not have — the only clean
-# route is a cross toolchain (zig or musl-cross-make) for a git pager on a device with no `git`.
+# `git-delta` is Rust but pulls two C dependencies (`libz-sys` and `onig_sys`), so the musl target
+# needs a C compiler. There is no armv7-musl gcc here; `zig cc` is the toolchain, and the three
+# wrappers in this directory exist because cargo injects the Rust triple (`--target=armv7-…`) that zig
+# rejects, and because AR_<target> cannot contain a space. Build recipe (host side):
+#
+#   sudo pacman -S zig
+#   CC_armv7_unknown_linux_musleabihf=scripts/zig-armv7-musl-cc.sh \
+#   CXX_armv7_unknown_linux_musleabihf=scripts/zig-armv7-musl-cxx.sh \
+#   AR_armv7_unknown_linux_musleabihf=scripts/zig-armv7-musl-ar.sh \
+#   CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=rust-lld \
+#     cargo install git-delta --target armv7-unknown-linux-musleabihf --root /tmp/delta-arm --locked
+#   ssh kururu 'cat > /usr/bin/delta.new' < /tmp/delta-arm/bin/delta
+#   ssh kururu 'chmod 755 /usr/bin/delta.new && mv /usr/bin/delta.new /usr/bin/delta'
+#
+# Keep `LINKER=rust-lld`: letting zig link produces `duplicate symbol: _start`, because rust-lld
+# already brings the musl crt for the target.
 apk add --no-cache $APK_PACKAGES
 
 status=0
