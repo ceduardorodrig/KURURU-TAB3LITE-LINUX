@@ -89,8 +89,11 @@ const SMART_LAMPS: [&str; 4] = [
 
 /// Probes whether any smart lamp on the mains AC grid is reachable via TCP port 6668.
 /// Returns true if at least one lamp responds, conclusively proving that mains power is active.
-fn is_mains_grid_online() -> bool {
-    for addr_str in &SMART_LAMPS {
+///
+/// The target list is a parameter, not a constant, so a diagnostic run can point the same probe at a
+/// known-dead address and prove the classifier without touching the real lamps (see `--assess`).
+fn is_mains_grid_online(lamps: &[String]) -> bool {
+    for addr_str in lamps {
         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
             if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
                 return true;
@@ -287,6 +290,93 @@ fn witness_label(witness: MainsWitness) -> &'static str {
     }
 }
 
+/// Lamp target list: the built-in four unless `--lamps a:6668,b:6668` overrides them.
+fn lamp_targets(args: &[String]) -> Vec<String> {
+    if let Some(position) = args.iter().position(|arg| arg == "--lamps") {
+        if let Some(list) = args.get(position + 1) {
+            let targets: Vec<String> = list
+                .split(',')
+                .map(|target| target.trim().to_string())
+                .filter(|target| !target.is_empty())
+                .collect();
+            if !targets.is_empty() {
+                return targets;
+            }
+        }
+    }
+    SMART_LAMPS.iter().map(|lamp| lamp.to_string()).collect()
+}
+
+/// Prints the vectors and the assessment the guardian would make, then exits.
+///
+/// This never claims the pid file and never enters the FSM, so it is safe beside the live daemon — and
+/// it is the only way to exercise the `Dead`/`Unknown` rows without an outage. Simulated inputs are
+/// labelled as such: this reports a classification, it does not pretend the world changed.
+fn run_assessment(args: &[String]) {
+    let lamps = lamp_targets(args);
+    let simulated_ac = args
+        .iter()
+        .position(|arg| arg == "--sim-ac")
+        .and_then(|position| args.get(position + 1))
+        .and_then(|value| value.parse::<u8>().ok());
+    let simulated_witness = args
+        .iter()
+        .position(|arg| arg == "--sim-witness")
+        .and_then(|position| args.get(position + 1))
+        .cloned();
+    let moved = args.iter().any(|arg| arg == "--moved");
+
+    println!("lamps:");
+    for lamp in &lamps {
+        let reachable = lamp
+            .parse::<SocketAddr>()
+            .map(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok())
+            .unwrap_or(false);
+        println!("  {:<22} {}", lamp, if reachable { "reachable" } else { "silent" });
+    }
+
+    let witness = match simulated_witness.as_deref() {
+        Some("healthy") => MainsWitness::Healthy,
+        Some("dead") => MainsWitness::Dead,
+        Some("unknown") => MainsWitness::Unknown,
+        Some(other) => {
+            eprintln!("--sim-witness expects healthy, dead or unknown; got '{}'", other);
+            std::process::exit(2);
+        }
+        None => mains_witness(&lamps),
+    };
+
+    let ac = match simulated_ac {
+        Some(value) => value == 1,
+        None => is_ac_online(),
+    };
+    let battery = read_battery_capacity();
+    let wan = is_wan_online();
+
+    println!(
+        "vectors: ac_online={}{} battery={:?} witness={}{} wan={} moved={}",
+        u8::from(ac),
+        if simulated_ac.is_some() { " (simulated)" } else { "" },
+        battery,
+        witness_label(witness),
+        if simulated_witness.is_some() { " (simulated)" } else { "" },
+        if wan { "UP" } else { "DOWN" },
+        if moved { "yes" } else { "no" }
+    );
+
+    if ac {
+        println!("assessment: AcNormal — mains present, the decision table is not consulted");
+        return;
+    }
+
+    let assessment = assess(moved, witness, wan, battery);
+    println!(
+        "assessment: {:?} confidence={}%",
+        assessment.decision, assessment.confidence
+    );
+    println!("reason: {}", assessment.reason);
+}
+
 /// The decision table, computed. `assess` is the single source of truth for what the guardian does
 /// with the vectors it has just read; the tests below walk every row, so this table and the document
 /// cannot drift apart again (HB-109 — the doc described a weighted model the code never computed).
@@ -462,8 +552,8 @@ const UNKNOWN_WITNESS_BATTERY_PERCENT: u8 = 25;
 /// Each rung that answers proves the network still exists and localises the failure; only when
 /// nothing answers is the verdict genuinely unknown. Router and switch sit on the UPS (HB-074), so
 /// during a real grid outage the LAN keeps answering and the lamps' silence stays conclusive.
-fn mains_witness() -> MainsWitness {
-    if is_mains_grid_online() {
+fn mains_witness(lamps: &[String]) -> MainsWitness {
+    if is_mains_grid_online(lamps) {
         return MainsWitness::Healthy;
     }
 
@@ -721,6 +811,18 @@ fn claim_single_instance(path: &Path) -> bool {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Diagnostic mode: read the vectors, print the assessment, exit. It never claims the pid file and
+    // never touches the FSM, so it is safe to run beside the live guardian — which is the only way to
+    // exercise the Dead/Unknown rows without an outage (HB-109).
+    if args.iter().any(|arg| arg == "--assess") {
+        run_assessment(&args);
+        return;
+    }
+
+    let lamps = lamp_targets(&args);
+
     if !claim_single_instance(Path::new(PID_FILE)) {
         eprintln!("kururu-sentinel: another instance already holds {}", PID_FILE);
         return;
@@ -799,7 +901,7 @@ fn main() {
                     let wan = is_wan_online();
                     // One decision, one place. `assess` is pure and the whole table is under test,
                     // so this branch and the document cannot drift apart again (HB-109).
-                    let witness = mains_witness();
+                    let witness = mains_witness(&lamps);
                     let battery = read_battery_capacity();
                     let assessment = assess(delta >= ORIENTATION_SHIFT_THRESHOLD, witness, wan, battery);
                     log_event(&format!(
@@ -853,7 +955,7 @@ fn main() {
                         if psi_up { "UP" } else { "DOWN" },
                         base_str,
                         blackout_debit_secs,
-                        witness_label(mains_witness())
+                        witness_label(mains_witness(&lamps))
                     ));
                     last_heartbeat = Instant::now();
                 }
@@ -885,7 +987,7 @@ fn main() {
                         };
 
                         if delta < ORIENTATION_SHIFT_THRESHOLD {
-                            let mains = is_mains_grid_online();
+                            let mains = is_mains_grid_online(&lamps);
                             if mains {
                                 log_event(&format!(
                                     "[ASSESSMENT] Confidence: 0% | Tablet returned to resting dock position without AC, but smart lamps are ONLINE (delta={:.1} < {:.1}) -> CableFault.",
@@ -951,7 +1053,7 @@ fn main() {
                     // here too: a silent lamp with the network gone is a blind spot, not evidence, and
                     // it must not turn a loose charger into a homelab shutdown (HB-109).
                     if state == SentinelState::CableFault {
-                        match mains_witness() {
+                        match mains_witness(&lamps) {
                             MainsWitness::Dead => {
                                 log_event("[ALERT] Smart lamps went offline while the network still answers! Power grid failure detected -> BlackoutPending(StaticDockLostAc).");
                                 push_alert("CableFault: lamps silent with the network alive -> grid outage, BlackoutPending");
@@ -1017,7 +1119,7 @@ fn main() {
                     let wan = is_wan_online();
 
                     // If smart lamps come back online while in StaticDockLostAc, mains power was restored!
-                    if matches!(reason, BlackoutReason::StaticDockLostAc) && is_mains_grid_online() {
+                    if matches!(reason, BlackoutReason::StaticDockLostAc) && is_mains_grid_online(&lamps) {
                         log_event("[TRANSITION] Smart lamps became reachable during blackout countdown! Mains power restored -> CableFault.");
                         state = SentinelState::CableFault;
                         blackout_debit_secs = 0;
@@ -1233,6 +1335,25 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lamp_targets_prefers_the_override_and_never_blinds_the_witness() {
+        let args: Vec<String> = ["--assess", "--lamps", "127.0.0.1:1, 10.0.0.9:6668"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        assert_eq!(
+            lamp_targets(&args),
+            vec!["127.0.0.1:1".to_string(), "10.0.0.9:6668".to_string()],
+            "an explicit list is used verbatim, whitespace trimmed"
+        );
+
+        // An empty or missing override must fall back to the real lamps: a typo in a diagnostic flag
+        // should not silently turn the witness into a blind spot.
+        let empty: Vec<String> = ["--lamps", ""].iter().map(|arg| arg.to_string()).collect();
+        assert_eq!(lamp_targets(&empty).len(), SMART_LAMPS.len());
+        assert_eq!(lamp_targets(&[]).len(), SMART_LAMPS.len());
     }
 
     #[test]
