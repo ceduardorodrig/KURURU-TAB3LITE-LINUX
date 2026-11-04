@@ -279,6 +279,50 @@ fn push_state(state: &SentinelState, debit: u64) {
     }
 }
 
+fn witness_label(witness: MainsWitness) -> &'static str {
+    match witness {
+        MainsWitness::Healthy => "HEALTHY",
+        MainsWitness::Dead => "DEAD",
+        MainsWitness::Unknown => "UNKNOWN",
+    }
+}
+
+/// Says whether an unknown witness is allowed to escalate. It is not, while the tablet has battery
+/// to wait with: the tablet's own charge is the only clock that does not travel over the network.
+fn unknown_escalates(witness: MainsWitness, battery: Option<u8>) -> bool {
+    witness == MainsWitness::Unknown
+        && battery.map_or(false, |cap| cap <= UNKNOWN_WITNESS_BATTERY_PERCENT)
+}
+
+/// Pushes an alert, collapsing identical summaries inside a 10-minute window.
+///
+/// The FSM probes every 5 s, so a witness that stays unknown would otherwise push 12 times a
+/// minute and train everyone to ignore the fleet topic — the opposite of the guardian's purpose.
+fn push_alert(summary: &str) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static RECENT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let recent = RECENT.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Ok(mut seen) = recent.lock() {
+        let now = Instant::now();
+        seen.retain(|_, at| now.duration_since(*at) < Duration::from_secs(600));
+        if let Some(at) = seen.get(summary) {
+            if now.duration_since(*at) < Duration::from_secs(600) {
+                return;
+            }
+        }
+        seen.insert(summary.to_string(), now);
+    }
+
+    let body = format!("kururu guardian: {}", summary);
+    let headers = [("Title", "kururu power guardian"), ("Tags", "warning,battery,guardian")];
+    if let Err(err) = send_http_post_with(NTFY_ALERTS_URL, &body, &headers, 3000) {
+        log_event(&format!("[NTFY] alert push failed: {}", err));
+    }
+}
+
 /// Checks physical AC mains power status on Kururu hardware
 /// Inspects Linux sysfs power_supply classes
 fn is_ac_online() -> bool {
@@ -306,6 +350,48 @@ fn is_ac_online() -> bool {
     }
 
     false
+}
+
+/// Three-valued verdict on the mains grid.
+///
+/// The only physical witness of grid power is the smart lamps, and they are reached over the same
+/// Wi-Fi the tablet uses. So "every lamp is silent" has two very different meanings: the grid is
+/// down, or *I lost the ability to look* — a dead router, a crashed AP, a dropped association. The
+/// old code collapsed both into `false` and, on battery, that meant BlackoutPending, and 180 s later
+/// a shutdown of Kavure and Psicopompo with the grid perfectly healthy (HB-109).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum MainsWitness {
+    /// At least one lamp answered: the wall sockets have power.
+    Healthy,
+    /// No lamp answered, but the rest of the network does: their silence is real evidence.
+    Dead,
+    /// Nothing answers, so the silence proves nothing. Never shut the homelab down on a guess.
+    Unknown,
+}
+
+/// Battery level below which an unknown witness stops being a reason to wait: the tablet is the
+/// clock, and it is the one sensor that does not travel over the network.
+const UNKNOWN_WITNESS_BATTERY_PERCENT: u8 = 25;
+
+/// Resolves the mains witness through a ladder of probes, from most direct to least.
+///
+/// Each rung that answers proves the network still exists and localises the failure; only when
+/// nothing answers is the verdict genuinely unknown. Router and switch sit on the UPS (HB-074), so
+/// during a real grid outage the LAN keeps answering and the lamps' silence stays conclusive.
+fn mains_witness() -> MainsWitness {
+    if is_mains_grid_online() {
+        return MainsWitness::Healthy;
+    }
+
+    let network_alive = is_node_online(KAVURE_LAN_IP, KAVURE_TS_IP)
+        || is_node_online(PSICOPOMPO_LAN_IP, PSICOPOMPO_TS_IP)
+        || ping_check("192.168.3.1", 1);
+
+    if network_alive {
+        MainsWitness::Dead
+    } else {
+        MainsWitness::Unknown
+    }
 }
 
 /// Probes an IP address using ICMP ping with a small timeout
@@ -627,10 +713,24 @@ fn main() {
                         _ => 0.0,
                     };
                     let wan = is_wan_online();
-                    let mains = is_mains_grid_online();
+                    // Tri-state: a silent lamp is evidence only while the rest of the network still
+                    // answers. `escalate_on_unknown` is the middle term — an unknown witness never
+                    // shuts the homelab down while there is battery to wait with, and does once the
+                    // tablet itself is running out (the only clock that ignores the network).
+                    let witness = mains_witness();
+                    let mains = witness == MainsWitness::Healthy;
+                    let unknown = witness == MainsWitness::Unknown;
+                    let battery = read_battery_capacity();
+                    let escalate_on_unknown = unknown_escalates(witness, battery);
 
                     if delta >= ORIENTATION_SHIFT_THRESHOLD {
-                        if wan || mains {
+                        if wan || mains || (unknown && !escalate_on_unknown) {
+                            if unknown {
+                                push_alert(&format!(
+                                    "witness unknown (moved): cannot see the home network, NOT escalating. bat={:?}",
+                                    battery
+                                ));
+                            }
                             log_event(&format!(
                                 "[ASSESSMENT] Confidence: 10% | Physical pickup (delta={:.1} >= {:.1}) with active network -> PortableUsage.",
                                 delta, ORIENTATION_SHIFT_THRESHOLD
@@ -651,8 +751,36 @@ fn main() {
                         ));
                         state = SentinelState::CableFault;
                         blackout_debit_secs = 0;
+                    } else if unknown {
+                        if escalate_on_unknown {
+                            // Blind and out of time: the tablet's own battery is the only clock that
+                            // does not travel over the network, so it gets to decide.
+                            log_event(&format!(
+                                "[ASSESSMENT] Confidence: 80% | Witness UNKNOWN and battery {:?} <= {}% -> escalating before the guardian itself dies.",
+                                battery, UNKNOWN_WITNESS_BATTERY_PERCENT
+                            ));
+                            push_alert(&format!(
+                                "witness UNKNOWN and bat={:?}: escalating without proof of blackout (tablet out of time)",
+                                battery
+                            ));
+                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                        } else {
+                            // Nothing answers: the lamps' silence is not evidence, it is a blind
+                            // spot. Staying on CableFault keeps the homelab up (HB-109).
+                            log_event(&format!(
+                                "[ASSESSMENT] Witness UNKNOWN | Static on dock (delta={:.1}), AC lost, no probe answers -> CableFault, NOT escalating. bat={:?}",
+                                delta, battery
+                            ));
+                            push_alert(&format!(
+                                "witness unknown on dock: cannot see the home network, NOT escalating. ac=0 bat={:?} debit={}s",
+                                battery, blackout_debit_secs
+                            ));
+                            state = SentinelState::CableFault;
+                            blackout_debit_secs = 0;
+                        }
                     } else {
-                        // Static on dock without AC, AND smart lamps are offline!
+                        // Static on dock without AC, AND smart lamps are offline (the network still
+                        // answers, so their silence is real evidence of a grid failure).
                         if wan {
                             log_event(&format!(
                                 "[ASSESSMENT] Confidence: 90% | Static on dock without AC and smart lamps offline (WAN alive via UPS, delta={:.1}) -> BlackoutPending(StaticDockLostAc).",
@@ -679,12 +807,13 @@ fn main() {
                         None => "dock=calibrating".to_string(),
                     };
                     log_event(&format!(
-                        "[HEARTBEAT] state=AcNormal ac_online=1 {} kavure_ts={} psicopompo_ts={} {} debit={}s",
+                        "[HEARTBEAT] state=AcNormal ac_online=1 {} kavure_ts={} psicopompo_ts={} {} debit={}s witness={}",
                         bat_str,
                         if kav_up { "UP" } else { "DOWN" },
                         if psi_up { "UP" } else { "DOWN" },
                         base_str,
-                        blackout_debit_secs
+                        blackout_debit_secs,
+                        witness_label(mains_witness())
                     ));
                     last_heartbeat = Instant::now();
                 }
@@ -778,12 +907,36 @@ fn main() {
                         }
                     }
 
-                    // Check 3: Real power grid outage occurred while in CableFault
+                    // Check 3: a real grid outage while parked on a cable fault. The tri-state matters
+                    // here too: a silent lamp with the network gone is a blind spot, not evidence, and
+                    // it must not turn a loose charger into a homelab shutdown (HB-109).
                     if state == SentinelState::CableFault {
-                        let mains = is_mains_grid_online();
-                        if !mains {
-                            log_event("[ALERT] Smart lamps went offline while in CableFault! Power grid failure detected -> BlackoutPending(StaticDockLostAc).");
-                            state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                        match mains_witness() {
+                            MainsWitness::Dead => {
+                                log_event("[ALERT] Smart lamps went offline while the network still answers! Power grid failure detected -> BlackoutPending(StaticDockLostAc).");
+                                push_alert("CableFault: lamps silent with the network alive -> grid outage, BlackoutPending");
+                                state = SentinelState::BlackoutPending(BlackoutReason::StaticDockLostAc);
+                            }
+                            MainsWitness::Unknown => {
+                                let battery = read_battery_capacity();
+                                if unknown_escalates(MainsWitness::Unknown, battery) {
+                                    log_event(&format!(
+                                        "[CRITICAL] Witness still unknown and tablet battery {:?} <= {}%: escalating to BlackoutPending before the guardian dies.",
+                                        battery, UNKNOWN_WITNESS_BATTERY_PERCENT
+                                    ));
+                                    state = SentinelState::BlackoutPending(BlackoutReason::CriticalBattery);
+                                } else {
+                                    log_event(&format!(
+                                        "[ASSESSMENT] Witness UNKNOWN in CableFault: cannot see the network, standing by. bat={:?}",
+                                        battery
+                                    ));
+                                    push_alert(&format!(
+                                        "witness unknown in CableFault: cannot see the home network, standing by. bat={:?}",
+                                        battery
+                                    ));
+                                }
+                            }
+                            MainsWitness::Healthy => {}
                         }
                     }
 
@@ -1040,6 +1193,23 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_witness_never_escalates_while_the_tablet_has_battery() {
+        // A blind spot must not shut the homelab down while there is time to wait: that was the
+        // false blackout of HB-109 (charger loose + Wi-Fi drop = shutdown with the grid healthy).
+        assert!(!unknown_escalates(MainsWitness::Unknown, Some(90)));
+        assert!(!unknown_escalates(MainsWitness::Unknown, Some(26)));
+        assert!(!unknown_escalates(MainsWitness::Unknown, None));
+
+        // Out of time: the tablet's own charge is the one clock that ignores the network.
+        assert!(unknown_escalates(MainsWitness::Unknown, Some(25)));
+        assert!(unknown_escalates(MainsWitness::Unknown, Some(8)));
+
+        // A conclusive witness never consults this gate at all.
+        assert!(!unknown_escalates(MainsWitness::Dead, Some(5)));
+        assert!(!unknown_escalates(MainsWitness::Healthy, Some(5)));
     }
 
     #[test]
