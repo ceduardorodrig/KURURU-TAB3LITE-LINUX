@@ -12,6 +12,11 @@
 
 </div>
 
+🛡️ Human-in-the-Loop Agentic Engineering
+
+Developed by Carlos Eduardo Rodrigues with AI coding agents.
+Every change is verified by the deterministic quality gate StenioSentinel
+
 ---
 
 ## 📖 Overview
@@ -174,14 +179,3 @@ A native, sovereign Wake-on-LAN (WoL) burst relay and HTTP daemon written in Rus
 ## 📄 License
 
 This project is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
-
----
-
-<div align="center">
-
-### 🛡️ Human-in-the-Loop Agentic Engineering
-
-Developed by [Carlos Eduardo Rodrigues](https://github.com/ceduardorodrig) with AI coding agents.
-Every change is verified by the deterministic quality gate [StenioSentinel](https://github.com/ceduardorodrig/STENIO-SENTINEL).
-
-</div>
