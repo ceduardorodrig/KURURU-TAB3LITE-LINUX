@@ -1,0 +1,37 @@
+# Dependabot config: one grouped monthly PR per ecosystem.
+version: 2
+updates:
+  # Rust: root workspace lockfile plus the standalone crates/kururu-display lockfile.
+  - package-ecosystem: "cargo"
+    directories:
+      - "/"
+      - "/crates/kururu-display"
+    schedule:
+      interval: "monthly"
+      timezone: "America/Sao_Paulo"
+    open-pull-requests-limit: 1
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+    # A major bump needs a manual API review, not an automatic merge.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    labels:
+      - "dependencies"
+
+  # GitHub Actions workflows (.github/workflows/ci.yml)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      timezone: "America/Sao_Paulo"
+    open-pull-requests-limit: 1
+    groups:
+      actions-dependencies:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "ci"
