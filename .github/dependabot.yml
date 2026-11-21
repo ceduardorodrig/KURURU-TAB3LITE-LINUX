@@ -1,11 +1,11 @@
 # Dependabot config: one grouped monthly PR per ecosystem.
 version: 2
 updates:
-  # Rust: root workspace lockfile plus the standalone crates/kururu-display lockfile.
+  # Rust: the root Cargo.lock covers every workspace member (kururu-su, -display, -wake, -sentinel).
+  # crates/kururu-display/Cargo.lock is an orphan: the crate inherits edition/version from the
+  # workspace root, so Dependabot cannot resolve that directory on its own.
   - package-ecosystem: "cargo"
-    directories:
-      - "/"
-      - "/crates/kururu-display"
+    directory: "/"
     schedule:
       interval: "monthly"
       timezone: "America/Sao_Paulo"
