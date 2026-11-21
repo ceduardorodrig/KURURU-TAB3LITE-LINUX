@@ -1,0 +1,36 @@
+name: rust-check
+
+# Compiles the whole workspace so that a dependency bump (Dependabot) is
+# actually built, not only audited. Cargo.lock is authoritative (--locked).
+# No crate has a build.rs or links a system library (libc, serde,
+# alacritty_terminal and portable-pty are pure Rust on Linux), so no apt
+# packages are needed.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-check:
+    name: cargo check (workspace, locked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (stable, edition 2021)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: cargo check
+        run: cargo check --locked --workspace --all-targets
