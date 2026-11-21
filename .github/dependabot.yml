@@ -10,14 +10,14 @@ updates:
       interval: "monthly"
       timezone: "America/Sao_Paulo"
     open-pull-requests-limit: 1
+    # Majors arrive as separate PRs (not ignored) so security fixes that need a major are not suppressed.
     groups:
       rust-dependencies:
         patterns:
           - "*"
-    # A major bump needs a manual API review, not an automatic merge.
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
+        update-types:
+          - "minor"
+          - "patch"
     labels:
       - "dependencies"
 
