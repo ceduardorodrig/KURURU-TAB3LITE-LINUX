@@ -31,7 +31,7 @@ APK_PACKAGES="ripgrep fd bat eza sd dust procs bottom"
 # wrappers in this directory exist because cargo injects the Rust triple (`--target=armv7-…`) that zig
 # rejects, and because AR_<target> cannot contain a space. Build recipe (host side):
 #
-#   sudo pacman -S zig
+#   pacman -S zig            # install zig on the host as root (the build below needs no privileges)
 #   CC_armv7_unknown_linux_musleabihf=scripts/zig-armv7-musl-cc.sh \
 #   CXX_armv7_unknown_linux_musleabihf=scripts/zig-armv7-musl-cxx.sh \
 #   AR_armv7_unknown_linux_musleabihf=scripts/zig-armv7-musl-ar.sh \

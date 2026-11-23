@@ -1,10 +1,10 @@
 name: ci
 
-# Auditoria de governança pelo StenioSentinel.
+# Governance audit by StenioSentinel.
 #
-# Consome a composite action publicada pelo próprio motor, que baixa o binário
-# já compilado da release em vez de compilar Rust aqui (CI em segundos, e uma
-# única versão do motor para todos os repositórios).
+# Uses the composite action published by the engine itself, which downloads the
+# already-compiled release binary instead of building Rust here (CI in seconds, and a
+# single engine version for all repositories).
 #
 # Ver: https://github.com/ceduardorodrig/STENIO-SENTINEL/.github/actions/stenio-check
 
