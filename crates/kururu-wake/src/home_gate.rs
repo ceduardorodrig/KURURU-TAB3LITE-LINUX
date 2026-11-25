@@ -163,7 +163,7 @@ fn on_link_devices(routes: &str, ip: Ipv4Addr) -> Vec<String> {
             continue;
         }
         if let Some(pair) = tokens.windows(2).find(|pair| pair[0] == "dev") {
-            if !pair[1].starts_with("tailscale") {
+            if !pair[1].starts_with("tailscale") && !devices.iter().any(|d| d == pair[1]) {
                 devices.push(pair[1].to_string());
             }
         }
@@ -412,6 +412,15 @@ mod tests {
         assert!(allowed(gate.check(&at_home(), start)));
         let away = net(AWAY_ROUTES, true, "");
         assert!(!allowed(gate.check(&away, later(start, 5))));
+    }
+
+    #[test]
+    fn a_host_route_beside_the_subnet_route_probes_the_interface_once() {
+        // Shape of a DHCP host: a subnet route plus a link-scoped route to the gateway itself.
+        let routes = "default via 192.168.3.1 dev enp1s0 proto dhcp src 192.168.3.41 \n\
+            192.168.3.0/24 dev enp1s0 proto kernel scope link src 192.168.3.41 \n\
+            192.168.3.1 dev enp1s0 proto dhcp scope link src 192.168.3.41 \n";
+        assert_eq!(on_link_devices(routes, DEFAULT_GATEWAY_IP), ["enp1s0"]);
     }
 
     #[test]
