@@ -1,7 +1,11 @@
+mod home_gate;
+
+use home_gate::{Config, HomeGate, Runner, Stamp, SystemRunner, Verdict};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -161,7 +165,91 @@ fn trigger_system_shutdown() {
     });
 }
 
-fn handle_http_client(mut stream: TcpStream) {
+/// Answers a shutdown request. `shutdown` runs only if the home gate allows it.
+fn handle_shutdown(
+    stream: &mut impl Write,
+    gate: &HomeGate,
+    runner: &impl Runner,
+    now: Stamp,
+    shutdown: impl FnOnce(),
+) {
+    let (status, body, allowed) = match gate.check(runner, now) {
+        Verdict::Allow(reason) => {
+            log_action(&format!(
+                "[POWER] Shutdown request accepted ({}). Triggering system shutdown...",
+                reason
+            ));
+            (
+                "200 OK",
+                r#"{"status":"ok","action":"shutdown","message":"System shutdown initiated"}"#
+                    .to_string(),
+                true,
+            )
+        }
+        Verdict::Refuse(reason) => {
+            log_action(&format!("[POWER] Shutdown request REFUSED: {}", reason));
+            (
+                "409 Conflict",
+                format!(
+                    r#"{{"status":"refused","action":"shutdown","message":"{}"}}"#,
+                    reason
+                ),
+                false,
+            )
+        }
+    };
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+    if allowed {
+        shutdown();
+    }
+}
+
+fn load_home_gate() -> HomeGate {
+    HomeGate::new(Config::from_lookup(|key| env::var(key).ok()))
+}
+
+/// Keeps the last confirmed presence fresh, so it exists when the router goes silent.
+fn spawn_presence_watch(gate: Arc<HomeGate>) {
+    let Config::Armed(home) = gate.config.clone() else {
+        return;
+    };
+    thread::spawn(move || {
+        let mut previous = None;
+        loop {
+            let (presence, _) = gate.refresh(&home, &SystemRunner, Stamp::now());
+            if previous.as_ref() != Some(&presence) {
+                log_action(&format!("[HOME GATE] Presence: {:?}", presence));
+                previous = Some(presence);
+            }
+            thread::sleep(home_gate::REFRESH_INTERVAL);
+        }
+    });
+}
+
+/// Preflight for deployments: probes once and never shuts anything down.
+fn check_home() -> bool {
+    let gate = load_home_gate();
+    println!("Home gate {}", gate.config.describe());
+    match gate.check(&SystemRunner, Stamp::now()) {
+        Verdict::Allow(reason) => {
+            println!("A shutdown request would be ACCEPTED: {}", reason);
+            true
+        }
+        Verdict::Refuse(reason) => {
+            println!("A shutdown request would be REFUSED: {}", reason);
+            false
+        }
+    }
+}
+
+fn handle_http_client(mut stream: TcpStream, gate: &HomeGate) {
     let mut buf = [0u8; 1024];
     let bytes_read = match stream.read(&mut buf) {
         Ok(n) => n,
@@ -198,16 +286,13 @@ fn handle_http_client(mut stream: TcpStream) {
     }
 
     if path == "/power/shutdown" || path == "/power/shutdown/" || path.starts_with("/power/shutdown?") {
-        log_action("[POWER] Received shutdown request via HTTP. Triggering system shutdown...");
-        let body = r#"{"status":"ok","action":"shutdown","message":"System shutdown initiated"}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+        handle_shutdown(
+            &mut stream,
+            gate,
+            &SystemRunner,
+            Stamp::now(),
+            trigger_system_shutdown,
         );
-        let _ = stream.write_all(response.as_bytes());
-        let _ = stream.flush();
-        trigger_system_shutdown();
         return;
     }
 
@@ -325,10 +410,15 @@ fn run_daemon(port: u16) {
         }
     };
 
+    let gate = Arc::new(load_home_gate());
+    log_action(&format!("[HOME GATE] {}", gate.config.describe()));
+    spawn_presence_watch(Arc::clone(&gate));
+
     for stream in listener.incoming() {
         if let Ok(s) = stream {
+            let gate = Arc::clone(&gate);
             thread::spawn(move || {
-                handle_http_client(s);
+                handle_http_client(s, &gate);
             });
         }
     }
@@ -588,8 +678,14 @@ fn print_usage() {
     println!("  kururu-wake <HOSTNAME|MAC>         Send Magic Packet to configured target or MAC");
     println!("  kururu-wake --daemon [PORT]        Run HTTP WOL Relay daemon (default: 9096)");
     println!("  kururu-wake --dispatcher [PORT]    Run Smart WoL Dispatcher with auto-failover (default: 9096)");
+    println!("  kururu-wake --check-home           Report whether a shutdown request would be accepted");
     println!("\nConfiguration:");
     println!("  Targets are mapped in /etc/kururu-wake.conf (e.g. host=aa:bb:cc:dd:ee:ff)");
+    println!("  POST /power/shutdown is accepted only on the home LAN (environment variables):");
+    println!("    WOL_HOME_GATEWAY_MAC          Home gateway MAC (required)");
+    println!("    WOL_HOME_GATEWAY_IP           Home gateway IPv4 (default 192.168.3.1)");
+    println!("    WOL_HOME_CACHE_MAX_AGE_SECS   Validity of the last confirmation (default 1800)");
+    println!("    WOL_HOME_GATE=off             Disable the gate");
 }
 
 fn main() {
@@ -618,6 +714,11 @@ fn main() {
                 .unwrap_or(9096);
             run_dispatcher(port);
         }
+        "--check-home" => {
+            if !check_home() {
+                std::process::exit(1);
+            }
+        }
         target => {
             if let Some(mac) = resolve_target_mac(target) {
                 if let Err(e) = send_magic_packet(mac, target) {
@@ -633,5 +734,51 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host with no route to the home gateway.
+    struct Away;
+
+    impl Runner for Away {
+        fn run(&self, _: &str, _: &[&str]) -> Option<(bool, String)> {
+            Some((true, String::new()))
+        }
+    }
+
+    fn request(config: Config) -> (String, bool) {
+        let mut response = Vec::new();
+        let mut powered_off = false;
+        handle_shutdown(
+            &mut response,
+            &HomeGate::new(config),
+            &Away,
+            Stamp::now(),
+            || powered_off = true,
+        );
+        (String::from_utf8_lossy(&response).into_owned(), powered_off)
+    }
+
+    #[test]
+    fn refusal_answers_409_and_does_nothing() {
+        let config = Config::from_lookup(|key| {
+            (key == home_gate::ENV_GATEWAY_MAC).then(|| "02:00:00:00:00:01".to_string())
+        });
+        let (response, powered_off) = request(config);
+        assert!(response.starts_with("HTTP/1.1 409 Conflict\r\n"), "{}", response);
+        // The sentinel treats any response containing this text as an accepted shutdown.
+        assert!(!response.contains("200 OK"));
+        assert!(!powered_off);
+    }
+
+    #[test]
+    fn acceptance_answers_200_and_shuts_down() {
+        let (response, powered_off) = request(Config::Off);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{}", response);
+        assert!(powered_off);
     }
 }

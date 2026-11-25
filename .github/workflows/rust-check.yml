@@ -34,3 +34,6 @@ jobs:
 
       - name: cargo check
         run: cargo check --locked --workspace --all-targets
+
+      - name: cargo test (shutdown home-LAN gate)
+        run: cargo test --locked -p kururu-wake
