@@ -168,6 +168,30 @@ A native, sovereign Wake-on-LAN (WoL) burst relay and HTTP daemon written in Rus
   - HTTP Daemon (port `9096`):
     - `GET /wake/<target_host>` → Emits burst of 5 magic packets to the configured target MAC (e.g. `d0:94:66:XX:XX:XX`).
     - `GET /health` → Real-time status probe.
+    - `POST /power/shutdown` → Powers the host off, only while it is on the home LAN; otherwise `409 Conflict` and nothing happens.
+
+#### Shutdown home-LAN gate
+
+The daemon is reachable over the VPN, so it verifies physical presence before powering off. It pings the home gateway through each interface that reaches it directly and compares the neighbour-table MAC. A stale entry without an answer proves nothing.
+
+| What the host sees | Result |
+|---|---|
+| Expected gateway MAC, answering now | accepted |
+| Another MAC on the gateway IP | refused, cached presence erased |
+| No on-link route to the gateway | refused |
+| Gateway silent, confirmed within the cache age | accepted (router dying during an outage) |
+| Gateway silent, older or no confirmation | refused |
+
+The cache lives in memory (a reboot clears it) and is refreshed every 30 s. A request can only arrive while some network path to the host still works.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WOL_HOME_GATEWAY_MAC` | none, **required** | Hardware address of the home gateway. Without it every shutdown is refused. |
+| `WOL_HOME_GATEWAY_IP` | `192.168.3.1` | Home gateway IPv4 address. |
+| `WOL_HOME_CACHE_MAX_AGE_SECS` | `1800` | How long the last confirmation covers a silent gateway. |
+| `WOL_HOME_GATE` | `on` | `off` disables the gate. |
+
+Run `kururu-wake --check-home` with the same variables before deploying. It probes once and never shuts anything down.
 
 ---
 
