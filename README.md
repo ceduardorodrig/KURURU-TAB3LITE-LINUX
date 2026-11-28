@@ -201,7 +201,11 @@ This project is licensed under the [GNU Affero General Public License v3.0 (AGPL
 
 ---
 
-🛡️ Human-in-the-Loop Agentic Engineering
+<div align="center">
 
-Developed by Carlos Eduardo Rodrigues with AI coding agents.
-Every change is verified by the deterministic quality gate StenioSentinel.
+### 🛡️ Human-in-the-Loop Agentic Engineering
+
+Developed by [Carlos Eduardo Rodrigues](https://github.com/ceduardorodrig) with AI coding agents.
+Every change is verified by the deterministic quality gate [StenioSentinel](https://github.com/ceduardorodrig/STENIO-SENTINEL).
+
+</div>
